@@ -34,13 +34,9 @@ button:focus-visible { outline: 2px solid #d4d4d8; outline-offset: 2px; }
 .nav-item.selected { color: var(--foreground); background: #27272a; }
 .nav-item.selected svg { color: #e4e4e7; }
 .sidebar-bottom { margin-top: auto; }
-.sidebar-status { min-height: 54px; padding: 10px; display: flex; align-items: flex-start; gap: 9px; border: 1px solid var(--border); border-radius: 7px; background: #151517; }
-.sidebar-status strong, .sidebar-status span { display: block; }
-.sidebar-status strong { color: var(--foreground); font-size: 13px; font-weight: 500; }
-.sidebar-status div span { margin-top: 4px; color: var(--subtle); font-size: 12px; }
 .status-dot { width: 7px; height: 7px; margin-top: 3px; flex: none; border-radius: 50%; background: #71717a; }
-.status-dot.online, .ready .status-dot { background: var(--green); }
-.version { display: block; padding: 14px 4px 0; color: var(--subtle); font-size: 11px; text-align: right; }
+.ready .status-dot { background: var(--green); }
+.version { display: block; padding: 0 4px; color: var(--subtle); font-size: 11px; text-align: right; }
 
 .main-panel { grid-column: 2; min-width: 0; }
 .topbar { height: 54px; padding: 0 32px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); color: #e4e4e7; font-size: 14px; }

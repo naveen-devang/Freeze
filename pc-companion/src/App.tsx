@@ -202,15 +202,6 @@ function App() {
         </nav>
 
         <div className="sidebar-bottom">
-          <div className="sidebar-status">
-            <span className={`status-dot ${online ? "online" : ""}`} />
-            <div>
-              <strong>
-                {online ? "Companion ready" : loadError ? "Unavailable" : "Starting"}
-              </strong>
-              <span>Freeze for desktop</span>
-            </div>
-          </div>
           <span className="version">0.1.0</span>
         </div>
       </aside>
