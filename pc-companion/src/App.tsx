@@ -211,7 +211,7 @@ function App() {
               <span>Freeze for desktop</span>
             </div>
           </div>
-          <span className="version">FREEZE <span>0.1.0</span></span>
+          <span className="version">0.1.0</span>
         </div>
       </aside>
 
@@ -230,7 +230,7 @@ function App() {
             <div className="legacy-import-actions">{legacyImports.map((item) => <button key={item.sourceId} className="secondary-button" onClick={() => void (item.ready ? importPhoneDeck(item.sourceId) : requestPhoneDeck(item.sourceId))}>{item.ready ? 'Import phone deck' : item.requested ? 'Request again' : 'Transfer phone deck'}</button>)}</div>
             {importError ? <p className="usb-error" role="alert">{importError}</p> : null}
           </section> : null}
-          {screen === 'deck' ? <DesktopDeckEditor config={deckConfig} onSaved={setDeckConfig} playbackState={playbackState} /> : <>
+          {screen === 'deck' ? <DesktopDeckEditor config={deckConfig} onSaved={setDeckConfig} playbackState={playbackState} isMacos={connection?.isMacos ?? false} /> : <>
           <div className="page-heading">
             <div>
               <h1>Overview</h1>
@@ -367,7 +367,7 @@ function App() {
   );
 }
 
-function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState }: { config: DeckConfig | null; onSaved: (config: DeckConfig) => void; playbackState: PlaybackState }) {
+function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMacos }: { config: DeckConfig | null; onSaved: (config: DeckConfig) => void; playbackState: PlaybackState; isMacos: boolean }) {
   const [workingConfig, setWorkingConfig] = useState<DeckConfig | null>(savedConfig);
   const [profileId, setProfileId] = useState('');
   const [pageId, setPageId] = useState('');
@@ -616,7 +616,7 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState }: { co
         </div>
       </div>
       <div className="button-properties"><div className="properties-heading"><div><h2>Button settings</h2><p>{selected ? 'Edit the selected control' : 'Select a button to configure it'}</p></div>{selected ? <button className="icon-button" aria-label="Remove button" onClick={() => { const next = { ...config, profiles: config.profiles.map((entry) => entry.id === profile.id ? { ...entry, pages: entry.pages.map((candidate) => candidate.id === page.id ? { ...candidate, buttons: candidate.buttons.filter((item) => item.id !== selected.id) } : candidate) } : entry) }; setButtonId(''); void save(next); }}><Trash2 size={15} /></button> : null}</div>
-        {selected ? <ButtonProperties key={selected.id} button={selected} busy={busy} onChange={updateButton} /> : <div className="properties-empty">Select a button from the deck grid.</div>}
+        {selected ? <ButtonProperties key={selected.id} button={selected} busy={busy} isMacos={isMacos} onChange={updateButton} /> : <div className="properties-empty">Select a button from the deck grid.</div>}
         {selected ? <button className="primary-button save-button" onClick={() => void save(deck)} disabled={busy}><Save size={14} /> {busy ? 'Saving…' : 'Save deck'}</button> : null}
       </div>
     </section>
@@ -747,7 +747,7 @@ function IconPicker({ value, disabled, onChange }: { value: string; disabled: bo
   </div>;
 }
 
-function ButtonProperties({ button, busy, onChange }: { button: DeckButton; busy: boolean; onChange: (patch: Partial<DeckButton>) => void }) {
+function ButtonProperties({ button, busy, isMacos, onChange }: { button: DeckButton; busy: boolean; isMacos: boolean; onChange: (patch: Partial<DeckButton>) => void }) {
   const action = button.action;
   const kind = action.type === 'sequence' ? 'sequence' : action.type;
   const keys = action.type === 'hotkey' ? action.keys.join('+') : '';
@@ -764,19 +764,32 @@ function ButtonProperties({ button, busy, onChange }: { button: DeckButton; busy
     onChange({ action: { ...action, app }, ...(button.icon === 'app-icon' ? { icon: 'auto', iconSvg: undefined } : {}), appIconData: undefined });
     setIconError('');
   }
+  async function extractIcon(useShortcutIcon: boolean) {
+    setExtractingIcon(true);
+    setIconError('');
+    try {
+      const data = await invoke<string>('extract_app_icon', { app, useShortcutIcon });
+      onChange({ icon: 'app-icon', iconSvg: undefined, appIconData: data });
+    } catch (error) {
+      setIconError(String(error));
+    } finally {
+      setExtractingIcon(false);
+    }
+  }
   async function browseApp() {
     try {
       const path = await openFileDialog({
         title: 'Choose an application',
         multiple: false,
         directory: false,
-        filters: [{ name: 'Applications', extensions: ['exe', 'app'] }],
+        filters: [isMacos ? { name: 'Applications', extensions: ['app'] } : { name: 'Applications and shortcuts', extensions: ['exe', 'lnk'] }],
       });
       if (typeof path === 'string') setAppTarget(path);
     } catch (error) {
       setIconError(`Could not open the application picker: ${String(error)}`);
     }
   }
+  const isWindowsShortcut = !isMacos && app.toLowerCase().endsWith('.lnk');
   const setKind = (value: string) => {
     const next: DeckAction = value === 'media' ? { type: 'media', command: 'play_pause' } : value === 'launch_app' ? { type: 'launch_app', app: '' } : value === 'sequence' ? { type: 'sequence', steps: [{ type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] }, { type: 'hotkey', keys: ['CTRL', 'S'] }] } : value === 'select_profile' ? { type: 'select_profile', profileId: 'default' } : value === 'select_page' ? { type: 'select_page', pageId: 'main' } : { type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] };
     onChange({ action: next, ...(value === 'launch_app' ? {} : { icon: 'auto', iconSvg: undefined, appIconData: undefined }) });
@@ -787,7 +800,7 @@ function ButtonProperties({ button, busy, onChange }: { button: DeckButton; busy
     <label>Action<DeckSelect value={kind} onChange={setKind} disabled={busy} options={[['media', 'Media'], ['hotkey', 'Keyboard shortcut'], ['launch_app', 'Launch app'], ['sequence', 'Sequence'], ['select_profile', 'Select profile'], ['select_page', 'Select page']].map(([value, label]) => ({ value, label }))} /></label>
     {kind === 'media' ? <label>Media command<DeckSelect value={media} onChange={(value) => onChange({ action: { type: 'media', command: value as MediaCommand } })} disabled={busy} options={[['play_pause', 'Play / Pause'], ['next_track', 'Next track'], ['previous_track', 'Previous track'], ['volume_up', 'Volume up'], ['volume_down', 'Volume down'], ['mute', 'Mute']].map(([value, label]) => ({ value, label }))} /></label> : null}
     {kind === 'hotkey' ? <label>Keys<input value={keys} onChange={(event) => onChange({ action: { type: 'hotkey', keys: event.target.value.toUpperCase().split('+').map((key) => key.trim()).filter(Boolean) } })} placeholder="CTRL+SHIFT+M" disabled={busy} /></label> : null}
-    {kind === 'launch_app' && action.type === 'launch_app' ? <><label>App path or name<div className="app-path-picker"><input value={app} onChange={(event) => setAppTarget(event.target.value)} placeholder="App path or installed app name" disabled={busy} /><button type="button" className="app-browse-button" aria-label="Browse for an application" title="Browse for an application" disabled={busy} onClick={() => void browseApp()}><FolderOpen size={15} /></button></div></label><button type="button" className="secondary-button app-icon-button" disabled={busy || extractingIcon || !app.trim()} onClick={async () => { setExtractingIcon(true); setIconError(''); try { const data = await invoke<string>('extract_app_icon', { app }); onChange({ icon: 'app-icon', iconSvg: undefined, appIconData: data }); } catch (error) { setIconError(String(error)); } finally { setExtractingIcon(false); } }}>{extractingIcon ? 'Reading app icon…' : button.appIconData ? 'Refresh app icon' : 'Use original app icon'}</button>{iconError ? <small className="form-error">{iconError}</small> : null}</> : null}
+    {kind === 'launch_app' && action.type === 'launch_app' ? <><label>App path or name<div className="app-path-picker"><input value={app} onChange={(event) => setAppTarget(event.target.value)} placeholder="Application, shortcut, or app name" disabled={busy} /><button type="button" className="app-browse-button" aria-label="Browse for an application" title="Browse for an application" disabled={busy} onClick={() => void browseApp()}><FolderOpen size={15} /></button></div></label><button type="button" className="secondary-button app-icon-button" disabled={busy || extractingIcon || !app.trim()} onClick={() => void extractIcon(true)}>{extractingIcon ? 'Reading icon…' : button.appIconData ? isWindowsShortcut ? 'Refresh shortcut icon' : 'Refresh app icon' : isWindowsShortcut ? 'Use shortcut icon' : 'Use original app icon'}</button>{isWindowsShortcut && button.appIconData ? <button type="button" className="secondary-button app-icon-button" disabled={busy || extractingIcon} onClick={() => void extractIcon(false)}>Reset to app icon</button> : null}{iconError ? <small className="form-error">{iconError}</small> : null}</> : null}
     {kind === 'sequence' ? <label>Keyboard steps<textarea value={sequenceDraft} onChange={(event) => setSequenceDraft(event.target.value)} onBlur={() => { const steps = parseSequenceText(sequenceDraft); if (!steps) { setSequenceError('Use 1–10 valid keyboard shortcuts separated by commas.'); return; } setSequenceError(''); onChange({ action: { type: 'sequence', steps } }); }} placeholder="CTRL+SHIFT+M, CTRL+S" disabled={busy} /><small>Enter 1–10 shortcuts separated by commas.</small>{sequenceError ? <small className="form-error">{sequenceError}</small> : null}</label> : null}
     {kind === 'select_profile' ? <label>Profile ID<input value={action.type === 'select_profile' ? action.profileId : ''} onChange={(event) => onChange({ action: { type: 'select_profile', profileId: event.target.value } })} disabled={busy} /></label> : null}
     {kind === 'select_page' ? <label>Page ID<input value={action.type === 'select_page' ? action.pageId : ''} onChange={(event) => onChange({ action: { type: 'select_page', pageId: event.target.value } })} disabled={busy} /></label> : null}

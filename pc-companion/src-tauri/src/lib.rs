@@ -121,38 +121,20 @@ struct DeckButton {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DeckAction {
-    Media {
-        command: MediaCommand,
-    },
-    Hotkey {
-        keys: Vec<String>,
-    },
-    LaunchApp {
-        app: String,
-    },
-    Sequence {
-        steps: Vec<DeckStep>,
-    },
-    SelectProfile {
-        profile_id: String,
-    },
-    SelectPage {
-        page_id: String,
-    },
+    Media { command: MediaCommand },
+    Hotkey { keys: Vec<String> },
+    LaunchApp { app: String },
+    Sequence { steps: Vec<DeckStep> },
+    SelectProfile { profile_id: String },
+    SelectPage { page_id: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DeckStep {
-    Media {
-        command: MediaCommand,
-    },
-    Hotkey {
-        keys: Vec<String>,
-    },
-    LaunchApp {
-        app: String,
-    },
+    Media { command: MediaCommand },
+    Hotkey { keys: Vec<String> },
+    LaunchApp { app: String },
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -501,10 +483,19 @@ fn load_deck_config(path: &Path) -> DeckConfig {
         {
             if let Ok(bytes) = fs::read(candidate) {
                 if let Ok(mut config) = serde_json::from_slice::<DeckConfig>(&bytes) {
-                    for page in config.profiles.iter_mut().flat_map(|profile| &mut profile.pages) {
+                    for page in config
+                        .profiles
+                        .iter_mut()
+                        .flat_map(|profile| &mut profile.pages)
+                    {
                         if page.rows == 0 || page.columns == 0 {
                             page.columns = if page.buttons.len() > 18 { 6 } else { 3 };
-                            page.rows = page.buttons.len().max(1).div_ceil(usize::from(page.columns)) as u8;
+                            page.rows = page
+                                .buttons
+                                .len()
+                                .max(1)
+                                .div_ceil(usize::from(page.columns))
+                                as u8;
                         }
                     }
                     for button in config
@@ -864,7 +855,7 @@ fn save_deck_config(
 }
 
 #[tauri::command]
-fn extract_app_icon(app: String) -> Result<String, String> {
+fn extract_app_icon(app: String, use_shortcut_icon: bool) -> Result<String, String> {
     if app.trim().is_empty() || app.len() > 512 || app.chars().any(char::is_control) {
         return Err("Enter a valid app path".into());
     }
@@ -873,10 +864,61 @@ fn extract_app_icon(app: String) -> Result<String, String> {
         if !Path::new(&app).is_file() {
             return Err("Choose an existing application file".into());
         }
-        let script = r#"Add-Type -AssemblyName System.Drawing; $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($env:FREEZE_APP_PATH); if ($null -eq $icon) { exit 2 }; $bitmap = $icon.ToBitmap(); $stream = New-Object System.IO.MemoryStream; $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png); [Convert]::ToBase64String($stream.ToArray())"#;
+        let script = r#"
+Add-Type -AssemblyName System.Drawing
+$path = $env:FREEZE_APP_PATH
+$icon = $null
+$iconHandle = [IntPtr]::Zero
+$smallHandle = [IntPtr]::Zero
+if ([IO.Path]::GetExtension($path) -ieq '.lnk') {
+  $link = (New-Object -ComObject WScript.Shell).CreateShortcut($path)
+  if ($env:FREEZE_USE_SHORTCUT_ICON -eq '1') {
+    $location = [Environment]::ExpandEnvironmentVariables($link.IconLocation)
+    if ($location -match '^(.*),\s*(-?\d+)$') {
+      $iconPath = $Matches[1].Trim().Trim('"')
+      $iconIndex = [int]$Matches[2]
+    } else {
+      $iconPath = $location.Trim().Trim('"')
+      $iconIndex = 0
+    }
+    if ($iconPath -and (Test-Path -LiteralPath $iconPath -PathType Leaf)) {
+      Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class FreezeIconExtractor {
+  [DllImport("shell32.dll", EntryPoint = "ExtractIconExW", CharSet = CharSet.Unicode)]
+  public static extern uint ExtractIconEx(string file, int index, out IntPtr large, out IntPtr small, uint count);
+  [DllImport("user32.dll", SetLastError = true)]
+  public static extern bool DestroyIcon(IntPtr icon);
+}
+'@
+      $count = [FreezeIconExtractor]::ExtractIconEx($iconPath, $iconIndex, [ref]$iconHandle, [ref]$smallHandle, 1)
+      if ($count -gt 0 -and $iconHandle -ne [IntPtr]::Zero) { $icon = [System.Drawing.Icon]::FromHandle($iconHandle) }
+    }
+  }
+  if ($null -eq $icon -and $link.TargetPath -and (Test-Path -LiteralPath $link.TargetPath -PathType Leaf)) {
+    $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($link.TargetPath)
+  }
+} else {
+  $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($path)
+}
+if ($null -eq $icon) { exit 2 }
+$bitmap = $icon.ToBitmap()
+$stream = New-Object System.IO.MemoryStream
+$bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
+[Console]::Out.Write([Convert]::ToBase64String($stream.ToArray()))
+$bitmap.Dispose()
+$stream.Dispose()
+if ($iconHandle -ne [IntPtr]::Zero) { $null = [FreezeIconExtractor]::DestroyIcon($iconHandle) }
+if ($smallHandle -ne [IntPtr]::Zero) { $null = [FreezeIconExtractor]::DestroyIcon($smallHandle) }
+"#;
         let output = Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .env("FREEZE_APP_PATH", &app)
+            .env(
+                "FREEZE_USE_SHORTCUT_ICON",
+                if use_shortcut_icon { "1" } else { "0" },
+            )
             .output()
             .map_err(|_| "Could not read the application icon".to_owned())?;
         if !output.status.success() {
@@ -1659,7 +1701,14 @@ fn launch_app(app: &str) -> Result<(), String> {
         return Err("Enter a valid app name or path".into());
     }
     #[cfg(windows)]
-    let result = Command::new(app).spawn();
+    let result = if Path::new(app)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"))
+    {
+        Command::new("explorer.exe").arg(app).spawn()
+    } else {
+        Command::new(app).spawn()
+    };
     #[cfg(target_os = "macos")]
     let result = Command::new("open").arg("-a").arg(app).spawn();
     #[cfg(not(any(windows, target_os = "macos")))]
