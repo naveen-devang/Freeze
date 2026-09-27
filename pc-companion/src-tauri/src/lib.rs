@@ -1,0 +1,1861 @@
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    Arc, RwLock,
+};
+use std::thread;
+use std::time::Duration;
+
+use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
+    response::IntoResponse,
+    routing::get,
+    Router,
+};
+use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Manager, WindowEvent,
+};
+use tokio::net::TcpListener;
+use tokio::sync::broadcast;
+
+const PORT: u16 = 39421;
+const MAX_DECK_CONFIG_BYTES: usize = 1_048_576;
+
+struct AppState {
+    host: String,
+    device_name: String,
+    token: RwLock<String>,
+    config_dir: RwLock<Option<PathBuf>>,
+    deck_config: RwLock<DeckConfig>,
+    deck_updates: broadcast::Sender<DeckConfig>,
+    pending_legacy: RwLock<HashMap<String, LegacyPhonePageSet>>,
+    legacy_offers: RwLock<HashMap<String, LegacyImportSummary>>,
+    legacy_requests: broadcast::Sender<String>,
+    active_devices: AtomicUsize,
+    server_online: AtomicBool,
+    android_usb_enabled: AtomicBool,
+    session_epoch: AtomicUsize,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PlaybackState {
+    Playing,
+    Paused,
+    Stopped,
+    Unavailable,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionInfo {
+    host: String,
+    device_name: String,
+    port: u16,
+    token: String,
+    active_devices: usize,
+    server_online: bool,
+    is_macos: bool,
+    android_usb_enabled: bool,
+}
+
+#[cfg(target_os = "macos")]
+const IS_MACOS: bool = true;
+#[cfg(not(target_os = "macos"))]
+const IS_MACOS: bool = false;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeckConfig {
+    schema_version: u32,
+    revision: u64,
+    profiles: Vec<DeckProfile>,
+    active_profile_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeckProfile {
+    id: String,
+    name: String,
+    pages: Vec<DeckPage>,
+    active_page_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeckPage {
+    id: String,
+    name: String,
+    #[serde(default)]
+    rows: u8,
+    #[serde(default)]
+    columns: u8,
+    buttons: Vec<DeckButton>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeckButton {
+    id: String,
+    label: String,
+    icon: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    icon_svg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    app_icon_data: Option<String>,
+    action: DeckAction,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum DeckAction {
+    Media {
+        command: MediaCommand,
+    },
+    Hotkey {
+        keys: Vec<String>,
+    },
+    LaunchApp {
+        app: String,
+    },
+    Sequence {
+        steps: Vec<DeckStep>,
+    },
+    SelectProfile {
+        profile_id: String,
+    },
+    SelectPage {
+        page_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum DeckStep {
+    Media {
+        command: MediaCommand,
+    },
+    Hotkey {
+        keys: Vec<String>,
+    },
+    LaunchApp {
+        app: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyPhonePageSet {
+    source_id: String,
+    pages: Vec<LegacyPhonePage>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyPhonePage {
+    name: String,
+    #[serde(default)]
+    shortcuts: Vec<LegacyPhoneShortcut>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyPhoneShortcut {
+    label: String,
+    #[serde(default)]
+    icon: Option<String>,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    keys: Option<Vec<String>>,
+    #[serde(default)]
+    app: Option<String>,
+    #[serde(default)]
+    steps: Option<Vec<Vec<String>>>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyImportSummary {
+    source_id: String,
+    pages: usize,
+    buttons: usize,
+    requested: bool,
+    ready: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MediaCommand {
+    PlayPause,
+    NextTrack,
+    PreviousTrack,
+    VolumeUp,
+    VolumeDown,
+    Mute,
+}
+
+fn default_deck_config() -> DeckConfig {
+    let buttons = [
+        (
+            "play-pause",
+            "Play / Pause",
+            "auto",
+            MediaCommand::PlayPause,
+        ),
+        ("next-track", "Next track", "auto", MediaCommand::NextTrack),
+        (
+            "previous-track",
+            "Previous track",
+            "auto",
+            MediaCommand::PreviousTrack,
+        ),
+        ("volume-up", "Volume up", "auto", MediaCommand::VolumeUp),
+        (
+            "volume-down",
+            "Volume down",
+            "auto",
+            MediaCommand::VolumeDown,
+        ),
+        ("mute", "Mute", "auto", MediaCommand::Mute),
+    ]
+    .into_iter()
+    .map(|(id, label, icon, command)| DeckButton {
+        id: id.to_owned(),
+        label: label.to_owned(),
+        icon: icon.to_owned(),
+        icon_svg: None,
+        app_icon_data: None,
+        action: DeckAction::Media { command },
+    })
+    .collect();
+    DeckConfig {
+        schema_version: 1,
+        revision: 1,
+        profiles: vec![DeckProfile {
+            id: "default".to_owned(),
+            name: "Default".to_owned(),
+            pages: vec![DeckPage {
+                id: "main".to_owned(),
+                name: "Main".to_owned(),
+                rows: 2,
+                columns: 3,
+                buttons,
+            }],
+            active_page_id: "main".to_owned(),
+        }],
+        active_profile_id: "default".to_owned(),
+    }
+}
+
+fn validate_deck_config(config: &DeckConfig) -> Result<(), String> {
+    if config.schema_version != 1 || config.profiles.is_empty() || config.profiles.len() > 32 {
+        return Err("Deck config must contain 1–32 profiles and use schema version 1".into());
+    }
+    let mut profile_ids = std::collections::HashSet::new();
+    let mut profile_names = std::collections::HashSet::new();
+    for profile in &config.profiles {
+        if !valid_id(&profile.id)
+            || !profile_ids.insert(profile.id.clone())
+            || !valid_label(&profile.name, 32)
+            || !profile_names.insert(profile.name.to_lowercase())
+        {
+            return Err("Profile IDs and names must be valid and unique".into());
+        }
+        if profile.pages.is_empty() || profile.pages.len() > 8 {
+            return Err("Each profile must contain 1–8 pages".into());
+        }
+        let mut page_ids = std::collections::HashSet::new();
+        let mut page_names = std::collections::HashSet::new();
+        let mut button_ids = std::collections::HashSet::new();
+        for page in &profile.pages {
+            if !valid_id(&page.id)
+                || !page_ids.insert(&page.id)
+                || !valid_label(&page.name, 24)
+                || !page_names.insert(page.name.to_lowercase())
+            {
+                return Err("Page IDs and names must be valid and unique".into());
+            }
+            if !(1..=6).contains(&page.rows) || !(1..=6).contains(&page.columns) {
+                return Err("Page rows and columns must be between 1 and 6".into());
+            }
+            if page.buttons.len() > usize::from(page.rows) * usize::from(page.columns) {
+                return Err("A page cannot contain more buttons than its grid slots".into());
+            }
+            for button in &page.buttons {
+                if !valid_id(&button.id)
+                    || !button_ids.insert(&button.id)
+                    || !valid_label(&button.label, 24)
+                {
+                    return Err(
+                        "Button IDs and labels must be valid and unique within a profile".into(),
+                    );
+                }
+                if !valid_icon_name(&button.icon) {
+                    return Err("A button uses an unsupported icon".into());
+                }
+                if let Some(svg) = &button.icon_svg {
+                    let lower = svg.to_ascii_lowercase();
+                    if button.icon == "auto"
+                        || button.icon == "app-icon"
+                        || svg.len() > 8_192
+                        || !svg.starts_with("<svg")
+                        || !svg.ends_with("</svg>")
+                        || [
+                            "<script",
+                            "<foreignobject",
+                            "<!",
+                            "<?",
+                            "onload=",
+                            "onclick=",
+                            "href=",
+                            "url(",
+                        ]
+                        .iter()
+                        .any(|blocked| lower.contains(blocked))
+                    {
+                        return Err("A button contains an invalid Lucide icon".into());
+                    }
+                }
+                if button
+                    .icon
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_uppercase)
+                    && ![
+                        "Command",
+                        "Monitor",
+                        "Music",
+                        "Mic",
+                        "Headphones",
+                        "AppWindow",
+                    ]
+                    .contains(&button.icon.as_str())
+                    && button.icon_svg.is_none()
+                {
+                    return Err("A custom Lucide icon needs its vector data".into());
+                }
+                if let Some(data) = &button.app_icon_data {
+                    if data.len() > 65_536
+                        || !data.starts_with("data:image/png;base64,")
+                        || button.icon != "app-icon"
+                    {
+                        return Err("A button contains an invalid app icon".into());
+                    }
+                }
+                if button.icon == "app-icon"
+                    && (button.app_icon_data.is_none()
+                        || !matches!(&button.action, DeckAction::LaunchApp { .. }))
+                {
+                    return Err("An app icon requires a launch app action".into());
+                }
+                validate_action(&button.action)?;
+            }
+        }
+        if !page_ids.contains(&profile.active_page_id) {
+            return Err("The active page must exist in its profile".into());
+        }
+    }
+    if !profile_ids.contains(&config.active_profile_id) {
+        return Err("The active profile must exist".into());
+    }
+    for profile in &config.profiles {
+        let page_ids: std::collections::HashSet<_> =
+            profile.pages.iter().map(|page| page.id.as_str()).collect();
+        for button in profile.pages.iter().flat_map(|page| &page.buttons) {
+            match &button.action {
+                DeckAction::SelectProfile { profile_id } if !profile_ids.contains(profile_id) => {
+                    return Err("A button references an unknown profile".into())
+                }
+                DeckAction::SelectPage { page_id } if !page_ids.contains(page_id.as_str()) => {
+                    return Err("A button references an unknown page".into())
+                }
+                _ => (),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn valid_icon_name(value: &str) -> bool {
+    matches!(value, "auto" | "app-icon")
+        || [
+            "command",
+            "monitor",
+            "music",
+            "mic",
+            "headphones",
+            "app-window",
+        ]
+        .contains(&value)
+        || (value.len() <= 64
+            && value.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+            && value.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+}
+
+fn valid_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+}
+
+fn valid_label(value: &str, max: usize) -> bool {
+    !value.trim().is_empty() && value.len() <= max && !value.chars().any(char::is_control)
+}
+
+fn validate_action(action: &DeckAction) -> Result<(), String> {
+    match action {
+        DeckAction::Media { .. }
+        | DeckAction::SelectProfile { .. }
+        | DeckAction::SelectPage { .. } => Ok(()),
+        DeckAction::Hotkey { keys } => validate_hotkey(keys),
+        DeckAction::LaunchApp { app, .. } => validate_app_target(app),
+        DeckAction::Sequence { steps } => {
+            if steps.is_empty() || steps.len() > 10 {
+                return Err("A sequence must contain 1–10 steps".into());
+            }
+            for step in steps {
+                match step {
+                    DeckStep::Media { .. } => (),
+                    DeckStep::Hotkey { keys } => validate_hotkey(keys)?,
+                    DeckStep::LaunchApp { app, .. } => validate_app_target(app)?,
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_hotkey(keys: &[String]) -> Result<(), String> {
+    if keys.len() < 2
+        || keys.len() > 5
+        || keys[..keys.len() - 1]
+            .iter()
+            .any(|key| !["CTRL", "ALT", "SHIFT", "META"].contains(&key.as_str()))
+    {
+        return Err("A shortcut must contain supported modifiers and one key".into());
+    }
+    let modifiers: std::collections::HashSet<_> = keys[..keys.len() - 1].iter().collect();
+    if modifiers.len() != keys.len() - 1 {
+        return Err("Shortcut modifiers must be unique".into());
+    }
+    parse_key(&keys[keys.len() - 1]).map(|_| ())
+}
+
+fn validate_app_target(app: &str) -> Result<(), String> {
+    if app.trim().is_empty() || app.len() > 512 || app.chars().any(char::is_control) {
+        Err("Enter a valid app name or path".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn save_deck_config_file(path: &Path, config: &DeckConfig) -> Result<(), String> {
+    validate_deck_config(config)?;
+    let temp = path.with_extension("json.tmp");
+    let backup = path.with_extension("json.bak");
+    let bytes =
+        serde_json::to_vec_pretty(config).map_err(|_| "Could not encode deck config".to_owned())?;
+    if bytes.len() > MAX_DECK_CONFIG_BYTES {
+        return Err("Deck config exceeds the 1 MiB size limit".into());
+    }
+    fs::write(&temp, bytes).map_err(|_| "Could not write deck config".to_owned())?;
+    if path.exists() {
+        let _ = fs::remove_file(&backup);
+        fs::rename(path, &backup).map_err(|_| "Could not prepare deck config update".to_owned())?;
+    }
+    if let Err(error) = fs::rename(&temp, path) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, path);
+        }
+        let _ = fs::remove_file(&temp);
+        return Err(format!("Could not save deck config: {error}"));
+    }
+    let _ = fs::remove_file(backup);
+    Ok(())
+}
+
+fn get_deck_config(state: &AppState) -> Option<DeckConfig> {
+    state.deck_config.read().ok().map(|config| config.clone())
+}
+
+fn load_deck_config(path: &Path) -> DeckConfig {
+    for candidate in [path.to_path_buf(), path.with_extension("json.bak")] {
+        if candidate
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() as usize <= MAX_DECK_CONFIG_BYTES)
+        {
+            if let Ok(bytes) = fs::read(candidate) {
+                if let Ok(mut config) = serde_json::from_slice::<DeckConfig>(&bytes) {
+                    for page in config.profiles.iter_mut().flat_map(|profile| &mut profile.pages) {
+                        if page.rows == 0 || page.columns == 0 {
+                            page.columns = if page.buttons.len() > 18 { 6 } else { 3 };
+                            page.rows = page.buttons.len().max(1).div_ceil(usize::from(page.columns)) as u8;
+                        }
+                    }
+                    for button in config
+                        .profiles
+                        .iter_mut()
+                        .flat_map(|profile| &mut profile.pages)
+                        .flat_map(|page| &mut page.buttons)
+                    {
+                        let legacy = button.icon.as_str();
+                        button.icon = match legacy {
+                            "command" => "Command",
+                            "monitor" => "Monitor",
+                            "music" if matches!(&button.action, DeckAction::Media { .. }) => "auto",
+                            "headphones" | "mic"
+                                if matches!(&button.action, DeckAction::Media { .. }) =>
+                            {
+                                "auto"
+                            }
+                            "music" => "Music",
+                            "headphones" => "Headphones",
+                            "mic" => "Mic",
+                            "app-window" => "AppWindow",
+                            _ => continue,
+                        }
+                        .to_owned();
+                        if button.icon == "auto" {
+                            button.icon_svg = None;
+                        }
+                    }
+                    if validate_deck_config(&config).is_ok() {
+                        return config;
+                    }
+                }
+            }
+        }
+    }
+    default_deck_config()
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ClientMessage {
+    Authenticate {
+        token: String,
+        #[serde(default, rename = "protocolVersion")]
+        protocol_version: Option<u32>,
+        #[serde(default, rename = "legacySourceId")]
+        legacy_source_id: Option<String>,
+        #[serde(default, rename = "legacyDeckAvailable")]
+        legacy_deck_available: bool,
+    },
+    InvokeButton {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        revision: u64,
+        #[serde(rename = "buttonId")]
+        button_id: String,
+    },
+    SelectProfile {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        revision: u64,
+        #[serde(rename = "profileId")]
+        profile_id: String,
+    },
+    SelectPage {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        revision: u64,
+        #[serde(rename = "pageId")]
+        page_id: String,
+    },
+    LegacyDeck {
+        #[serde(rename = "legacyDeck")]
+        deck: LegacyPhonePageSet,
+    },
+}
+
+enum ClientAction {
+    Hotkey { keys: Vec<String> },
+    Media { command: MediaCommand },
+    LaunchApp { app: String },
+    Sequence { actions: Vec<SequenceAction> },
+}
+
+enum SequenceAction {
+    Hotkey { keys: Vec<String> },
+    Media { command: MediaCommand },
+    LaunchApp { app: String },
+}
+
+#[tauri::command]
+fn connection_info(state: tauri::State<'_, Arc<AppState>>) -> ConnectionInfo {
+    ConnectionInfo {
+        host: state.host.clone(),
+        device_name: state.device_name.clone(),
+        port: PORT,
+        token: state
+            .token
+            .read()
+            .map(|token| token.clone())
+            .unwrap_or_default(),
+        active_devices: state.active_devices.load(Ordering::Relaxed),
+        server_online: state.server_online.load(Ordering::Relaxed),
+        is_macos: IS_MACOS,
+        android_usb_enabled: state.android_usb_enabled.load(Ordering::Relaxed),
+    }
+}
+
+#[tauri::command]
+fn deck_config(state: tauri::State<'_, Arc<AppState>>) -> Result<DeckConfig, String> {
+    state
+        .deck_config
+        .read()
+        .map(|config| config.clone())
+        .map_err(|_| "Freeze deck config is unavailable".to_owned())
+}
+
+#[tauri::command]
+fn pending_legacy_imports(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<LegacyImportSummary>, String> {
+    state
+        .legacy_offers
+        .read()
+        .map(|offers| offers.values().cloned().collect())
+        .map_err(|_| "Pending phone imports are unavailable".to_owned())
+}
+
+#[tauri::command]
+fn request_legacy_deck_import(
+    source_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let mut offers = state
+        .legacy_offers
+        .write()
+        .map_err(|_| "Pending phone imports are unavailable".to_owned())?;
+    let offer = offers
+        .get_mut(&source_id)
+        .ok_or_else(|| "This phone is no longer connected".to_owned())?;
+    if offer.ready {
+        return Ok(());
+    }
+    offer.requested = true;
+    let _ = state.legacy_requests.send(source_id);
+    Ok(())
+}
+
+#[tauri::command]
+fn import_legacy_deck(
+    source_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<DeckConfig, String> {
+    let pending = state
+        .pending_legacy
+        .read()
+        .map_err(|_| "Pending phone imports are unavailable".to_owned())?
+        .get(&source_id)
+        .cloned()
+        .ok_or_else(|| "This phone deck import is no longer available".to_owned())?;
+    if !state
+        .legacy_offers
+        .read()
+        .map_err(|_| "Pending phone imports are unavailable".to_owned())?
+        .get(&source_id)
+        .is_some_and(|offer| offer.ready)
+    {
+        return Err("Request the phone deck transfer before importing it".into());
+    }
+    validate_legacy_deck(&pending)?;
+    let mut config = state
+        .deck_config
+        .write()
+        .map_err(|_| "Freeze deck config is unavailable".to_owned())?;
+    let mut profile_name = "Imported phone deck".to_owned();
+    let mut suffix = 2;
+    while config
+        .profiles
+        .iter()
+        .any(|profile| profile.name.eq_ignore_ascii_case(&profile_name))
+    {
+        profile_name = format!("Imported phone deck {suffix}");
+        suffix += 1;
+    }
+    let profile_id = format!("import-{}", pending.source_id);
+    if config
+        .profiles
+        .iter()
+        .any(|profile| profile.id == profile_id)
+    {
+        return Err("This phone deck was already imported".into());
+    }
+    let pages: Vec<DeckPage> = pending
+        .pages
+        .iter()
+        .enumerate()
+        .map(|(page_index, page)| {
+            let name: String = page.name.trim().chars().take(24).collect();
+            let buttons: Result<Vec<DeckButton>, String> = page
+                .shortcuts
+                .iter()
+                .enumerate()
+                .map(|(button_index, shortcut)| {
+                    let action = match shortcut.kind.as_deref().unwrap_or("hotkey") {
+                        "hotkey" => DeckAction::Hotkey {
+                            keys: shortcut.keys.clone().unwrap_or_default(),
+                        },
+                        "launch_app" => DeckAction::LaunchApp {
+                            app: shortcut.app.clone().unwrap_or_default(),
+                        },
+                        "sequence" => DeckAction::Sequence {
+                            steps: shortcut
+                                .steps
+                                .clone()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|keys| DeckStep::Hotkey { keys })
+                                .collect(),
+                        },
+                        _ => return Err("A phone deck contains an unsupported action".into()),
+                    };
+                    Ok(DeckButton {
+                        id: format!("imp{}b{}", page_index, button_index),
+                        label: shortcut.label.trim().chars().take(24).collect(),
+                        icon: shortcut
+                            .icon
+                            .as_deref()
+                            .filter(|icon| {
+                                [
+                                    "command",
+                                    "monitor",
+                                    "music",
+                                    "mic",
+                                    "headphones",
+                                    "app-window",
+                                ]
+                                .contains(icon)
+                            })
+                            .unwrap_or("command")
+                            .to_owned(),
+                        icon_svg: None,
+                        app_icon_data: None,
+                        action,
+                    })
+                })
+                .collect();
+            Ok(DeckPage {
+                id: format!("impp{page_index}"),
+                name: if name.is_empty() {
+                    format!("Page {}", page_index + 1)
+                } else {
+                    name
+                },
+                rows: 4,
+                columns: 3,
+                buttons: buttons?,
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    let active_page_id = pages
+        .first()
+        .map(|page| page.id.clone())
+        .ok_or_else(|| "Phone deck has no pages".to_owned())?;
+    config.profiles.push(DeckProfile {
+        id: profile_id,
+        name: profile_name,
+        pages,
+        active_page_id,
+    });
+    config.active_profile_id = format!("import-{}", pending.source_id);
+    config.revision = config.revision.saturating_add(1);
+    let config_dir = state
+        .config_dir
+        .read()
+        .map_err(|_| "Freeze settings are unavailable".to_owned())?
+        .clone()
+        .ok_or_else(|| "Freeze settings are unavailable".to_owned())?;
+    save_deck_config_file(&config_dir.join("deck-config.json"), &config)?;
+    let result = config.clone();
+    drop(config);
+    state
+        .pending_legacy
+        .write()
+        .map_err(|_| "Pending phone imports are unavailable".to_owned())?
+        .remove(&source_id);
+    state
+        .legacy_offers
+        .write()
+        .map_err(|_| "Pending phone imports are unavailable".to_owned())?
+        .remove(&source_id);
+    let _ = state.deck_updates.send(result.clone());
+    Ok(result)
+}
+
+fn validate_legacy_deck(deck: &LegacyPhonePageSet) -> Result<(), String> {
+    if !valid_id(&deck.source_id)
+        || deck.source_id.len() > 56
+        || deck.pages.is_empty()
+        || deck.pages.len() > 8
+    {
+        return Err("Phone deck import is invalid".into());
+    }
+    for page in &deck.pages {
+        if !valid_label(&page.name, 128) || page.shortcuts.len() > 12 {
+            return Err("Phone deck import has invalid pages or too many buttons".into());
+        }
+        for shortcut in &page.shortcuts {
+            if !valid_label(&shortcut.label, 128) {
+                return Err("Phone deck import contains an invalid button label".into());
+            }
+            let action = match shortcut.kind.as_deref().unwrap_or("hotkey") {
+                "hotkey" => DeckAction::Hotkey {
+                    keys: shortcut.keys.clone().unwrap_or_default(),
+                },
+                "launch_app" => DeckAction::LaunchApp {
+                    app: shortcut.app.clone().unwrap_or_default(),
+                },
+                "sequence" => DeckAction::Sequence {
+                    steps: shortcut
+                        .steps
+                        .clone()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|keys| DeckStep::Hotkey { keys })
+                        .collect(),
+                },
+                _ => return Err("Phone deck import contains an unsupported action".into()),
+            };
+            validate_action(&action)?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn save_deck_config(
+    mut config: DeckConfig,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<DeckConfig, String> {
+    validate_deck_config(&config)?;
+    let mut current = state
+        .deck_config
+        .write()
+        .map_err(|_| "Freeze deck config is unavailable".to_owned())?;
+    let config_dir = state
+        .config_dir
+        .read()
+        .map_err(|_| "Freeze settings are unavailable".to_owned())?
+        .clone()
+        .ok_or_else(|| "Freeze settings are unavailable".to_owned())?;
+    config.revision = current.revision.saturating_add(1);
+    save_deck_config_file(&config_dir.join("deck-config.json"), &config)?;
+    *current = config.clone();
+    let _ = state.deck_updates.send(config.clone());
+    Ok(config)
+}
+
+#[tauri::command]
+fn extract_app_icon(app: String) -> Result<String, String> {
+    if app.trim().is_empty() || app.len() > 512 || app.chars().any(char::is_control) {
+        return Err("Enter a valid app path".into());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if !Path::new(&app).is_file() {
+            return Err("Choose an existing application file".into());
+        }
+        let script = r#"Add-Type -AssemblyName System.Drawing; $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($env:FREEZE_APP_PATH); if ($null -eq $icon) { exit 2 }; $bitmap = $icon.ToBitmap(); $stream = New-Object System.IO.MemoryStream; $bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png); [Convert]::ToBase64String($stream.ToArray())"#;
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env("FREEZE_APP_PATH", &app)
+            .output()
+            .map_err(|_| "Could not read the application icon".to_owned())?;
+        if !output.status.success() {
+            return Err("Windows could not read an icon from that application".into());
+        }
+        let encoded = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if encoded.is_empty() || encoded.len() > 65_500 {
+            return Err("The application icon is too large to use".into());
+        }
+        return Ok(format!("data:image/png;base64,{encoded}"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let bundle = Path::new(&app);
+        if !bundle.is_dir() {
+            return Err("Choose a macOS .app bundle to extract its icon".into());
+        }
+        let resources = bundle.join("Contents/Resources");
+        let info = bundle.join("Contents/Info.plist");
+        let declared = Command::new("/usr/bin/plutil")
+            .args(["-extract", "CFBundleIconFile", "raw", "-o", "-"])
+            .arg(&info)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+        let declared_path = declared
+            .filter(|name| !name.is_empty() && Path::new(name).file_name().is_some())
+            .map(|name| {
+                resources.join(if name.ends_with(".icns") {
+                    name
+                } else {
+                    format!("{name}.icns")
+                })
+            })
+            .filter(|path| path.is_file());
+        let icon = declared_path
+            .or_else(|| {
+                fs::read_dir(&resources)
+                    .ok()?
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .find(|path| {
+                        path.extension()
+                            .is_some_and(|extension| extension.eq_ignore_ascii_case("icns"))
+                    })
+            })
+            .ok_or_else(|| "No .icns file was found in this app bundle".to_owned())?;
+        let temp = std::env::temp_dir().join(format!("freeze-icon-{}.png", rand::random::<u64>()));
+        let converted = Command::new("/usr/bin/sips")
+            .args(["-s", "format", "png", "--resampleWidth", "128"])
+            .arg(&icon)
+            .arg("--out")
+            .arg(&temp)
+            .output()
+            .map_err(|_| "Could not convert the macOS app icon".to_owned())?;
+        if !converted.status.success() {
+            return Err("Could not convert the macOS app icon".into());
+        }
+        let encoded = Command::new("/usr/bin/base64")
+            .arg("-i")
+            .arg(&temp)
+            .output()
+            .map_err(|_| "Could not encode the macOS app icon".to_owned());
+        let _ = fs::remove_file(&temp);
+        let encoded = encoded?;
+        if !encoded.status.success() || encoded.stdout.len() > 65_500 {
+            return Err("The application icon is too large to use".into());
+        }
+        let data = String::from_utf8_lossy(&encoded.stdout)
+            .replace('\n', "")
+            .replace('\r', "");
+        return Ok(format!("data:image/png;base64,{data}"));
+    }
+    #[allow(unreachable_code)]
+    Err("Original app icons are not supported on this platform".into())
+}
+
+#[tauri::command]
+fn enable_android_usb(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+    ensure_android_usb_reverse()?;
+    let config_dir = state
+        .config_dir
+        .read()
+        .map_err(|_| "Freeze settings are unavailable".to_owned())?
+        .clone()
+        .ok_or_else(|| "Freeze settings are unavailable".to_owned())?;
+    fs::write(config_dir.join("android-usb-enabled"), "true")
+        .map_err(|_| "Could not save the Android USB setting".to_owned())?;
+    state.android_usb_enabled.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+fn rotate_pairing_key(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+    let config_dir = state
+        .config_dir
+        .read()
+        .map_err(|_| "Freeze settings are unavailable".to_owned())?
+        .clone()
+        .ok_or_else(|| "Freeze settings are unavailable".to_owned())?;
+    let token = create_pairing_key();
+    save_pairing_key(&config_dir.join("pairing-key"), &token)?;
+    *state
+        .token
+        .write()
+        .map_err(|_| "Freeze pairing key is unavailable".to_owned())? = token;
+    state.session_epoch.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+fn ensure_android_usb_reverse() -> Result<(), String> {
+    let devices = Command::new("adb")
+        .args(["devices"])
+        .output()
+        .map_err(|_| {
+            "Install Android SDK Platform-Tools and make adb available in PATH".to_owned()
+        })?;
+    if !devices.status.success() {
+        return Err("Android Debug Bridge could not list connected devices".into());
+    }
+    let output = String::from_utf8_lossy(&devices.stdout);
+    let states: Vec<_> = output
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .collect();
+    if states.iter().any(|state| *state == "unauthorized") {
+        return Err("Unlock your Android phone and allow USB debugging for this PC".into());
+    }
+    if states.len() > 1 {
+        return Err("Connect only one Android phone by USB at a time".into());
+    }
+    let authorized = states.iter().filter(|state| **state == "device").count();
+    if authorized == 0 {
+        return Err("Connect one Android phone by USB and enable USB debugging".into());
+    }
+    let forwards = Command::new("adb")
+        .args(["reverse", "--list"])
+        .output()
+        .map_err(|_| "Android Debug Bridge could not check USB forwarding".to_owned())?;
+    if forwards.status.success()
+        && String::from_utf8_lossy(&forwards.stdout).contains("tcp:39421 tcp:39421")
+    {
+        return Ok(());
+    }
+    let reverse = Command::new("adb")
+        .args(["reverse", "tcp:39421", "tcp:39421"])
+        .output()
+        .map_err(|_| "Android Debug Bridge could not configure USB forwarding".to_owned())?;
+    if !reverse.status.success() {
+        let detail = String::from_utf8_lossy(&reverse.stderr);
+        return Err(if detail.trim().is_empty() {
+            "Android USB port forwarding failed".into()
+        } else {
+            detail.trim().to_owned()
+        });
+    }
+    Ok(())
+}
+
+fn create_pairing_key() -> String {
+    let mut secret = [0_u8; 32];
+    rand::rng().fill_bytes(&mut secret);
+    secret.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn machine_name() -> String {
+    let name = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .or_else(|| {
+            Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        })
+        .unwrap_or_else(|| "Freeze PC".to_owned());
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        "Freeze PC".to_owned()
+    } else {
+        cleaned
+    }
+}
+
+fn save_pairing_key(path: &Path, token: &str) -> Result<(), String> {
+    fs::write(path, token).map_err(|_| "Could not save the Freeze pairing key".to_owned())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|_| "Could not secure the Freeze pairing key".to_owned())?;
+    }
+    Ok(())
+}
+
+fn load_or_create_pairing_key(path: &Path) -> Result<String, String> {
+    if let Ok(saved) = fs::read_to_string(path) {
+        let token = saved.trim();
+        if token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok(token.to_owned());
+        }
+    }
+    let token = create_pairing_key();
+    save_pairing_key(path, &token)?;
+    Ok(token)
+}
+
+async fn upgrade_socket(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    ws.max_message_size(MAX_DECK_CONFIG_BYTES + 65_536)
+        .max_frame_size(MAX_DECK_CONFIG_BYTES + 65_536)
+        .on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
+    let mut authenticated = false;
+    let mut session_epoch = 0;
+    let mut deck_updates = state.deck_updates.subscribe();
+    let mut legacy_requests = state.legacy_requests.subscribe();
+    let mut legacy_source_id: Option<String> = None;
+    let mut playback_updates = tokio::time::interval(Duration::from_millis(500));
+    let mut last_playback_state = None;
+    loop {
+        let incoming = tokio::select! {
+            message = socket.recv() => message,
+            update = deck_updates.recv(), if authenticated => {
+                match update {
+                    Ok(config) => {
+                        let message = serde_json::json!({ "type": "deck_snapshot", "protocolVersion": 1, "config": config });
+                        if socket.send(Message::Text(message.to_string().into())).await.is_err() { break; }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if let Some(config) = get_deck_config(&state) {
+                            let message = serde_json::json!({ "type": "deck_snapshot", "protocolVersion": 1, "config": config });
+                            if socket.send(Message::Text(message.to_string().into())).await.is_err() { break; }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+                continue;
+            }
+            request = legacy_requests.recv(), if authenticated => {
+                match request {
+                    Ok(source_id) if legacy_source_id.as_deref() == Some(source_id.as_str()) => {
+                        let message = serde_json::json!({ "type": "legacy_deck_request", "sourceId": source_id });
+                        if socket.send(Message::Text(message.to_string().into())).await.is_err() { break; }
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+                continue;
+            }
+            _ = playback_updates.tick(), if authenticated => {
+                if state.session_epoch.load(Ordering::Relaxed) != session_epoch {
+                    break;
+                }
+                let playback_state = current_playback_state().await;
+                if last_playback_state != Some(playback_state) {
+                    let message = serde_json::json!({ "type": "playback_state", "state": playback_state });
+                    if socket.send(Message::Text(message.to_string().into())).await.is_err() {
+                        break;
+                    }
+                    last_playback_state = Some(playback_state);
+                }
+                continue;
+            }
+        };
+        let Some(Ok(message)) = incoming else {
+            break;
+        };
+        let Message::Text(text) = message else {
+            continue;
+        };
+        let Ok(message) = serde_json::from_str::<ClientMessage>(&text) else {
+            let _ = socket
+                .send(Message::Text(
+                    r#"{"type":"error","message":"invalid_message"}"#.into(),
+                ))
+                .await;
+            continue;
+        };
+
+        match message {
+            ClientMessage::Authenticate {
+                token,
+                protocol_version,
+                legacy_source_id: requested_source_id,
+                legacy_deck_available,
+            } if !authenticated => {
+                if protocol_version != Some(1) {
+                    let _ = socket
+                        .send(Message::Text(
+                            r#"{"type":"error","message":"update_required","protocolVersion":1}"#
+                                .into(),
+                        ))
+                        .await;
+                    break;
+                }
+                if state
+                    .token
+                    .read()
+                    .map(|current| *current != token)
+                    .unwrap_or(true)
+                {
+                    let _ = socket
+                        .send(Message::Text(
+                            r#"{"type":"error","message":"unauthorized"}"#.into(),
+                        ))
+                        .await;
+                    break;
+                }
+                authenticated = true;
+                session_epoch = state.session_epoch.load(Ordering::Relaxed);
+                state.active_devices.fetch_add(1, Ordering::Relaxed);
+                if legacy_deck_available {
+                    if let Some(source_id) =
+                        requested_source_id.filter(|id| valid_id(id) && id.len() <= 56)
+                    {
+                        let imported = state
+                            .deck_config
+                            .read()
+                            .map(|config| {
+                                config
+                                    .profiles
+                                    .iter()
+                                    .any(|profile| profile.id == format!("import-{source_id}"))
+                            })
+                            .unwrap_or(false);
+                        if !imported {
+                            legacy_source_id = Some(source_id.clone());
+                            if let Ok(mut offers) = state.legacy_offers.write() {
+                                offers.insert(
+                                    source_id.clone(),
+                                    LegacyImportSummary {
+                                        source_id,
+                                        pages: 0,
+                                        buttons: 0,
+                                        requested: false,
+                                        ready: false,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                if socket
+                    .send(Message::Text(r#"{"type":"ready"}"#.into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if let Some(config) = get_deck_config(&state) {
+                    let message = serde_json::json!({ "type": "deck_snapshot", "protocolVersion": 1, "config": config });
+                    if socket
+                        .send(Message::Text(message.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                let playback_state = current_playback_state().await;
+                let message =
+                    serde_json::json!({ "type": "playback_state", "state": playback_state });
+                if socket
+                    .send(Message::Text(message.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            ClientMessage::InvokeButton {
+                request_id,
+                revision,
+                button_id,
+            } if authenticated => {
+                let result = if !valid_id(&request_id) || !valid_id(&button_id) {
+                    Err("invalid_request".to_owned())
+                } else {
+                    invoke_button(&state, revision, &button_id)
+                };
+                let stale_revision = matches!(&result, Err(error) if error == "stale_revision");
+                let reply = match result {
+                    Ok(()) => {
+                        serde_json::json!({ "type": "action_result", "requestId": request_id, "ok": true })
+                    }
+                    Err(error) => {
+                        let reason = if error == "stale_revision" || error == "unknown_button" {
+                            error.as_str()
+                        } else if error.starts_with("Could not launch app:") {
+                            "app_launch_failed"
+                        } else if error.to_lowercase().contains("permission") {
+                            "accessibility_permission_required"
+                        } else {
+                            "control_failed"
+                        };
+                        serde_json::json!({ "type": "action_result", "requestId": request_id, "ok": false, "reason": reason })
+                    }
+                };
+                if socket
+                    .send(Message::Text(reply.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if stale_revision {
+                    if let Some(config) = get_deck_config(&state) {
+                        let snapshot = serde_json::json!({ "type": "deck_snapshot", "protocolVersion": 1, "config": config });
+                        if socket
+                            .send(Message::Text(snapshot.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            ClientMessage::SelectProfile {
+                request_id,
+                revision,
+                profile_id,
+            } if authenticated => {
+                let result = if valid_id(&request_id) {
+                    update_selection(&state, revision, Some(&profile_id), None)
+                } else {
+                    Err("invalid_request".to_owned())
+                };
+                let stale_revision = matches!(&result, Err(error) if error == "stale_revision");
+                let reply = selection_reply(&request_id, result);
+                if socket
+                    .send(Message::Text(reply.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if stale_revision {
+                    if let Some(config) = get_deck_config(&state) {
+                        let snapshot = serde_json::json!({ "type": "deck_snapshot", "protocolVersion": 1, "config": config });
+                        if socket
+                            .send(Message::Text(snapshot.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            ClientMessage::SelectPage {
+                request_id,
+                revision,
+                page_id,
+            } if authenticated => {
+                let result = if valid_id(&request_id) {
+                    update_selection(&state, revision, None, Some(&page_id))
+                } else {
+                    Err("invalid_request".to_owned())
+                };
+                let stale_revision = matches!(&result, Err(error) if error == "stale_revision");
+                let reply = selection_reply(&request_id, result);
+                if socket
+                    .send(Message::Text(reply.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                if stale_revision {
+                    if let Some(config) = get_deck_config(&state) {
+                        let snapshot = serde_json::json!({ "type": "deck_snapshot", "protocolVersion": 1, "config": config });
+                        if socket
+                            .send(Message::Text(snapshot.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            ClientMessage::LegacyDeck { deck } if authenticated => {
+                let requested = state
+                    .legacy_offers
+                    .read()
+                    .map(|offers| {
+                        offers
+                            .get(&deck.source_id)
+                            .is_some_and(|offer| offer.requested)
+                    })
+                    .unwrap_or(false);
+                let accepted = legacy_source_id.as_deref() == Some(deck.source_id.as_str())
+                    && requested
+                    && validate_legacy_deck(&deck).is_ok();
+                if accepted {
+                    if let Ok(mut offers) = state.legacy_offers.write() {
+                        if let Some(offer) = offers
+                            .get_mut(&deck.source_id)
+                            .filter(|offer| offer.requested)
+                        {
+                            offer.pages = deck.pages.len();
+                            offer.buttons =
+                                deck.pages.iter().map(|page| page.shortcuts.len()).sum();
+                            offer.ready = true;
+                            if let Ok(mut pending) = state.pending_legacy.write() {
+                                pending.insert(deck.source_id.clone(), deck);
+                            }
+                        }
+                    }
+                }
+                let response = if accepted {
+                    r#"{"type":"legacy_deck_received"}"#
+                } else {
+                    r#"{"type":"error","message":"invalid_legacy_deck"}"#
+                };
+                if socket.send(Message::Text(response.into())).await.is_err() {
+                    break;
+                }
+            }
+            _ => {
+                let _ = socket
+                    .send(Message::Text(
+                        r#"{"type":"error","message":"unauthorized"}"#.into(),
+                    ))
+                    .await;
+                break;
+            }
+        }
+    }
+    if authenticated {
+        state.active_devices.fetch_sub(1, Ordering::Relaxed);
+    }
+    if let Some(source_id) = legacy_source_id {
+        if let Ok(mut offers) = state.legacy_offers.write() {
+            if let Some(offer) = offers.get_mut(&source_id) {
+                if !offer.ready {
+                    offer.requested = false;
+                }
+            }
+        }
+    }
+}
+
+fn update_selection(
+    state: &AppState,
+    expected_revision: u64,
+    profile_id: Option<&str>,
+    page_id: Option<&str>,
+) -> Result<(), String> {
+    let mut config = state
+        .deck_config
+        .write()
+        .map_err(|_| "Deck config is unavailable".to_owned())?;
+    if config.revision != expected_revision {
+        return Err("stale_revision".into());
+    }
+    if let Some(profile_id) = profile_id {
+        if !config
+            .profiles
+            .iter()
+            .any(|profile| profile.id == profile_id)
+        {
+            return Err("unknown_profile".into());
+        }
+        config.active_profile_id = profile_id.to_owned();
+    }
+    let active_profile_id = config.active_profile_id.clone();
+    let profile = config
+        .profiles
+        .iter_mut()
+        .find(|profile| profile.id == active_profile_id)
+        .ok_or_else(|| "unknown_profile".to_owned())?;
+    if let Some(page_id) = page_id {
+        if !profile.pages.iter().any(|page| page.id == page_id) {
+            return Err("unknown_page".into());
+        }
+        profile.active_page_id = page_id.to_owned();
+    }
+    config.revision = config.revision.saturating_add(1);
+    let config_dir = state
+        .config_dir
+        .read()
+        .map_err(|_| "Freeze settings are unavailable".to_owned())?
+        .clone()
+        .ok_or_else(|| "Freeze settings are unavailable".to_owned())?;
+    save_deck_config_file(&config_dir.join("deck-config.json"), &config)?;
+    let next = config.clone();
+    drop(config);
+    let _ = state.deck_updates.send(next);
+    Ok(())
+}
+
+fn selection_reply(request_id: &str, result: Result<(), String>) -> serde_json::Value {
+    match result {
+        Ok(()) => {
+            serde_json::json!({ "type": "action_result", "requestId": request_id, "ok": true })
+        }
+        Err(error) => {
+            serde_json::json!({ "type": "action_result", "requestId": request_id, "ok": false, "reason": error })
+        }
+    }
+}
+
+fn invoke_button(state: &AppState, revision: u64, button_id: &str) -> Result<(), String> {
+    let config = state
+        .deck_config
+        .read()
+        .map_err(|_| "Deck config is unavailable".to_owned())?
+        .clone();
+    if config.revision != revision {
+        return Err("stale_revision".into());
+    }
+    let profile = config
+        .profiles
+        .iter()
+        .find(|profile| profile.id == config.active_profile_id)
+        .ok_or_else(|| "unknown_profile".to_owned())?;
+    let page = profile
+        .pages
+        .iter()
+        .find(|page| page.id == profile.active_page_id)
+        .ok_or_else(|| "unknown_page".to_owned())?;
+    let button = page
+        .buttons
+        .iter()
+        .find(|button| button.id == button_id)
+        .ok_or_else(|| "unknown_button".to_owned())?;
+    run_deck_action(&button.action, state, revision)
+}
+
+fn run_deck_action(action: &DeckAction, state: &AppState, revision: u64) -> Result<(), String> {
+    match action {
+        DeckAction::Media { command } => run_action(ClientAction::Media { command: *command }),
+        DeckAction::Hotkey { keys } => run_action(ClientAction::Hotkey { keys: keys.clone() }),
+        DeckAction::LaunchApp { app } => run_action(ClientAction::LaunchApp { app: app.clone() }),
+        DeckAction::Sequence { steps } => {
+            let mut actions = Vec::with_capacity(steps.len());
+            for step in steps {
+                actions.push(match step {
+                    DeckStep::Media { command } => SequenceAction::Media { command: *command },
+                    DeckStep::Hotkey { keys } => SequenceAction::Hotkey { keys: keys.clone() },
+                    DeckStep::LaunchApp { app } => SequenceAction::LaunchApp { app: app.clone() },
+                });
+            }
+            run_action(ClientAction::Sequence { actions })
+        }
+        DeckAction::SelectProfile { profile_id } => {
+            update_selection(state, revision, Some(profile_id), None)
+        }
+        DeckAction::SelectPage { page_id } => {
+            update_selection(state, revision, None, Some(page_id))
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn current_playback_state() -> PlaybackState {
+    use windows::Media::Control::{
+        GlobalSystemMediaTransportControlsSessionManager as SessionManager,
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status,
+    };
+
+    let Ok(operation) = SessionManager::RequestAsync() else {
+        return PlaybackState::Unavailable;
+    };
+    let Ok(manager) = operation.await else {
+        return PlaybackState::Unavailable;
+    };
+    let Ok(session) = manager.GetCurrentSession() else {
+        return PlaybackState::Stopped;
+    };
+    let Ok(info) = session.GetPlaybackInfo() else {
+        return PlaybackState::Unavailable;
+    };
+    match info.PlaybackStatus() {
+        Ok(Status::Playing) => PlaybackState::Playing,
+        Ok(Status::Paused | Status::Opened | Status::Changing) => PlaybackState::Paused,
+        Ok(Status::Closed | Status::Stopped) => PlaybackState::Stopped,
+        _ => PlaybackState::Unavailable,
+    }
+}
+
+#[cfg(not(windows))]
+async fn current_playback_state() -> PlaybackState {
+    PlaybackState::Unavailable
+}
+
+#[tauri::command]
+async fn get_playback_state() -> PlaybackState {
+    current_playback_state().await
+}
+
+fn run_action(action: ClientAction) -> Result<(), String> {
+    match action {
+        ClientAction::Hotkey { keys } => {
+            let mut enigo = Enigo::new(&Settings::default()).map_err(|error| error.to_string())?;
+            if keys.len() < 2 || keys.len() > 5 {
+                return Err("A shortcut must contain a modifier and one key".into());
+            }
+            let mut modifiers = Vec::with_capacity(keys.len() - 1);
+            for (index, modifier) in keys[..keys.len() - 1].iter().enumerate() {
+                if keys[..index].contains(modifier) {
+                    return Err("Shortcut modifiers must be unique".into());
+                }
+                modifiers.push(match modifier.as_str() {
+                    "CTRL" => Key::Control,
+                    "ALT" => Key::Alt,
+                    "SHIFT" => Key::Shift,
+                    "META" => Key::Meta,
+                    _ => return Err("Unsupported modifier".into()),
+                });
+            }
+            let key = parse_key(&keys[keys.len() - 1])?;
+            for modifier in &modifiers {
+                enigo
+                    .key(*modifier, Direction::Press)
+                    .map_err(|e| e.to_string())?;
+            }
+            enigo
+                .key(key, Direction::Click)
+                .map_err(|e| e.to_string())?;
+            for modifier in modifiers.iter().rev() {
+                enigo
+                    .key(*modifier, Direction::Release)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        ClientAction::Media { command } => {
+            let mut enigo = Enigo::new(&Settings::default()).map_err(|error| error.to_string())?;
+            let key = match command {
+                MediaCommand::PlayPause => Key::MediaPlayPause,
+                MediaCommand::NextTrack => Key::MediaNextTrack,
+                MediaCommand::PreviousTrack => Key::MediaPrevTrack,
+                MediaCommand::VolumeUp => Key::VolumeUp,
+                MediaCommand::VolumeDown => Key::VolumeDown,
+                MediaCommand::Mute => Key::VolumeMute,
+            };
+            enigo
+                .key(key, Direction::Click)
+                .map_err(|e| e.to_string())?;
+        }
+        ClientAction::LaunchApp { app } => launch_app(&app)?,
+        ClientAction::Sequence { actions } => {
+            if actions.is_empty() || actions.len() > 10 {
+                return Err("An action sequence must contain between 1 and 10 steps".into());
+            }
+            for (index, action) in actions.into_iter().enumerate() {
+                if index > 0 {
+                    thread::sleep(Duration::from_millis(150));
+                }
+                let action = match action {
+                    SequenceAction::Hotkey { keys } => ClientAction::Hotkey { keys },
+                    SequenceAction::Media { command } => ClientAction::Media { command },
+                    SequenceAction::LaunchApp { app } => ClientAction::LaunchApp { app },
+                };
+                run_action(action)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn launch_app(app: &str) -> Result<(), String> {
+    let app = app.trim();
+    if app.is_empty() || app.len() > 512 || app.chars().any(char::is_control) {
+        return Err("Enter a valid app name or path".into());
+    }
+    #[cfg(windows)]
+    let result = Command::new(app).spawn();
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").arg("-a").arg(app).spawn();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let result: Result<std::process::Child, std::io::Error> = Err(std::io::Error::other(
+        "App launching is supported on Windows and macOS",
+    ));
+    result
+        .map(|_| ())
+        .map_err(|error| format!("Could not launch app: {error}"))
+}
+
+fn parse_key(key: &str) -> Result<Key, String> {
+    if key.len() == 1 && key.as_bytes()[0].is_ascii_alphanumeric() {
+        return Ok(Key::Unicode(
+            key.to_ascii_lowercase().chars().next().unwrap(),
+        ));
+    }
+    let special = match key {
+        "SPACE" => Key::Space,
+        "ENTER" => Key::Return,
+        "TAB" => Key::Tab,
+        "ESCAPE" => Key::Escape,
+        "BACKSPACE" => Key::Backspace,
+        "DELETE" => Key::Delete,
+        "HOME" => Key::Home,
+        "END" => Key::End,
+        "PAGE_UP" => Key::PageUp,
+        "PAGE_DOWN" => Key::PageDown,
+        "UP" => Key::UpArrow,
+        "DOWN" => Key::DownArrow,
+        "LEFT" => Key::LeftArrow,
+        "RIGHT" => Key::RightArrow,
+        "F1" => Key::F1,
+        "F2" => Key::F2,
+        "F3" => Key::F3,
+        "F4" => Key::F4,
+        "F5" => Key::F5,
+        "F6" => Key::F6,
+        "F7" => Key::F7,
+        "F8" => Key::F8,
+        "F9" => Key::F9,
+        "F10" => Key::F10,
+        "F11" => Key::F11,
+        "F12" => Key::F12,
+        _ => return Err("Unsupported key".into()),
+    };
+    Ok(special)
+}
+
+async fn serve(state: Arc<AppState>) {
+    let app = Router::new()
+        .route("/ws", get(upgrade_socket))
+        .with_state(state.clone());
+    let listener = match TcpListener::bind(("0.0.0.0", PORT)).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("Could not start the Freeze connection server: {error}");
+            return;
+        }
+    };
+    state.server_online.store(true, Ordering::Relaxed);
+    if let Err(error) = axum::serve(listener, app).await {
+        eprintln!("Freeze connection server stopped: {error}");
+        state.server_online.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    let host = local_ip_address::local_ip()
+        .map(|address| address.to_string())
+        .unwrap_or_else(|_| "127.0.0.1".to_owned());
+    let (deck_updates, _) = broadcast::channel(16);
+    let (legacy_requests, _) = broadcast::channel(16);
+    let state = Arc::new(AppState {
+        host,
+        device_name: machine_name(),
+        token: RwLock::new(String::new()),
+        config_dir: RwLock::new(None),
+        deck_config: RwLock::new(default_deck_config()),
+        deck_updates,
+        pending_legacy: RwLock::new(HashMap::new()),
+        legacy_offers: RwLock::new(HashMap::new()),
+        legacy_requests,
+        active_devices: AtomicUsize::new(0),
+        server_online: AtomicBool::new(false),
+        android_usb_enabled: AtomicBool::new(false),
+        session_epoch: AtomicUsize::new(0),
+    });
+
+    tauri::Builder::default()
+        .manage(state.clone())
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![
+            connection_info,
+            deck_config,
+            save_deck_config,
+            get_playback_state,
+            extract_app_icon,
+            pending_legacy_imports,
+            request_legacy_deck_import,
+            import_legacy_deck,
+            enable_android_usb,
+            rotate_pairing_key
+        ])
+        .setup(move |app| {
+            let config_dir = app.path().app_config_dir()?;
+            fs::create_dir_all(&config_dir)?;
+            let token = load_or_create_pairing_key(&config_dir.join("pairing-key"))
+                .map_err(std::io::Error::other)?;
+            *state
+                .token
+                .write()
+                .map_err(|_| std::io::Error::other("Freeze pairing key lock poisoned"))? = token;
+            *state
+                .config_dir
+                .write()
+                .map_err(|_| std::io::Error::other("Freeze settings directory lock poisoned"))? =
+                Some(config_dir.clone());
+
+            let deck_path = config_dir.join("deck-config.json");
+            let deck_config = load_deck_config(&deck_path);
+            let saved_config_valid = deck_path
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() as usize <= MAX_DECK_CONFIG_BYTES)
+                && fs::read(&deck_path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<DeckConfig>(&bytes).ok())
+                    .is_some_and(|config| validate_deck_config(&config).is_ok());
+            if !saved_config_valid {
+                save_deck_config_file(&deck_path, &deck_config).map_err(std::io::Error::other)?;
+            }
+            *state
+                .deck_config
+                .write()
+                .map_err(|_| std::io::Error::other("Freeze deck config lock poisoned"))? =
+                deck_config;
+
+            let usb_enabled = fs::read_to_string(config_dir.join("android-usb-enabled"))
+                .is_ok_and(|value| value.trim() == "true");
+            state
+                .android_usb_enabled
+                .store(usb_enabled, Ordering::Relaxed);
+            let monitor_state = state.clone();
+            thread::spawn(move || loop {
+                thread::sleep(Duration::from_secs(3));
+                if monitor_state.android_usb_enabled.load(Ordering::Relaxed) {
+                    let _ = ensure_android_usb_reverse();
+                }
+            });
+
+            tauri::async_runtime::spawn(serve(state));
+            let open = MenuItem::with_id(app, "open", "Open Freeze", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Quit Freeze", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&open, &quit])?;
+            let icon = app
+                .default_window_icon()
+                .ok_or("missing default window icon")?
+                .clone();
+
+            TrayIconBuilder::new()
+                .icon(icon)
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "open" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "quit" => app.exit(0),
+                    _ => (),
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        if let Some(window) = tray.app_handle().get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                })
+                .build(app)?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running Freeze");
+}

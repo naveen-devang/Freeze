@@ -1,0 +1,16 @@
+node_modules/
+**/node_modules/
+**/dist/
+**/target/
+**/.expo/
+**/.claude/
+**/.vscode/*
+!**/.vscode/extensions.json
+.env
+.env.*
+!.env.example
+*.local
+*.log
+.DS_Store
+Thumbs.db
+*.tsbuildinfo
