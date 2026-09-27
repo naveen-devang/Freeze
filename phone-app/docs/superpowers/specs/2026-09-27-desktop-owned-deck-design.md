@@ -45,7 +45,7 @@ Phone tap(button ID) -> PC resolves configured action -> Windows/macOS executes 
 
 ## Ownership and data model
 
-The desktop companion owns a versioned `DeckConfig` with profiles, pages, buttons, and the active profile/page. One Rust-owned state instance is shared by the desktop's Tauri commands and the WebSocket server, so local edits and remote reads use the same config. A button contains a stable ID, display label, Lucide icon key, and an action definition. Initial action types are media control, keyboard shortcut, app launch, sequence, profile/page navigation, plugin action, and custom script. Existing six media controls become ordinary configured buttons in the default profile rather than being separately hard-coded into the phone.
+The desktop companion owns a versioned `DeckConfig` with profiles, pages, buttons, and the active profile/page. One Rust-owned state instance is shared by the desktop's Tauri commands and the WebSocket server, so local edits and remote reads use the same config. A button contains a stable ID, display label, Lucide icon key, and an action definition. Core action types are media control, keyboard shortcut, app launch, sequence, and profile/page navigation. Existing six media controls become ordinary configured buttons in the default profile rather than being separately hard-coded into the phone. Plugin and custom script actions are added only in their later phases, after the core protocol is stable.
 
 An app launch action stores an application identity/target for the host platform. It may include per-platform target mappings for a profile shared through a future export/import feature, but a local profile must always resolve to an installed app on its own PC. The desktop editor supplies the app target; no path is sent from the phone at invocation time.
 
@@ -85,7 +85,7 @@ The protocol is versioned. An incompatible app/desktop pair receives an actionab
 
 ## Migration of existing phone decks
 
-The first connection after this change may find a legacy deck stored on the phone. The phone may identify that it has legacy deck data during the versioned handshake. If the PC has only its untouched generated default, the desktop offers to import that data as a new PC profile. Import is explicit, validated as untrusted input, and never overwrites an existing PC profile. App targets are reviewed on the PC and may need to be selected again for that operating system. Once imported, the PC sends its saved snapshot and is the sole authority. Migration prompting and review appear in the desktop app; the Connect redesign does not change pairing keys or saved-PC records.
+The first connection after this change may find a legacy deck stored on the phone. During the versioned handshake, the phone may report only that legacy deck data exists. The desktop offers a **Transfer phone deck** action; only after the user requests it does the phone send the bounded deck data. The desktop then offers an explicit **Import phone deck** action to create a new PC profile. Import is validated as untrusted input and never overwrites an existing PC profile. App targets remain disabled until reviewed and approved on the PC, and may need to be selected again for that operating system. Once imported, the PC sends its saved snapshot and is the sole authority. Migration prompting and review appear in the desktop app; the Connect redesign does not change pairing keys or saved-PC records.
 
 If migration is declined or the phone data is invalid, the desktop default profile remains available. Existing pairing keys and saved-PC entries are not migrated or rewritten by this feature.
 
@@ -120,20 +120,20 @@ Dynamic labels/icons are derived from host state when available. For example, Pl
 
 ## Delivery phases
 
-1. **Elgato compatibility spike:** run an official, non-protected sample plugin against a narrow Freeze host prototype. Establish which SDK lifecycle, settings, property-inspector, and dynamic-state features can be supported on Windows and macOS. Do not use or attempt to unwrap Marketplace DRM packages. Record the compatibility matrix and update the estimate before committing to broad third-party support.
-2. **Desktop-owned deck and protocol:** define versioned profile/action structures, persistence, defaults, authenticated snapshot delivery, revision updates, and ID-based invoke/select requests. Preserve existing network pairing and USB transport.
-3. **Desktop editor and phone remote:** add profile/page/button management, action configuration, application picker, sequence composition, live preview, host-driven phone deck/profiles, and legacy deck import.
-4. **Connect redesign:** implement the updated Add PC/scan, paired-PC, manual setup, transport, and status flows without losing existing connection behavior or pairing data.
-5. **Custom script actions:** build the guided desktop script editor, runtime detection, template/test flow, trust/enable controls, protected secret handling, and PC-only action runner.
+1. **Core desktop and phone apps:** establish the PC-owned, versioned profile/action config, persistence/default deck, authenticated snapshot protocol, revision updates, and ID-based invoke/select requests. Build the desktop profile/page/button editor, action configuration for built-ins, app picker, sequence composition, and live preview; make the phone render the PC deck and remotely select profiles/pages; provide explicit legacy phone-deck import. Preserve Wi-Fi, Android USB, and existing pairing identity.
+2. **Connect experience:** redesign Add PC/QR, the first-class paired-PC list, manual setup, transport selection, and status/retry controls without losing existing pairing behavior or records.
+3. **Core platform completion:** add optional foreground-app profile association and platform-specific app/media state reporting. Ship Windows first while keeping host abstractions portable, then validate native macOS launch/control and supported macOS versions.
+4. **Custom script actions:** after the desktop and phone core is stable, build the PC-only guided script editor, runtime detection, templates/test flow, and trust/enable controls. Keep script paths/source and credentials off the phone; apply the security boundaries above.
+5. **Elgato compatibility research spike:** after core delivery, test an official, non-protected sample plugin against a narrow Freeze host prototype. Establish which SDK lifecycle, settings, property-inspector, and dynamic-state features can be supported on Windows and macOS. Do not use or attempt to unwrap Marketplace DRM packages. Record the compatibility matrix before committing to broad third-party support.
 6. **Plugin platform and marketplace equivalents:** add a documented Freeze plugin/action API and compatible `.streamDeckPlugin` support for validated, permitted packages where the spike proves feasible. Independently implement Freeze actions for selected common integrations where Marketplace packages are protected, host-dependent, or unsupported. Direct Marketplace package support requires rights/technical confirmation; never decrypt or patch protected packages.
-7. **System-aware behavior and release validation:** add optional foreground-app profile association and platform-specific app/media state reporting. Windows ships first; validate macOS native launch/control, plugin/script permissions, connection flows, persistence/migration, and packaging.
+7. **Release validation:** validate cross-platform behavior, permissions, connection flows, persistence/migration, plugin compatibility claims, and packaging against the supported feature matrix.
 
 ## Sub-project boundaries
 
-- **Deck core:** PC-owned profiles, desktop editing, versioned connection protocol, phone remote rendering, and one-time migration. This is the prerequisite for all plugin/script actions.
-- **Connection experience:** the phone Connect redesign can proceed against the existing protocol while preserving the same pairing identity and saved-device behavior.
-- **Custom scripts:** a PC-only action provider that plugs into the deck core; keep it separate from third-party plugin compatibility because its editor, runtime discovery, and permission model differ.
-- **Plugin compatibility:** start with the bounded compatibility spike, then implement the supported key-action subset and selected Freeze equivalents as a separate platform project. Do not block deck core on universal Marketplace coverage.
+- **Core desktop and phone apps:** PC-owned profiles, desktop editing, built-in action configuration, versioned connection protocol, phone remote rendering, and one-time migration. This is the prerequisite for all extension actions.
+- **Connection experience:** the phone Connect redesign is part of the initial product work and preserves the same pairing identity and saved-device behavior.
+- **Custom scripts:** a later PC-only action provider that plugs into the stable deck core; keep it separate from third-party plugin compatibility because its editor, runtime discovery, and permission model differ.
+- **Plugin compatibility:** a later, separate platform project. Begin with the bounded compatibility spike, then implement only the supported key-action subset and selected Freeze equivalents. Do not block core desktop or phone apps on Marketplace coverage.
 
 ## Acceptance criteria
 
