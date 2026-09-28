@@ -82,8 +82,8 @@ struct DeckConfig {
     revision: u64,
     profiles: Vec<DeckProfile>,
     active_profile_id: String,
-    #[serde(default)]
-    auto_switch_enabled: bool,
+    #[serde(default, rename = "autoSwitchEnabled", skip_serializing)]
+    legacy_auto_switch_enabled: bool,
     #[serde(default)]
     fallback_profile_id: String,
 }
@@ -97,6 +97,8 @@ struct DeckProfile {
     active_page_id: String,
     #[serde(default)]
     auto_switch_apps: Vec<String>,
+    #[serde(default)]
+    auto_switch_enabled: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -244,9 +246,10 @@ fn default_deck_config() -> DeckConfig {
             }],
             active_page_id: "main".to_owned(),
             auto_switch_apps: Vec::new(),
+            auto_switch_enabled: false,
         }],
         active_profile_id: "default".to_owned(),
-        auto_switch_enabled: false,
+        legacy_auto_switch_enabled: false,
         fallback_profile_id: "default".to_owned(),
     }
 }
@@ -512,6 +515,12 @@ fn load_deck_config(path: &Path) -> DeckConfig {
         {
             if let Ok(bytes) = fs::read(candidate) {
                 if let Ok(mut config) = serde_json::from_slice::<DeckConfig>(&bytes) {
+                    if config.legacy_auto_switch_enabled {
+                        for profile in &mut config.profiles {
+                            profile.auto_switch_enabled = !profile.auto_switch_apps.is_empty();
+                        }
+                    }
+                    config.legacy_auto_switch_enabled = false;
                     for page in config
                         .profiles
                         .iter_mut()
@@ -795,6 +804,7 @@ fn import_legacy_deck(
         pages,
         active_page_id,
         auto_switch_apps: Vec::new(),
+        auto_switch_enabled: false,
     });
     config.active_profile_id = format!("import-{}", pending.source_id);
     config.revision = config.revision.saturating_add(1);
@@ -965,20 +975,33 @@ fn switch_profile_for_foreground(state: &AppState, foreground: &ForegroundApp) {
     let Ok(mut config) = state.deck_config.write() else {
         return;
     };
-    if !config.auto_switch_enabled {
-        return;
-    }
-    let target_id = config
+    if !config
         .profiles
         .iter()
+        .any(|profile| profile.auto_switch_enabled)
+    {
+        return;
+    }
+    let matched_profile_id = config
+        .profiles
+        .iter()
+        .filter(|profile| profile.auto_switch_enabled)
         .find_map(|profile| {
             profile
                 .auto_switch_apps
                 .iter()
                 .any(|target| app_target_matches(target, foreground))
                 .then(|| profile.id.clone())
-        })
-        .unwrap_or_else(|| {
+        });
+    let target_id =
+        if let Some(profile_id) = matched_profile_id {
+            profile_id
+        } else {
+            if !config.profiles.iter().any(|profile| {
+                profile.id == config.active_profile_id && profile.auto_switch_enabled
+            }) {
+                return;
+            }
             if config
                 .profiles
                 .iter()
@@ -988,7 +1011,7 @@ fn switch_profile_for_foreground(state: &AppState, foreground: &ForegroundApp) {
             } else {
                 config.profiles[0].id.clone()
             }
-        });
+        };
     if config.active_profile_id == target_id {
         return;
     }

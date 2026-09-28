@@ -59,8 +59,8 @@ type DeckButton = { id: string; label: string; icon: string; iconSvg?: string; a
 type PlaybackState = 'playing' | 'paused' | 'stopped' | 'unavailable';
 type LucideRegistry = Record<string, typeof Command>;
 type DeckPage = { id: string; name: string; rows: number; columns: number; buttons: DeckButton[] };
-type DeckProfile = { id: string; name: string; pages: DeckPage[]; activePageId: string; autoSwitchApps: string[] };
-type DeckConfig = { schemaVersion: number; revision: number; profiles: DeckProfile[]; activeProfileId: string; autoSwitchEnabled: boolean; fallbackProfileId: string };
+type DeckProfile = { id: string; name: string; pages: DeckPage[]; activePageId: string; autoSwitchApps: string[]; autoSwitchEnabled: boolean };
+type DeckConfig = { schemaVersion: number; revision: number; profiles: DeckProfile[]; activeProfileId: string; fallbackProfileId: string };
 type LegacyImportSummary = { sourceId: string; pages: number; buttons: number; requested: boolean; ready: boolean };
 
 function App() {
@@ -499,7 +499,7 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
   function addProfile() {
     if (deck.profiles.length >= 32) return setError('You can create up to 32 profiles.');
     const id = `profile-${Date.now()}`;
-    const nextProfile: DeckProfile = { id, name: `Profile ${deck.profiles.length + 1}`, pages: [{ id: `${id}-main`, name: 'Main', rows: 2, columns: 3, buttons: [] }], activePageId: `${id}-main`, autoSwitchApps: [] };
+    const nextProfile: DeckProfile = { id, name: `Profile ${deck.profiles.length + 1}`, pages: [{ id: `${id}-main`, name: 'Main', rows: 2, columns: 3, buttons: [] }], activePageId: `${id}-main`, autoSwitchApps: [], autoSwitchEnabled: false };
     const next = { ...deck, activeProfileId: id, profiles: [...deck.profiles, nextProfile] };
     setProfileId(id);
     setPageId(nextProfile.activePageId);
@@ -604,8 +604,12 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
     }
   }
 
-  function updateAutoSwitchSetting(patch: Partial<Pick<DeckConfig, 'autoSwitchEnabled' | 'fallbackProfileId'>>) {
-    void save({ ...deck, ...patch, fallbackProfileId: patch.fallbackProfileId ?? (deck.fallbackProfileId || deck.profiles[0].id) });
+  function updateProfileAutoSwitch(enabled: boolean) {
+    void save({ ...deck, profiles: deck.profiles.map((item) => item.id === profile.id ? { ...item, autoSwitchEnabled: enabled } : item) });
+  }
+
+  function updateFallbackProfile(fallbackProfileId: string) {
+    void save({ ...deck, fallbackProfileId });
   }
 
   function actionType(action: DeckAction): string {
@@ -626,9 +630,9 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
       <div className="page-control"><label>Pages<div className="page-switcher">{profile.pages.map((item) => item.id === editingPageId ? <input key={item.id} className="page-tab-editor" aria-label={`Rename ${item.name}`} value={pageNameDraft} maxLength={24} style={{ width: `${Math.max(8, pageNameDraft.length + 2)}ch` }} autoFocus disabled={busy} onChange={(event) => setPageNameDraft(event.target.value)} onBlur={() => renamePage(item.id, pageNameDraft)} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} /> : <button key={item.id} className={`transport-tab ${page.id === item.id ? 'selected' : ''}`} disabled={busy} title="Double-click to rename" onDoubleClick={() => { setPageId(item.id); setPageNameDraft(item.name); setEditingPageId(item.id); }} onClick={() => { setPageId(item.id); if (page.id !== item.id) setButtonId(''); if (profile.activePageId !== item.id) void save({ ...deck, activeProfileId: profile.id, profiles: deck.profiles.map((entry) => entry.id === profile.id ? { ...entry, activePageId: item.id } : entry) }); }}>{item.name}</button>)}</div></label><button className="add-page-button" onClick={addPage} disabled={busy || profile.pages.length >= 8} aria-label="Add page" title="Add page"><Plus size={16} /></button></div>
     </section>
     <section className="auto-switch-card">
-      <div className="auto-switch-heading"><div><h2>Automatic profile switching</h2><p>Switch to a profile when one of its assigned apps is in the foreground on this PC.</p></div><label className="auto-switch-toggle"><input type="checkbox" checked={deck.autoSwitchEnabled} disabled={busy} onChange={(event) => updateAutoSwitchSetting({ autoSwitchEnabled: event.target.checked })} /> Enabled</label></div>
+      <div className="auto-switch-heading"><div><h2>Automatic switching · {profile.name}</h2><p>Switch to this profile when one of its assigned apps is in the foreground on this PC.</p></div><label className="auto-switch-toggle"><input type="checkbox" checked={profile.autoSwitchEnabled} disabled={busy} onChange={(event) => updateProfileAutoSwitch(event.target.checked)} /> Enabled</label></div>
       <div className="auto-switch-settings">
-        <label>When no assigned app is active<DeckSelect value={deck.fallbackProfileId || deck.profiles[0].id} disabled={busy} options={deck.profiles.map((item) => ({ value: item.id, label: item.name }))} onChange={(fallbackProfileId) => updateAutoSwitchSetting({ fallbackProfileId })} /></label>
+        <label>Fallback when leaving an automatic profile<DeckSelect value={deck.fallbackProfileId || deck.profiles[0].id} disabled={busy} options={deck.profiles.map((item) => ({ value: item.id, label: item.name }))} onChange={updateFallbackProfile} /></label>
         <div className="auto-switch-apps"><div className="auto-switch-apps-heading"><strong>Apps assigned to {profile.name}</strong><span>Entering a process name also works.</span></div><div className="auto-switch-app-add"><input value={autoSwitchAppDraft} maxLength={512} disabled={busy} placeholder={isMacos ? 'App name or .app path' : 'App name or .exe path'} onChange={(event) => setAutoSwitchAppDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); addAutoSwitchApp(); } }} /><button className="secondary-button" disabled={busy || !autoSwitchAppDraft.trim()} onClick={() => addAutoSwitchApp()}>Add app</button><button className="icon-button" aria-label="Browse for an application" title="Browse for an application" disabled={busy} onClick={() => void browseAutoSwitchApp()}><FolderOpen size={15} /></button></div>{profile.autoSwitchApps.length ? <div className="auto-switch-app-list">{profile.autoSwitchApps.map((app) => <span className="auto-switch-app" key={app}>{app}<button className="icon-button" aria-label={`Remove ${app}`} disabled={busy} onClick={() => updateAutoSwitchApps(profile.autoSwitchApps.filter((item) => item !== app))}><Trash2 size={12} /></button></span>)}</div> : <p className="auto-switch-empty">No apps assigned to this profile yet.</p>}</div>
       </div>
     </section>
