@@ -992,6 +992,8 @@ dependencies = [
  "axum",
  "enigo",
  "local-ip-address",
+ "objc2-app-kit",
+ "objc2-foundation",
  "rand",
  "serde",
  "serde_json",

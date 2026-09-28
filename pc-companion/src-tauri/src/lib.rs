@@ -82,6 +82,10 @@ struct DeckConfig {
     revision: u64,
     profiles: Vec<DeckProfile>,
     active_profile_id: String,
+    #[serde(default)]
+    auto_switch_enabled: bool,
+    #[serde(default)]
+    fallback_profile_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -91,6 +95,8 @@ struct DeckProfile {
     name: String,
     pages: Vec<DeckPage>,
     active_page_id: String,
+    #[serde(default)]
+    auto_switch_apps: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -237,8 +243,11 @@ fn default_deck_config() -> DeckConfig {
                 buttons,
             }],
             active_page_id: "main".to_owned(),
+            auto_switch_apps: Vec::new(),
         }],
         active_profile_id: "default".to_owned(),
+        auto_switch_enabled: false,
+        fallback_profile_id: "default".to_owned(),
     }
 }
 
@@ -352,6 +361,26 @@ fn validate_deck_config(config: &DeckConfig) -> Result<(), String> {
     }
     if !profile_ids.contains(&config.active_profile_id) {
         return Err("The active profile must exist".into());
+    }
+    if !config.fallback_profile_id.is_empty() && !profile_ids.contains(&config.fallback_profile_id)
+    {
+        return Err("The fallback profile must exist".into());
+    }
+    let mut matched_apps = std::collections::HashSet::new();
+    for profile in &config.profiles {
+        if profile.auto_switch_apps.len() > 32 {
+            return Err("A profile can match up to 32 applications".into());
+        }
+        for app in &profile.auto_switch_apps {
+            let normalized = app.trim().to_lowercase();
+            if normalized.is_empty()
+                || normalized.len() > 512
+                || normalized.chars().any(char::is_control)
+                || !matched_apps.insert(normalized)
+            {
+                return Err("Application matches must be valid and unique across profiles".into());
+            }
+        }
     }
     for profile in &config.profiles {
         let page_ids: std::collections::HashSet<_> =
@@ -765,6 +794,7 @@ fn import_legacy_deck(
         name: profile_name,
         pages,
         active_page_id,
+        auto_switch_apps: Vec::new(),
     });
     config.active_profile_id = format!("import-{}", pending.source_id);
     config.revision = config.revision.saturating_add(1);
@@ -852,6 +882,129 @@ fn save_deck_config(
     *current = config.clone();
     let _ = state.deck_updates.send(config.clone());
     Ok(config)
+}
+
+#[derive(Clone, Debug)]
+struct ForegroundApp {
+    identity: String,
+    path: String,
+}
+
+#[cfg(target_os = "windows")]
+fn foreground_app() -> Option<ForegroundApp> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+
+    unsafe {
+        let window = GetForegroundWindow();
+        if window.is_invalid() {
+            return None;
+        }
+        let mut process_id = 0;
+        GetWindowThreadProcessId(window, Some(&mut process_id));
+        if process_id == 0 || process_id == std::process::id() {
+            return None;
+        }
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id).ok()?;
+        let mut buffer = [0u16; 32_768];
+        let mut length = buffer.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(buffer.as_mut_ptr()),
+            &mut length,
+        );
+        let _ = CloseHandle(process);
+        result.ok()?;
+        let path = String::from_utf16(&buffer[..length as usize]).ok()?;
+        Some(ForegroundApp {
+            identity: path.clone(),
+            path,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn foreground_app() -> Option<ForegroundApp> {
+    use objc2_app_kit::NSWorkspace;
+
+    let app = NSWorkspace::sharedWorkspace().frontmostApplication()?;
+    let identity = app.bundleIdentifier()?.to_string();
+    if identity == "app.freeze.pc" {
+        return None;
+    }
+    let path = app.bundleURL()?.path()?.to_string();
+    Some(ForegroundApp { identity, path })
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn foreground_app() -> Option<ForegroundApp> {
+    None
+}
+
+fn app_target_matches(target: &str, foreground: &ForegroundApp) -> bool {
+    let target = target.trim();
+    if target.eq_ignore_ascii_case(&foreground.identity)
+        || target.eq_ignore_ascii_case(&foreground.path)
+    {
+        return true;
+    }
+    let target_name = Path::new(target).file_stem().and_then(|name| name.to_str());
+    let foreground_name = Path::new(&foreground.path)
+        .file_stem()
+        .and_then(|name| name.to_str());
+    target_name
+        .is_some_and(|target| foreground_name.is_some_and(|name| target.eq_ignore_ascii_case(name)))
+}
+
+fn switch_profile_for_foreground(state: &AppState, foreground: &ForegroundApp) {
+    let Ok(mut config) = state.deck_config.write() else {
+        return;
+    };
+    if !config.auto_switch_enabled {
+        return;
+    }
+    let target_id = config
+        .profiles
+        .iter()
+        .find_map(|profile| {
+            profile
+                .auto_switch_apps
+                .iter()
+                .any(|target| app_target_matches(target, foreground))
+                .then(|| profile.id.clone())
+        })
+        .unwrap_or_else(|| {
+            if config
+                .profiles
+                .iter()
+                .any(|profile| profile.id == config.fallback_profile_id)
+            {
+                config.fallback_profile_id.clone()
+            } else {
+                config.profiles[0].id.clone()
+            }
+        });
+    if config.active_profile_id == target_id {
+        return;
+    }
+    config.active_profile_id = target_id;
+    config.revision = config.revision.saturating_add(1);
+    let config_dir = state
+        .config_dir
+        .read()
+        .ok()
+        .and_then(|directory| directory.clone());
+    let Some(config_dir) = config_dir else { return };
+    if let Err(error) = save_deck_config_file(&config_dir.join("deck-config.json"), &config) {
+        eprintln!("Could not save automatic profile switch: {error}");
+        return;
+    }
+    let _ = state.deck_updates.send(config.clone());
 }
 
 #[tauri::command]
@@ -1858,6 +2011,14 @@ pub fn run() {
                 if monitor_state.android_usb_enabled.load(Ordering::Relaxed) {
                     let _ = ensure_android_usb_reverse();
                 }
+            });
+
+            let profile_monitor = state.clone();
+            thread::spawn(move || loop {
+                if let Some(foreground) = foreground_app() {
+                    switch_profile_for_foreground(&profile_monitor, &foreground);
+                }
+                thread::sleep(Duration::from_millis(700));
             });
 
             tauri::async_runtime::spawn(serve(state));

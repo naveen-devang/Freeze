@@ -4,6 +4,7 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   AppWindow,
+  ChevronUp,
   Check,
   ChevronDown,
   Command,
@@ -58,8 +59,8 @@ type DeckButton = { id: string; label: string; icon: string; iconSvg?: string; a
 type PlaybackState = 'playing' | 'paused' | 'stopped' | 'unavailable';
 type LucideRegistry = Record<string, typeof Command>;
 type DeckPage = { id: string; name: string; rows: number; columns: number; buttons: DeckButton[] };
-type DeckProfile = { id: string; name: string; pages: DeckPage[]; activePageId: string };
-type DeckConfig = { schemaVersion: number; revision: number; profiles: DeckProfile[]; activeProfileId: string };
+type DeckProfile = { id: string; name: string; pages: DeckPage[]; activePageId: string; autoSwitchApps: string[] };
+type DeckConfig = { schemaVersion: number; revision: number; profiles: DeckProfile[]; activeProfileId: string; autoSwitchEnabled: boolean; fallbackProfileId: string };
 type LegacyImportSummary = { sourceId: string; pages: number; buttons: number; requested: boolean; ready: boolean };
 
 function App() {
@@ -370,6 +371,7 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
   const [busy, setBusy] = useState(false);
   const [draggingButtonId, setDraggingButtonId] = useState('');
   const [dragOverButtonId, setDragOverButtonId] = useState('');
+  const [autoSwitchAppDraft, setAutoSwitchAppDraft] = useState('');
   const buttonDrag = useRef<{ id: string; pointerId: number; x: number; y: number; active: boolean } | null>(null);
 
   useEffect(() => { setWorkingConfig(savedConfig); }, [savedConfig]);
@@ -387,6 +389,7 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
   const activeProfile = config?.profiles.find((item) => item.id === profileId) ?? config?.profiles[0];
   const activePage = activeProfile?.pages.find((item) => item.id === pageId) ?? activeProfile?.pages[0];
   useEffect(() => { if (activeProfile) setProfileName(activeProfile.name); }, [activeProfile?.id, activeProfile?.name]);
+  useEffect(() => setAutoSwitchAppDraft(''), [activeProfile?.id]);
 
   if (!config || !activeProfile || !activePage) return <div className="deck-loading">Loading your PC deck…</div>;
   const deck = config;
@@ -496,7 +499,7 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
   function addProfile() {
     if (deck.profiles.length >= 32) return setError('You can create up to 32 profiles.');
     const id = `profile-${Date.now()}`;
-    const nextProfile: DeckProfile = { id, name: `Profile ${deck.profiles.length + 1}`, pages: [{ id: `${id}-main`, name: 'Main', rows: 2, columns: 3, buttons: [] }], activePageId: `${id}-main` };
+    const nextProfile: DeckProfile = { id, name: `Profile ${deck.profiles.length + 1}`, pages: [{ id: `${id}-main`, name: 'Main', rows: 2, columns: 3, buttons: [] }], activePageId: `${id}-main`, autoSwitchApps: [] };
     const next = { ...deck, activeProfileId: id, profiles: [...deck.profiles, nextProfile] };
     setProfileId(id);
     setPageId(nextProfile.activePageId);
@@ -515,7 +518,7 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
   function deleteProfile() {
     if (deck.profiles.length <= 1) return setError('Keep at least one profile.');
     const remaining = deck.profiles.filter((item) => item.id !== profile.id);
-    const next = { ...deck, activeProfileId: remaining[0].id, profiles: remaining };
+    const next = { ...deck, activeProfileId: remaining[0].id, fallbackProfileId: deck.fallbackProfileId === profile.id ? remaining[0].id : deck.fallbackProfileId, profiles: remaining };
     setProfileId(remaining[0].id);
     setPageId(remaining[0].activePageId);
     setButtonId('');
@@ -567,6 +570,44 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
     replacePage({ ...page, [dimension]: nextValue });
   }
 
+  function updateAutoSwitchApps(apps: string[]) {
+    void save({ ...deck, profiles: deck.profiles.map((item) => item.id === profile.id ? { ...item, autoSwitchApps: apps } : item) });
+  }
+
+  function addAutoSwitchApp(value = autoSwitchAppDraft) {
+    const app = value.trim();
+    if (!app) return;
+    if (profile.autoSwitchApps.some((item) => item.toLowerCase() === app.toLowerCase())) {
+      setError('This application is already assigned to the selected profile.');
+      return;
+    }
+    if (deck.profiles.some((item) => item.id !== profile.id && item.autoSwitchApps.some((target) => target.toLowerCase() === app.toLowerCase()))) {
+      setError('This application is already assigned to another profile.');
+      return;
+    }
+    setError('');
+    setAutoSwitchAppDraft('');
+    updateAutoSwitchApps([...profile.autoSwitchApps, app]);
+  }
+
+  async function browseAutoSwitchApp() {
+    try {
+      const path = await openFileDialog({
+        title: 'Choose an application for automatic profile switching',
+        multiple: false,
+        directory: isMacos,
+        filters: [isMacos ? { name: 'Applications', extensions: ['app'] } : { name: 'Applications', extensions: ['exe'] }],
+      });
+      if (typeof path === 'string') addAutoSwitchApp(path);
+    } catch (cause) {
+      setError(`Could not open the application picker: ${String(cause)}`);
+    }
+  }
+
+  function updateAutoSwitchSetting(patch: Partial<Pick<DeckConfig, 'autoSwitchEnabled' | 'fallbackProfileId'>>) {
+    void save({ ...deck, ...patch, fallbackProfileId: patch.fallbackProfileId ?? (deck.fallbackProfileId || deck.profiles[0].id) });
+  }
+
   function actionType(action: DeckAction): string {
     if (action.type === 'sequence') return 'sequence';
     if (action.type === 'select_page' || action.type === 'select_profile') return action.type;
@@ -583,6 +624,13 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
       <label>Profile<DeckSelect value={profile.id} disabled={busy} options={deck.profiles.map((item) => ({ value: item.id, label: item.name }))} onChange={(value) => { const nextProfile = deck.profiles.find((item) => item.id === value)!; setProfileId(nextProfile.id); setPageId(nextProfile.activePageId); setButtonId(''); void save({ ...deck, activeProfileId: nextProfile.id }); }} /></label>
       <label>Profile name<input value={profileName} maxLength={32} disabled={busy} onChange={(event) => setProfileName(event.target.value)} onBlur={renameProfile} /></label>
       <div className="page-control"><label>Pages<div className="page-switcher">{profile.pages.map((item) => item.id === editingPageId ? <input key={item.id} className="page-tab-editor" aria-label={`Rename ${item.name}`} value={pageNameDraft} maxLength={24} style={{ width: `${Math.max(8, pageNameDraft.length + 2)}ch` }} autoFocus disabled={busy} onChange={(event) => setPageNameDraft(event.target.value)} onBlur={() => renamePage(item.id, pageNameDraft)} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} /> : <button key={item.id} className={`transport-tab ${page.id === item.id ? 'selected' : ''}`} disabled={busy} title="Double-click to rename" onDoubleClick={() => { setPageId(item.id); setPageNameDraft(item.name); setEditingPageId(item.id); }} onClick={() => { setPageId(item.id); if (page.id !== item.id) setButtonId(''); if (profile.activePageId !== item.id) void save({ ...deck, activeProfileId: profile.id, profiles: deck.profiles.map((entry) => entry.id === profile.id ? { ...entry, activePageId: item.id } : entry) }); }}>{item.name}</button>)}</div></label><button className="add-page-button" onClick={addPage} disabled={busy || profile.pages.length >= 8} aria-label="Add page" title="Add page"><Plus size={16} /></button></div>
+    </section>
+    <section className="auto-switch-card">
+      <div className="auto-switch-heading"><div><h2>Automatic profile switching</h2><p>Switch to a profile when one of its assigned apps is in the foreground on this PC.</p></div><label className="auto-switch-toggle"><input type="checkbox" checked={deck.autoSwitchEnabled} disabled={busy} onChange={(event) => updateAutoSwitchSetting({ autoSwitchEnabled: event.target.checked })} /> Enabled</label></div>
+      <div className="auto-switch-settings">
+        <label>When no assigned app is active<DeckSelect value={deck.fallbackProfileId || deck.profiles[0].id} disabled={busy} options={deck.profiles.map((item) => ({ value: item.id, label: item.name }))} onChange={(fallbackProfileId) => updateAutoSwitchSetting({ fallbackProfileId })} /></label>
+        <div className="auto-switch-apps"><div className="auto-switch-apps-heading"><strong>Apps assigned to {profile.name}</strong><span>Entering a process name also works.</span></div><div className="auto-switch-app-add"><input value={autoSwitchAppDraft} maxLength={512} disabled={busy} placeholder={isMacos ? 'App name or .app path' : 'App name or .exe path'} onChange={(event) => setAutoSwitchAppDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); addAutoSwitchApp(); } }} /><button className="secondary-button" disabled={busy || !autoSwitchAppDraft.trim()} onClick={() => addAutoSwitchApp()}>Add app</button><button className="icon-button" aria-label="Browse for an application" title="Browse for an application" disabled={busy} onClick={() => void browseAutoSwitchApp()}><FolderOpen size={15} /></button></div>{profile.autoSwitchApps.length ? <div className="auto-switch-app-list">{profile.autoSwitchApps.map((app) => <span className="auto-switch-app" key={app}>{app}<button className="icon-button" aria-label={`Remove ${app}`} disabled={busy} onClick={() => updateAutoSwitchApps(profile.autoSwitchApps.filter((item) => item !== app))}><Trash2 size={12} /></button></span>)}</div> : <p className="auto-switch-empty">No apps assigned to this profile yet.</p>}</div>
+      </div>
     </section>
     <section className="deck-editor-layout">
       <div className="deck-canvas-wrap">
@@ -607,7 +655,7 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
         </div>
       </div>
       <div className="button-properties"><div className="properties-heading"><div><h2>Button settings</h2><p>{selected ? 'Edit the selected control' : 'Select a button to configure it'}</p></div>{selected ? <button className="icon-button" aria-label="Remove button" onClick={() => { const next = { ...config, profiles: config.profiles.map((entry) => entry.id === profile.id ? { ...entry, pages: entry.pages.map((candidate) => candidate.id === page.id ? { ...candidate, buttons: candidate.buttons.filter((item) => item.id !== selected.id) } : candidate) } : entry) }; setButtonId(''); void save(next); }}><Trash2 size={15} /></button> : null}</div>
-        {selected ? <ButtonProperties key={selected.id} button={selected} busy={busy} isMacos={isMacos} onChange={updateButton} /> : <div className="properties-empty">Select a button from the deck grid.</div>}
+        {selected ? <ButtonProperties key={selected.id} button={selected} busy={busy} isMacos={isMacos} profiles={deck.profiles} pages={profile.pages} onChange={updateButton} /> : <div className="properties-empty">Select a button from the deck grid.</div>}
         {selected ? <button className="primary-button save-button" onClick={() => void save(deck)} disabled={busy}><Save size={14} /> {busy ? 'Saving…' : 'Save deck'}</button> : null}
       </div>
     </section>
@@ -738,18 +786,14 @@ function IconPicker({ value, disabled, onChange }: { value: string; disabled: bo
   </div>;
 }
 
-function ButtonProperties({ button, busy, isMacos, onChange }: { button: DeckButton; busy: boolean; isMacos: boolean; onChange: (patch: Partial<DeckButton>) => void }) {
+function ButtonProperties({ button, busy, isMacos, profiles, pages, onChange }: { button: DeckButton; busy: boolean; isMacos: boolean; profiles: DeckProfile[]; pages: DeckPage[]; onChange: (patch: Partial<DeckButton>) => void }) {
   const action = button.action;
   const kind = action.type === 'sequence' ? 'sequence' : action.type;
   const keys = action.type === 'hotkey' ? action.keys.join('+') : '';
   const app = action.type === 'launch_app' ? action.app : '';
   const media = action.type === 'media' ? action.command : 'play_pause';
-  const sequence = action.type === 'sequence' ? action.steps.map((step) => step.type === 'hotkey' ? step.keys.join('+') : step.type === 'launch_app' ? `APP:${step.app}` : `MEDIA:${step.command}`).join(', ') : 'CTRL+SHIFT+M, CTRL+S';
-  const [sequenceDraft, setSequenceDraft] = useState(sequence);
-  const [sequenceError, setSequenceError] = useState('');
   const [iconError, setIconError] = useState('');
   const [extractingIcon, setExtractingIcon] = useState(false);
-  useEffect(() => { setSequenceDraft(sequence); setSequenceError(''); }, [sequence]);
   function setAppTarget(app: string) {
     if (action.type !== 'launch_app') return;
     onChange({ action: { ...action, app }, ...(button.icon === 'app-icon' ? { icon: 'auto', iconSvg: undefined } : {}), appIconData: undefined });
@@ -782,7 +826,7 @@ function ButtonProperties({ button, busy, isMacos, onChange }: { button: DeckBut
   }
   const isWindowsShortcut = !isMacos && app.toLowerCase().endsWith('.lnk');
   const setKind = (value: string) => {
-    const next: DeckAction = value === 'media' ? { type: 'media', command: 'play_pause' } : value === 'launch_app' ? { type: 'launch_app', app: '' } : value === 'sequence' ? { type: 'sequence', steps: [{ type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] }, { type: 'hotkey', keys: ['CTRL', 'S'] }] } : value === 'select_profile' ? { type: 'select_profile', profileId: 'default' } : value === 'select_page' ? { type: 'select_page', pageId: 'main' } : { type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] };
+    const next: DeckAction = value === 'media' ? { type: 'media', command: 'play_pause' } : value === 'launch_app' ? { type: 'launch_app', app: '' } : value === 'sequence' ? { type: 'sequence', steps: [{ type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] }, { type: 'hotkey', keys: ['CTRL', 'S'] }] } : value === 'select_profile' ? { type: 'select_profile', profileId: profiles[0]?.id ?? '' } : value === 'select_page' ? { type: 'select_page', pageId: pages[0]?.id ?? '' } : { type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] };
     onChange({ action: next, ...(value === 'launch_app' ? {} : { icon: 'auto', iconSvg: undefined, appIconData: undefined }) });
   };
   return <div className="property-fields">
@@ -792,26 +836,94 @@ function ButtonProperties({ button, busy, isMacos, onChange }: { button: DeckBut
     {kind === 'media' ? <label>Media command<DeckSelect value={media} onChange={(value) => onChange({ action: { type: 'media', command: value as MediaCommand } })} disabled={busy} options={[['play_pause', 'Play / Pause'], ['next_track', 'Next track'], ['previous_track', 'Previous track'], ['volume_up', 'Volume up'], ['volume_down', 'Volume down'], ['mute', 'Mute']].map(([value, label]) => ({ value, label }))} /></label> : null}
     {kind === 'hotkey' ? <label>Keys<input value={keys} onChange={(event) => onChange({ action: { type: 'hotkey', keys: event.target.value.toUpperCase().split('+').map((key) => key.trim()).filter(Boolean) } })} placeholder="CTRL+SHIFT+M" disabled={busy} /></label> : null}
     {kind === 'launch_app' && action.type === 'launch_app' ? <><label>App path or name<div className="app-path-picker"><input value={app} onChange={(event) => setAppTarget(event.target.value)} placeholder="Application, shortcut, or app name" disabled={busy} /><button type="button" className="app-browse-button" aria-label="Browse for an application" title="Browse for an application" disabled={busy} onClick={() => void browseApp()}><FolderOpen size={15} /></button></div></label><button type="button" className="secondary-button app-icon-button" disabled={busy || extractingIcon || !app.trim()} onClick={() => void extractIcon(true)}>{extractingIcon ? 'Reading icon…' : button.appIconData ? isWindowsShortcut ? 'Refresh shortcut icon' : 'Refresh app icon' : isWindowsShortcut ? 'Use shortcut icon' : 'Use original app icon'}</button>{isWindowsShortcut && button.appIconData ? <button type="button" className="secondary-button app-icon-button" disabled={busy || extractingIcon} onClick={() => void extractIcon(false)}>Reset to app icon</button> : null}{iconError ? <small className="form-error">{iconError}</small> : null}</> : null}
-    {kind === 'sequence' ? <label>Keyboard steps<textarea value={sequenceDraft} onChange={(event) => setSequenceDraft(event.target.value)} onBlur={() => { const steps = parseSequenceText(sequenceDraft); if (!steps) { setSequenceError('Use 1–10 valid keyboard shortcuts separated by commas.'); return; } setSequenceError(''); onChange({ action: { type: 'sequence', steps } }); }} placeholder="CTRL+SHIFT+M, CTRL+S" disabled={busy} /><small>Enter 1–10 shortcuts separated by commas.</small>{sequenceError ? <small className="form-error">{sequenceError}</small> : null}</label> : null}
-    {kind === 'select_profile' ? <label>Profile ID<input value={action.type === 'select_profile' ? action.profileId : ''} onChange={(event) => onChange({ action: { type: 'select_profile', profileId: event.target.value } })} disabled={busy} /></label> : null}
-    {kind === 'select_page' ? <label>Page ID<input value={action.type === 'select_page' ? action.pageId : ''} onChange={(event) => onChange({ action: { type: 'select_page', pageId: event.target.value } })} disabled={busy} /></label> : null}
+    {kind === 'sequence' && action.type === 'sequence' ? <SequenceEditor steps={action.steps} disabled={busy} isMacos={isMacos} onChange={(steps) => onChange({ action: { type: 'sequence', steps } })} /> : null}
+    {kind === 'select_profile' && action.type === 'select_profile' ? <label>Profile<DeckSelect value={action.profileId} options={profiles.map((item) => ({ value: item.id, label: item.name }))} onChange={(profileId) => onChange({ action: { type: 'select_profile', profileId } })} disabled={busy} /></label> : null}
+    {kind === 'select_page' && action.type === 'select_page' ? <label>Page<DeckSelect value={action.pageId} options={pages.map((item) => ({ value: item.id, label: item.name }))} onChange={(pageId) => onChange({ action: { type: 'select_page', pageId } })} disabled={busy} /></label> : null}
   </div>;
 }
 
-function parseSequenceText(value: string): DeckStep[] | null {
-  const steps = value.split(',').map((part) => part.trim());
-  if (steps.length < 1 || steps.length > 10 || steps.some((step) => !step)) return null;
+function SequenceEditor({ steps, disabled, isMacos, onChange }: { steps: DeckStep[]; disabled: boolean; isMacos: boolean; onChange: (steps: DeckStep[]) => void }) {
+  const [draft, setDraft] = useState(steps);
+  const [error, setError] = useState('');
+  useEffect(() => { setDraft(steps); setError(''); }, [steps]);
+
+  function commit(next: DeckStep[]) {
+    if (next.length < 1 || next.length > 10) return;
+    setDraft(next);
+    setError('');
+    onChange(next);
+  }
+
+  function changeStep(index: number, step: DeckStep) {
+    const next = [...draft];
+    next[index] = step;
+    commit(next);
+  }
+
+  function moveStep(index: number, offset: number) {
+    const destination = index + offset;
+    if (destination < 0 || destination >= draft.length) return;
+    const next = [...draft];
+    [next[index], next[destination]] = [next[destination], next[index]];
+    commit(next);
+  }
+
+  async function browseApp(index: number) {
+    try {
+      const path = await openFileDialog({
+        title: 'Choose an application for this step',
+        multiple: false,
+        directory: false,
+        filters: [isMacos ? { name: 'Applications', extensions: ['app'] } : { name: 'Applications and shortcuts', extensions: ['exe', 'lnk'] }],
+      });
+      if (typeof path === 'string') changeStep(index, { type: 'launch_app', app: path });
+    } catch (cause) {
+      setError(`Could not open the application picker: ${String(cause)}`);
+    }
+  }
+
+  return <div className="sequence-editor">
+    <div className="sequence-heading"><strong>Sequence steps</strong><span>Runs in order on this PC · {draft.length}/10</span></div>
+    {draft.map((step, index) => <section className="sequence-step" key={index} aria-label={`Sequence step ${index + 1}`}>
+      <div className="sequence-step-heading">
+        <span className="sequence-step-number">{index + 1}</span>
+        <div className="sequence-step-type"><DeckSelect value={step.type} disabled={disabled} options={[['hotkey', 'Keyboard shortcut'], ['media', 'Media command'], ['launch_app', 'Launch app']].map(([value, label]) => ({ value, label }))} onChange={(value) => changeStep(index, value === 'media' ? { type: 'media', command: 'play_pause' } : value === 'launch_app' ? { type: 'launch_app', app: '' } : { type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] })} /></div>
+        <button type="button" className="sequence-order-button" aria-label={`Move step ${index + 1} up`} title="Move up" disabled={disabled || index === 0} onClick={() => moveStep(index, -1)}><ChevronUp size={14} /></button>
+        <button type="button" className="sequence-order-button" aria-label={`Move step ${index + 1} down`} title="Move down" disabled={disabled || index === draft.length - 1} onClick={() => moveStep(index, 1)}><ChevronDown size={14} /></button>
+        <button type="button" className="sequence-order-button sequence-remove-button" aria-label={`Remove step ${index + 1}`} title="Remove step" disabled={disabled || draft.length === 1} onClick={() => commit(draft.filter((_, itemIndex) => itemIndex !== index))}><Trash2 size={14} /></button>
+      </div>
+      {step.type === 'hotkey' ? <label>Shortcut<input value={step.keys.join('+')} disabled={disabled} placeholder="CTRL+SHIFT+M" onChange={(event) => {
+        const next = [...draft];
+        next[index] = { type: 'hotkey', keys: event.target.value.toUpperCase().split('+').map((key) => key.trim()) };
+        setDraft(next);
+      }} onBlur={() => {
+        const keys = parseShortcut(step.keys.join('+'));
+        if (!keys) setError(`Step ${index + 1}: enter a valid shortcut such as CTRL+SHIFT+M.`);
+        else changeStep(index, { type: 'hotkey', keys });
+      }} /></label> : null}
+      {step.type === 'media' ? <label>Command<DeckSelect value={step.command} disabled={disabled} options={[
+        ['play_pause', 'Play / Pause'], ['next_track', 'Next track'], ['previous_track', 'Previous track'], ['volume_up', 'Volume up'], ['volume_down', 'Volume down'], ['mute', 'Mute'],
+      ].map(([value, label]) => ({ value, label }))} onChange={(value) => changeStep(index, { type: 'media', command: value as MediaCommand })} /></label> : null}
+      {step.type === 'launch_app' ? <label>Application<div className="app-path-picker"><input value={step.app} disabled={disabled} placeholder="Application path or name" onChange={(event) => {
+        const next = [...draft];
+        next[index] = { type: 'launch_app', app: event.target.value };
+        setDraft(next);
+      }} onBlur={() => changeStep(index, step)} /><button type="button" className="app-browse-button" aria-label={`Browse for application in step ${index + 1}`} title="Browse for an application" disabled={disabled} onClick={() => void browseApp(index)}><FolderOpen size={15} /></button></div></label> : null}
+    </section>)}
+    {draft.length < 10 ? <button type="button" className="secondary-button sequence-add-button" disabled={disabled} onClick={() => commit([...draft, { type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] }])}><Plus size={14} /> Add step</button> : null}
+    {error ? <small className="form-error">{error}</small> : null}
+  </div>;
+}
+
+function parseShortcut(value: string): string[] | null {
+  if (!value.trim()) return null;
   const modifiers = new Set(['CTRL', 'ALT', 'SHIFT', 'META']);
   const special = new Set(['SPACE', 'ENTER', 'TAB', 'ESCAPE', 'BACKSPACE', 'DELETE', 'HOME', 'END', 'PAGE_UP', 'PAGE_DOWN', 'UP', 'DOWN', 'LEFT', 'RIGHT']);
-  const result: DeckStep[] = [];
-  for (const step of steps) {
-    const keys = step.toUpperCase().replace(/ /g, '').split('+');
-    if (keys.length < 2 || keys.length > 5 || keys.slice(0, -1).some((key) => !modifiers.has(key)) || new Set(keys.slice(0, -1)).size !== keys.length - 1) return null;
-    const last = keys[keys.length - 1];
-    if (!/^[A-Z0-9]$/.test(last) && !special.has(last) && !/^F([1-9]|1[0-2])$/.test(last)) return null;
-    result.push({ type: 'hotkey', keys });
-  }
-  return result;
+  const keys = value.toUpperCase().replace(/ /g, '').split('+');
+  if (keys.length < 2 || keys.length > 5 || keys.some((key) => !key) || keys.slice(0, -1).some((key) => !modifiers.has(key)) || new Set(keys.slice(0, -1)).size !== keys.length - 1) return null;
+  const last = keys[keys.length - 1];
+  if (!/^[A-Z0-9]$/.test(last) && !special.has(last) && !/^F([1-9]|1[0-2])$/.test(last)) return null;
+  return keys;
 }
 
 export default App;
