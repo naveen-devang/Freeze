@@ -53,7 +53,8 @@
           }
         }
       ],
-      "expo-sqlite"
+      "expo-sqlite",
+      "expo-localization"
     ]
   }
 }

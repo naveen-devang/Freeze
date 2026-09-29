@@ -6,9 +6,11 @@ import {
   AppWindow,
   ChevronUp,
   Check,
+  Clock,
   ChevronDown,
   Command,
   Copy,
+  File,
   FolderOpen,
   Headphones,
   Layers,
@@ -53,15 +55,123 @@ type ConnectionInfo = {
 };
 
 type MediaCommand = 'play_pause' | 'next_track' | 'previous_track' | 'volume_up' | 'volume_down' | 'mute';
-type DeckStep = { type: 'media'; command: MediaCommand } | { type: 'hotkey'; keys: string[] } | { type: 'launch_app'; app: string };
+type DeckStep = { type: 'media'; command: MediaCommand } | { type: 'hotkey'; keys: string[] } | { type: 'launch_app'; app: string } | { type: 'launch_file'; path: string } | { type: 'launch_folder'; path: string };
 type DeckAction = DeckStep | { type: 'launch_app'; app: string } | { type: 'sequence'; steps: DeckStep[] } | { type: 'select_profile'; profileId: string } | { type: 'select_page'; pageId: string };
-type DeckButton = { id: string; label: string; icon: string; iconSvg?: string; appIconData?: string; action: DeckAction };
+type DeckPlacement = { row: number; column: number; rowSpan: number; columnSpan: number };
+type DeckButton = { id: string; label: string; icon: string; placement?: DeckPlacement; iconSvg?: string; appIconData?: string; action: DeckAction };
+type DeckWidget = { id: string; type: 'clock'; placement: DeckPlacement };
+type WidgetScreen = { enabled: boolean; rows: number; columns: number; buttons: DeckButton[]; widgets: DeckWidget[] };
+type WidgetPage = { id: string; name: string; buttons: DeckButton[]; widgets: DeckWidget[] };
+type WidgetArea = { enabled: boolean; rows: number; columns: number; pages: WidgetPage[] };
 type PlaybackState = 'playing' | 'paused' | 'stopped' | 'unavailable';
 type LucideRegistry = Record<string, typeof Command>;
-type DeckPage = { id: string; name: string; rows: number; columns: number; buttons: DeckButton[] };
+type DeckPage = { id: string; name: string; rows: number; columns: number; buttons: DeckButton[]; widgetArea?: WidgetArea };
 type DeckProfile = { id: string; name: string; pages: DeckPage[]; activePageId: string; autoSwitchApps: string[]; autoSwitchEnabled: boolean };
 type DeckConfig = { schemaVersion: number; revision: number; profiles: DeckProfile[]; activeProfileId: string; fallbackProfileId: string };
 type LegacyImportSummary = { sourceId: string; pages: number; buttons: number; requested: boolean; ready: boolean };
+
+function buttonPlacement(page: DeckPage, button: DeckButton): DeckPlacement {
+  if (button.placement) return button.placement;
+  const index = page.buttons.findIndex((item) => item.id === button.id);
+  return { row: Math.floor(index / page.columns), column: index % page.columns, rowSpan: 1, columnSpan: 1 };
+}
+
+function canPlaceButton(page: DeckPage, buttonId: string, placement: DeckPlacement): boolean {
+  if (![placement.row, placement.column, placement.rowSpan, placement.columnSpan].every(Number.isInteger) ||
+      placement.row < 0 || placement.column < 0 || placement.rowSpan < 1 || placement.columnSpan < 1 ||
+      placement.row + placement.rowSpan > page.rows || placement.column + placement.columnSpan > page.columns) return false;
+  return page.buttons.every((button) => {
+    if (button.id === buttonId) return true;
+    const other = buttonPlacement(page, button);
+    return placement.row >= other.row + other.rowSpan || other.row >= placement.row + placement.rowSpan ||
+      placement.column >= other.column + other.columnSpan || other.column >= placement.column + placement.columnSpan;
+  });
+}
+
+function swapPlacements(rows: number, columns: number, items: { id: string; placement: DeckPlacement }[], firstId: string, secondId: string): Map<string, DeckPlacement> | null {
+  const first = items.find((item) => item.id === firstId)?.placement;
+  const second = items.find((item) => item.id === secondId)?.placement;
+  if (!first || !second || firstId === secondId) return null;
+  const placements = items.map((item) => ({
+    id: item.id,
+    placement: item.id === firstId ? { ...first, row: second.row, column: second.column }
+      : item.id === secondId ? { ...second, row: first.row, column: first.column }
+        : item.placement,
+  }));
+  const fits = placements.every(({ placement }, index) => placement.row >= 0 && placement.column >= 0 && placement.row + placement.rowSpan <= rows && placement.column + placement.columnSpan <= columns &&
+    placements.slice(index + 1).every(({ placement: other }) => placement.row >= other.row + other.rowSpan || other.row >= placement.row + placement.rowSpan || placement.column >= other.column + other.columnSpan || other.column >= placement.column + placement.columnSpan));
+  return fits ? new Map(placements.map((item) => [item.id, item.placement])) : null;
+}
+
+function firstButtonPlacement(page: DeckPage, rowSpan = 1, columnSpan = 1): DeckPlacement | null {
+  for (let row = 0; row <= page.rows - rowSpan; row++) {
+    for (let column = 0; column <= page.columns - columnSpan; column++) {
+      const placement = { row, column, rowSpan, columnSpan };
+      if (canPlaceButton(page, '', placement)) return placement;
+    }
+  }
+  return null;
+}
+
+function occupiedDeckCells(page: DeckPage): Map<number, DeckButton> {
+  const occupied = new Map<number, DeckButton>();
+  page.buttons.forEach((button) => {
+    const placement = buttonPlacement(page, button);
+    for (let row = placement.row; row < placement.row + placement.rowSpan; row++) {
+      for (let column = placement.column; column < placement.column + placement.columnSpan; column++) {
+        occupied.set(row * page.columns + column, button);
+      }
+    }
+  });
+  return occupied;
+}
+
+function emptyWidgetArea(): WidgetArea {
+  return { enabled: false, rows: 2, columns: 3, pages: [{ id: 'widgets-1', name: 'Page 1', buttons: [], widgets: [] }] };
+}
+
+type WidgetCanvasItem = { type: 'button'; button: DeckButton } | { type: 'widget'; widget: DeckWidget };
+
+function canPlaceWidgetItem(screen: WidgetScreen, itemId: string, placement: DeckPlacement): boolean {
+  if (![placement.row, placement.column, placement.rowSpan, placement.columnSpan].every(Number.isInteger) ||
+      placement.row < 0 || placement.column < 0 || placement.rowSpan < 1 || placement.columnSpan < 1 ||
+      placement.row + placement.rowSpan > screen.rows || placement.column + placement.columnSpan > screen.columns) return false;
+  const items = [
+    ...screen.buttons.map((button) => ({ id: button.id, placement: buttonPlacement({ ...screen, id: '', name: '', buttons: screen.buttons }, button) })),
+    ...screen.widgets.map((widget) => ({ id: widget.id, placement: widget.placement })),
+  ];
+  return items.every((item) => item.id === itemId ||
+    placement.row >= item.placement.row + item.placement.rowSpan || item.placement.row >= placement.row + placement.rowSpan ||
+    placement.column >= item.placement.column + item.placement.columnSpan || item.placement.column >= placement.column + placement.columnSpan);
+}
+
+function firstWidgetPlacement(screen: WidgetScreen, rowSpan = 1, columnSpan = 1): DeckPlacement | null {
+  for (let row = 0; row <= screen.rows - rowSpan; row++) {
+    for (let column = 0; column <= screen.columns - columnSpan; column++) {
+      const placement = { row, column, rowSpan, columnSpan };
+      if (canPlaceWidgetItem(screen, '', placement)) return placement;
+    }
+  }
+  return null;
+}
+
+function occupiedWidgetCells(screen: WidgetScreen): Map<number, WidgetCanvasItem> {
+  const occupied = new Map<number, WidgetCanvasItem>();
+  const page = { id: '', name: '', rows: screen.rows, columns: screen.columns, buttons: screen.buttons };
+  for (const button of screen.buttons) {
+    const placement = buttonPlacement(page, button);
+    for (let row = placement.row; row < placement.row + placement.rowSpan; row++) {
+      for (let column = placement.column; column < placement.column + placement.columnSpan; column++) occupied.set(row * screen.columns + column, { type: 'button', button });
+    }
+  }
+  for (const widget of screen.widgets) {
+    const placement = widget.placement;
+    for (let row = placement.row; row < placement.row + placement.rowSpan; row++) {
+      for (let column = placement.column; column < placement.column + placement.columnSpan; column++) occupied.set(row * screen.columns + column, { type: 'widget', widget });
+    }
+  }
+  return occupied;
+}
 
 function App() {
   const [connection, setConnection] = useState<ConnectionInfo | null>(null);
@@ -104,6 +214,18 @@ function App() {
       window.clearInterval(timer);
     };
   }, []);
+
+  useEffect(() => {
+    if (!connection?.isMacos) return;
+    const rootBackground = document.documentElement.style.backgroundColor;
+    const bodyBackground = document.body.style.backgroundColor;
+    document.documentElement.style.backgroundColor = 'transparent';
+    document.body.style.backgroundColor = 'transparent';
+    return () => {
+      document.documentElement.style.backgroundColor = rootBackground;
+      document.body.style.backgroundColor = bodyBackground;
+    };
+  }, [connection?.isMacos]);
 
   useEffect(() => {
     let live = true;
@@ -185,7 +307,7 @@ function App() {
     : "";
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell ${connection?.isMacos ? 'macos-native-sidebar' : ''}`}>
       <aside className="sidebar">
         <div className="brand">
           <Snowflake size={20} strokeWidth={1.8} />
@@ -364,6 +486,8 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
   const [profileId, setProfileId] = useState('');
   const [pageId, setPageId] = useState('');
   const [buttonId, setButtonId] = useState('');
+  const [widgetId, setWidgetId] = useState('');
+  const [widgetPageId, setWidgetPageId] = useState('');
   const [profileName, setProfileName] = useState('');
   const [editingPageId, setEditingPageId] = useState('');
   const [pageNameDraft, setPageNameDraft] = useState('');
@@ -371,8 +495,14 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
   const [busy, setBusy] = useState(false);
   const [draggingButtonId, setDraggingButtonId] = useState('');
   const [dragOverButtonId, setDragOverButtonId] = useState('');
+  const [dragOverCellKey, setDragOverCellKey] = useState('');
+  const [resizePreview, setResizePreview] = useState<{ id: string; placement: DeckPlacement; valid: boolean } | null>(null);
   const [autoSwitchAppDraft, setAutoSwitchAppDraft] = useState('');
-  const buttonDrag = useRef<{ id: string; pointerId: number; x: number; y: number; active: boolean } | null>(null);
+  const [clock, setClock] = useState(() => new Date());
+  const buttonDrag = useRef<{ id: string; surface: 'page' | 'widgets'; kind: 'button' | 'widget'; pointerId: number; x: number; y: number; active: boolean } | null>(null);
+  const resizeDrag = useRef<{ id: string; surface: 'page' | 'widgets'; kind: 'button' | 'widget'; pointerId: number; x: number; y: number; placement: DeckPlacement } | null>(null);
+  const canvasRef = useRef<HTMLDivElement | null>(null);
+  const widgetCanvasRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => { setWorkingConfig(savedConfig); }, [savedConfig]);
   const config = workingConfig ?? savedConfig;
@@ -383,19 +513,34 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
     const page = profile.pages.find((item) => item.id === (pageId || profile.activePageId)) ?? profile.pages[0];
     setProfileId(profile.id);
     setPageId(page.id);
-    if (!page.buttons.some((button) => button.id === buttonId)) setButtonId(page.buttons[0]?.id ?? '');
-  }, [config, profileId, pageId, buttonId]);
+    const area = page.widgetArea;
+    const widgetPage = area?.pages.find((item) => item.id === widgetPageId) ?? area?.pages[0];
+    if (widgetPage && widgetPage.id !== widgetPageId) setWidgetPageId(widgetPage.id);
+    if (!widgetId && !page.buttons.some((button) => button.id === buttonId) && !widgetPage?.buttons.some((button) => button.id === buttonId)) setButtonId(page.buttons[0]?.id ?? '');
+    if (!widgetPage?.widgets.some((widget) => widget.id === widgetId)) setWidgetId('');
+  }, [config, profileId, pageId, buttonId, widgetId]);
 
   const activeProfile = config?.profiles.find((item) => item.id === profileId) ?? config?.profiles[0];
   const activePage = activeProfile?.pages.find((item) => item.id === pageId) ?? activeProfile?.pages[0];
   useEffect(() => { if (activeProfile) setProfileName(activeProfile.name); }, [activeProfile?.id, activeProfile?.name]);
   useEffect(() => setAutoSwitchAppDraft(''), [activeProfile?.id]);
+  useEffect(() => {
+    const timer = window.setInterval(() => setClock(new Date()), 15_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   if (!config || !activeProfile || !activePage) return <div className="deck-loading">Loading your PC deck…</div>;
   const deck = config;
   const profile = activeProfile;
   const page = activePage;
-  const selected = page.buttons.find((button) => button.id === buttonId) ?? null;
+  const widgetArea = page.widgetArea ?? emptyWidgetArea();
+  const widgetPage = widgetArea.pages.find((item) => item.id === widgetPageId) ?? widgetArea.pages[0];
+  const widgetScreen: WidgetScreen = { enabled: widgetArea.enabled, rows: widgetArea.rows, columns: widgetArea.columns, buttons: widgetPage?.buttons ?? [], widgets: widgetPage?.widgets ?? [] };
+  const selected = page.buttons.find((button) => button.id === buttonId) ?? widgetScreen.buttons.find((button) => button.id === buttonId) ?? null;
+  const selectedWidget = widgetScreen.widgets.find((widget) => widget.id === widgetId) ?? null;
+  const occupied = occupiedDeckCells(page);
+  const widgetOccupied = occupiedWidgetCells(widgetScreen);
+  const hasFreeCell = occupied.size < page.rows * page.columns;
 
   async function save(next: DeckConfig) {
     setBusy(true);
@@ -418,6 +563,14 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
     if (persist) void save(next);
   }
 
+  function replaceWidgetScreen(nextScreen: WidgetScreen, nextProfile = profile, persist = true, basePage = page) {
+    const baseArea = basePage.widgetArea ?? emptyWidgetArea();
+    const pages = baseArea.pages.map((item) => item.id === widgetPage?.id ? { ...item, buttons: nextScreen.buttons, widgets: nextScreen.widgets } : item);
+    const nextArea: WidgetArea = { enabled: nextScreen.enabled, rows: nextScreen.rows, columns: nextScreen.columns, pages: pages.length ? pages : [{ id: 'widgets-1', name: 'Page 1', buttons: nextScreen.buttons, widgets: nextScreen.widgets }] };
+    const nextPage = { ...basePage, widgetArea: nextArea };
+    replacePage(nextPage, nextProfile, persist);
+  }
+
   function addPage() {
     if (profile.pages.length >= 8) return setError('Profiles can have up to 8 pages.');
     const id = `page-${Date.now()}`;
@@ -428,28 +581,136 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
     void save(next);
   }
 
-  function addButton() {
-    if (page.buttons.length >= page.rows * page.columns) return setError('This page is full. Increase its rows or columns to add more buttons.');
+  function addButton(row?: number, column?: number) {
+    const placement = row === undefined || column === undefined
+      ? firstButtonPlacement(page)
+      : canPlaceButton(page, '', { row, column, rowSpan: 1, columnSpan: 1 })
+        ? { row, column, rowSpan: 1, columnSpan: 1 }
+        : null;
+    if (!placement) return setError('There is no free grid cell. Move or resize a button to make room.');
     const id = `button-${Date.now()}`;
-    const nextButton: DeckButton = { id, label: 'New button', icon: 'auto', action: { type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] } };
+    const nextButton: DeckButton = { id, label: 'New button', icon: 'auto', placement, action: { type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] } };
     replacePage({ ...page, buttons: [...page.buttons, nextButton] });
     setButtonId(id);
   }
 
-  function reorderButton(draggedId: string, targetId: string) {
-    if (draggedId === targetId || busy) return;
-    const index = page.buttons.findIndex((item) => item.id === draggedId);
-    const destination = page.buttons.findIndex((item) => item.id === targetId);
-    if (index < 0 || destination < 0) return;
-    const buttons = [...page.buttons];
-    const [dragged] = buttons.splice(index, 1);
-    buttons.splice(destination, 0, dragged);
-    replacePage({ ...page, buttons });
+  function moveButtonTo(buttonId: string, row: number, column: number) {
+    const moving = page.buttons.find((button) => button.id === buttonId);
+    if (!moving || busy) return;
+    const placement = { ...buttonPlacement(page, moving), row, column };
+    if (!canPlaceButton(page, buttonId, placement)) return setError('That position is occupied or outside the grid. Move another button first.');
+    setError('');
+    replacePage({ ...page, buttons: page.buttons.map((button) => button.id === buttonId ? { ...button, placement } : button) });
   }
 
-  function startButtonDrag(event: React.PointerEvent<HTMLButtonElement>, id: string) {
+  function moveItemBetweenSurfaces(itemId: string, source: 'page' | 'widgets', target: 'page' | 'widgets', row: number, column: number, kind: 'button' | 'widget', targetId = '') {
+    if (busy) return;
+    if (kind === 'widget') {
+      if (source !== 'widgets' || target !== 'widgets') return;
+      const widget = widgetScreen.widgets.find((item) => item.id === itemId);
+      if (!widget) return;
+      if (source === target && targetId && targetId !== itemId) {
+        const placements = swapPlacements(widgetScreen.rows, widgetScreen.columns, [
+          ...widgetScreen.buttons.map((button) => ({ id: button.id, placement: buttonPlacement({ ...widgetScreen, id: '', name: '', buttons: widgetScreen.buttons }, button) })),
+          ...widgetScreen.widgets.map((item) => ({ id: item.id, placement: item.placement })),
+        ], itemId, targetId);
+        if (!placements) return setError('Those items cannot swap places without overlapping. Resize one and try again.');
+        setError('');
+        replaceWidgetScreen({ ...widgetScreen,
+          buttons: widgetScreen.buttons.map((button) => ({ ...button, placement: placements.get(button.id)! })),
+          widgets: widgetScreen.widgets.map((item) => ({ ...item, placement: placements.get(item.id)! })),
+        });
+        setWidgetId(itemId);
+        setButtonId('');
+        return;
+      }
+      const placement = { ...widget.placement, row, column };
+      if (!canPlaceWidgetItem(widgetScreen, itemId, placement)) return setError('That position is occupied or outside the widget screen.');
+      replaceWidgetScreen({ ...widgetScreen, widgets: widgetScreen.widgets.map((item) => item.id === itemId ? { ...item, placement } : item) });
+      setWidgetId(itemId);
+      setButtonId('');
+      return;
+    }
+    const button = (source === 'page' ? page.buttons : widgetScreen.buttons).find((item) => item.id === itemId);
+    if (!button) return;
+    const placement = { ...buttonPlacement(source === 'page' ? page : { ...widgetScreen, id: 'widgets', name: 'Widgets' }, button), row, column };
+    if (source === target) {
+      if (targetId && targetId !== itemId) {
+        const currentPage = target === 'page' ? page : null;
+        const items = target === 'page'
+          ? page.buttons.map((item) => ({ id: item.id, placement: buttonPlacement(page, item) }))
+          : [
+            ...widgetScreen.buttons.map((item) => ({ id: item.id, placement: buttonPlacement({ ...widgetScreen, id: '', name: '', buttons: widgetScreen.buttons }, item) })),
+            ...widgetScreen.widgets.map((item) => ({ id: item.id, placement: item.placement })),
+          ];
+        const placements = swapPlacements(target === 'page' ? page.rows : widgetScreen.rows, target === 'page' ? page.columns : widgetScreen.columns, items, itemId, targetId);
+        if (!placements) return setError('Those items cannot swap places without overlapping. Resize one and try again.');
+        setError('');
+        if (currentPage) replacePage({ ...currentPage, buttons: currentPage.buttons.map((item) => ({ ...item, placement: placements.get(item.id)! })) });
+        else replaceWidgetScreen({ ...widgetScreen,
+          buttons: widgetScreen.buttons.map((item) => ({ ...item, placement: placements.get(item.id)! })),
+          widgets: widgetScreen.widgets.map((item) => ({ ...item, placement: placements.get(item.id)! })),
+        });
+        setButtonId(itemId);
+        setWidgetId('');
+        return;
+      }
+      const valid = target === 'page' ? canPlaceButton(page, itemId, placement) : canPlaceWidgetItem(widgetScreen, itemId, placement);
+      if (!valid) return setError(`That position is occupied or outside the ${target === 'page' ? 'button grid' : 'widget screen'}.`);
+      setError('');
+      if (target === 'page') replacePage({ ...page, buttons: page.buttons.map((item) => item.id === itemId ? { ...item, placement } : item) });
+      else replaceWidgetScreen({ ...widgetScreen, buttons: widgetScreen.buttons.map((item) => item.id === itemId ? { ...item, placement } : item) });
+    } else if (target === 'widgets') {
+      if (!canPlaceWidgetItem(widgetScreen, '', placement)) return setError('That position is occupied or outside the widget screen.');
+      setError('');
+      replaceWidgetScreen({ ...widgetScreen, enabled: true, buttons: [...widgetScreen.buttons, { ...button, placement }] }, profile, true, { ...page, buttons: page.buttons.filter((entry) => entry.id !== itemId) });
+    } else {
+      if (!canPlaceButton(page, '', placement)) return setError('That position is occupied or outside the button grid.');
+      const nextPage = { ...page, buttons: [...page.buttons, { ...button, placement }] };
+      const nextScreen = { ...widgetScreen, buttons: widgetScreen.buttons.filter((item) => item.id !== itemId) };
+      setError('');
+      replaceWidgetScreen(nextScreen, profile, true, nextPage);
+    }
+    setButtonId(itemId);
+    setWidgetId('');
+  }
+
+  function moveSelectedButtonToOtherSurface() {
+    if (!selected) return;
+    const source = page.buttons.some((button) => button.id === selected.id) ? 'page' : 'widgets';
+    const placement = buttonPlacement(source === 'page' ? page : { ...widgetScreen, id: 'widgets', name: 'Widgets' }, selected);
+    const target = source === 'page' ? 'widgets' : 'page';
+    const destination = target === 'page'
+      ? firstButtonPlacement(page, placement.rowSpan, placement.columnSpan)
+      : firstWidgetPlacement(widgetScreen, placement.rowSpan, placement.columnSpan);
+    if (!destination) return setError(`There is no free ${target === 'page' ? 'button grid' : 'widget screen'} space large enough for this button.`);
+    moveItemBetweenSurfaces(selected.id, source, target, destination.row, destination.column, 'button');
+  }
+
+  function resizeButtonTo(buttonId: string, placement: DeckPlacement) {
+    if (busy) return false;
+    if (!canPlaceButton(page, buttonId, placement)) return false;
+    setError('');
+    replacePage({ ...page, buttons: page.buttons.map((button) => button.id === buttonId ? { ...button, placement } : button) });
+    return true;
+  }
+
+  function resizeWidgetItem(itemId: string, placement: DeckPlacement, kind: 'button' | 'widget') {
+    if (busy || !canPlaceWidgetItem(widgetScreen, itemId, placement)) return false;
+    if (kind === 'button') replaceWidgetScreen({ ...widgetScreen, buttons: widgetScreen.buttons.map((button) => button.id === itemId ? { ...button, placement } : button) });
+    else replaceWidgetScreen({ ...widgetScreen, widgets: widgetScreen.widgets.map((widget) => widget.id === itemId ? { ...widget, placement } : widget) });
+    return true;
+  }
+
+  function startButtonDrag(event: React.PointerEvent<HTMLButtonElement>, id: string, surface: 'page' | 'widgets' = 'page') {
     if (event.button !== 0 || busy) return;
-    buttonDrag.current = { id, pointerId: event.pointerId, x: event.clientX, y: event.clientY, active: false };
+    buttonDrag.current = { id, surface, kind: 'button', pointerId: event.pointerId, x: event.clientX, y: event.clientY, active: false };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function startWidgetDrag(event: React.PointerEvent<HTMLButtonElement>, id: string) {
+    if (event.button !== 0 || busy) return;
+    buttonDrag.current = { id, surface: 'widgets', kind: 'widget', pointerId: event.pointerId, x: event.clientX, y: event.clientY, active: false };
     event.currentTarget.setPointerCapture(event.pointerId);
   }
 
@@ -460,9 +721,11 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
     drag.active = true;
     event.preventDefault();
     setDraggingButtonId(drag.id);
-    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('[data-deck-button]');
-    const targetId = target?.dataset.deckButton ?? '';
+    const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('[data-deck-cell]');
+    const targetId = target?.dataset.deckItem ?? target?.dataset.deckButton ?? '';
     if (targetId !== dragOverButtonId) setDragOverButtonId(targetId);
+    const cellKey = target ? `${target.dataset.row}:${target.dataset.column}` : '';
+    if (cellKey !== dragOverCellKey) setDragOverCellKey(cellKey);
   }
 
   function finishButtonDrag(event: React.PointerEvent<HTMLButtonElement>) {
@@ -470,12 +733,16 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
     if (!drag || drag.pointerId !== event.pointerId) return;
     buttonDrag.current = null;
     if (drag.active) {
-      const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('[data-deck-button]');
-      if (target?.dataset.deckButton) reorderButton(drag.id, target.dataset.deckButton);
-      setButtonId(drag.id);
+      const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('[data-deck-cell]');
+      if (target?.dataset.surface === 'page' || target?.dataset.surface === 'widgets') {
+        moveItemBetweenSurfaces(drag.id, drag.surface, target.dataset.surface, Number(target.dataset.row), Number(target.dataset.column), drag.kind, target.dataset.deckItem ?? target.dataset.deckButton ?? '');
+      }
+      if (drag.kind === 'button') setButtonId(drag.id);
+      else setWidgetId(drag.id);
     }
     setDraggingButtonId('');
     setDragOverButtonId('');
+    setDragOverCellKey('');
   }
 
   function cancelButtonDrag(event: React.PointerEvent<HTMLButtonElement>) {
@@ -483,15 +750,67 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
     buttonDrag.current = null;
     setDraggingButtonId('');
     setDragOverButtonId('');
+    setDragOverCellKey('');
+  }
+
+  function startResize(event: React.PointerEvent<HTMLSpanElement>, button: DeckButton | DeckWidget, surface: 'page' | 'widgets' = 'page', kind: 'button' | 'widget' = 'button') {
+    if (event.button !== 0 || busy) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const placement = kind === 'widget' ? (button as DeckWidget).placement : buttonPlacement(surface === 'page' ? page : { ...widgetScreen, id: 'widgets', name: 'Widgets' }, button as DeckButton);
+    resizeDrag.current = { id: button.id, surface, kind, pointerId: event.pointerId, x: event.clientX, y: event.clientY, placement };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    if (kind === 'button') setButtonId(button.id);
+    else setWidgetId(button.id);
+  }
+
+  function moveResize(event: React.PointerEvent<HTMLSpanElement>) {
+    const drag = resizeDrag.current;
+    const canvas = drag?.surface === 'widgets' ? widgetCanvasRef.current : canvasRef.current;
+    if (!drag || drag.pointerId !== event.pointerId || !canvas) return;
+    const surface = drag.surface === 'widgets' ? widgetScreen : null;
+    const rowCount = surface?.rows ?? page.rows;
+    const columnCount = surface?.columns ?? page.columns;
+    const bounds = canvas.getBoundingClientRect();
+    const style = getComputedStyle(canvas);
+    const gap = Number.parseFloat(style.columnGap) || 10;
+    const rowGap = Number.parseFloat(style.rowGap) || gap;
+    const horizontalPadding = (Number.parseFloat(style.paddingLeft) || 0) + (Number.parseFloat(style.paddingRight) || 0);
+    const cellWidth = (bounds.width - horizontalPadding - gap * (columnCount - 1)) / columnCount;
+    const cellHeight = 100;
+    const columnSpan = Math.max(1, drag.placement.columnSpan + Math.round((event.clientX - drag.x) / (cellWidth + gap)));
+    const rowSpan = Math.max(1, drag.placement.rowSpan + Math.round((event.clientY - drag.y) / (cellHeight + rowGap)));
+    const placement = { ...drag.placement, rowSpan, columnSpan };
+    const valid = drag.surface === 'page' ? canPlaceButton(page, drag.id, placement) : canPlaceWidgetItem(widgetScreen, drag.id, placement);
+    setResizePreview({ id: drag.id, placement, valid: valid && placement.row + placement.rowSpan <= rowCount });
+  }
+
+  function finishResize(event: React.PointerEvent<HTMLSpanElement>) {
+    const drag = resizeDrag.current;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    resizeDrag.current = null;
+    const preview = resizePreview;
+    if (preview?.id === drag.id && preview.valid) {
+      if (drag.surface === 'page') resizeButtonTo(drag.id, preview.placement);
+      else resizeWidgetItem(drag.id, preview.placement, drag.kind);
+    }
+    else if (preview?.id === drag.id && (preview.placement.rowSpan !== drag.placement.rowSpan || preview.placement.columnSpan !== drag.placement.columnSpan)) setError('That size overlaps another button or extends beyond the grid.');
+    setResizePreview(null);
+  }
+
+  function cancelResize(event: React.PointerEvent<HTMLSpanElement>) {
+    if (resizeDrag.current?.pointerId !== event.pointerId) return;
+    resizeDrag.current = null;
+    setResizePreview(null);
   }
 
   function duplicateButton() {
     if (!selected) return;
-    if (page.buttons.length >= page.rows * page.columns) return setError('This page is full. Increase its rows or columns to add more buttons.');
+    const sourcePlacement = buttonPlacement(page, selected);
+    const placement = firstButtonPlacement(page, sourcePlacement.rowSpan, sourcePlacement.columnSpan);
+    if (!placement) return setError('There is no free space large enough to duplicate this button.');
     const id = `button-${Date.now()}`;
-    const index = page.buttons.findIndex((item) => item.id === selected.id);
-    const buttons = [...page.buttons];
-    buttons.splice(index + 1, 0, { ...selected, id, label: `${selected.label} copy`.slice(0, 24) });
+    const buttons = [...page.buttons, { ...selected, id, placement, label: `${selected.label} copy`.slice(0, 24) }];
     replacePage({ ...page, buttons });
     setButtonId(id);
   }
@@ -504,6 +823,7 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
     setProfileId(id);
     setPageId(nextProfile.activePageId);
     setButtonId('');
+    setWidgetId('');
     void save(next);
   }
 
@@ -557,7 +877,8 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
 
   function updateButton(patch: Partial<DeckButton>) {
     if (!selected) return;
-    replacePage({ ...page, buttons: page.buttons.map((button) => button.id === selected.id ? { ...button, ...patch } : button) }, profile, false);
+    if (page.buttons.some((button) => button.id === selected.id)) replacePage({ ...page, buttons: page.buttons.map((button) => button.id === selected.id ? { ...button, ...patch } : button) }, profile, false);
+    else replaceWidgetScreen({ ...widgetScreen, buttons: widgetScreen.buttons.map((button) => button.id === selected.id ? { ...button, ...patch } : button) }, profile, false);
   }
 
   function resizePage(dimension: 'rows' | 'columns', value: string) {
@@ -565,9 +886,74 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
     if (!Number.isInteger(nextValue) || nextValue < 1 || nextValue > 6) return;
     const rows = dimension === 'rows' ? nextValue : page.rows;
     const columns = dimension === 'columns' ? nextValue : page.columns;
-    if (page.buttons.length > rows * columns) return setError(`This page already has ${page.buttons.length} buttons. Keep at least ${Math.ceil(page.buttons.length / (dimension === 'rows' ? columns : rows))} ${dimension}.`);
+    if (page.buttons.some((button) => {
+      const placement = buttonPlacement(page, button);
+      return placement.row + placement.rowSpan > rows || placement.column + placement.columnSpan > columns;
+    })) return setError(`A button extends beyond the new grid. Move or resize it before reducing ${dimension}.`);
     setError('');
     replacePage({ ...page, [dimension]: nextValue });
+  }
+
+  function updateWidgetScreen(patch: Partial<WidgetScreen>) {
+    replaceWidgetScreen({ ...widgetScreen, ...patch });
+  }
+
+  function addWidgetPage() {
+    if (widgetArea.pages.length >= 9) return setError('A page can have up to 9 widget pages.');
+    const id = `widgets-${Date.now()}`;
+    const nextArea = { ...widgetArea, enabled: true, pages: [...widgetArea.pages, { id, name: `Page ${widgetArea.pages.length + 1}`, buttons: [], widgets: [] }] };
+    replacePage({ ...page, widgetArea: nextArea });
+    setWidgetPageId(id);
+    setButtonId('');
+    setWidgetId('');
+  }
+
+  function selectWidgetPage(id: string) {
+    setWidgetPageId(id);
+    setButtonId('');
+    setWidgetId('');
+  }
+
+  function deleteWidgetPage() {
+    if (widgetArea.pages.length <= 1) return setError('Keep at least one widget page.');
+    if (widgetScreen.buttons.length + widgetScreen.widgets.length > 0) return setError('Move or delete the items on this widget page first.');
+    const remaining = widgetArea.pages.filter((item) => item.id !== widgetPage?.id);
+    replacePage({ ...page, widgetArea: { ...widgetArea, pages: remaining } });
+    setWidgetPageId(remaining[0].id);
+  }
+
+  function resizeWidgetScreen(dimension: 'rows' | 'columns', value: string) {
+    const nextValue = Number(value);
+    if (!Number.isInteger(nextValue) || nextValue < 1 || nextValue > 6) return;
+    const nextScreen = { ...widgetScreen, [dimension]: nextValue };
+    if (widgetArea.pages.some((candidate) => [
+      ...candidate.buttons.map((button) => button.placement ?? buttonPlacement({ id: '', name: '', rows: widgetScreen.rows, columns: widgetScreen.columns, buttons: candidate.buttons }, button)),
+      ...candidate.widgets.map((widget) => widget.placement),
+    ].some((placement) => placement.row + placement.rowSpan > nextScreen.rows || placement.column + placement.columnSpan > nextScreen.columns))) {
+      return setError(`An item extends beyond the new widget screen. Move or resize it before reducing ${dimension}.`);
+    }
+    setError('');
+    updateWidgetScreen({ [dimension]: nextValue });
+  }
+
+  function addClockWidget(row?: number, column?: number) {
+    const placement = row === undefined || column === undefined
+      ? firstWidgetPlacement(widgetScreen)
+      : canPlaceWidgetItem(widgetScreen, '', { row, column, rowSpan: 1, columnSpan: 1 })
+        ? { row, column, rowSpan: 1, columnSpan: 1 }
+        : null;
+    if (!placement) return setError('There is no free cell on the widget screen. Move or resize an item to make room.');
+    const widget: DeckWidget = { id: `widget-${Date.now()}`, type: 'clock', placement };
+    setError('');
+    setWidgetId(widget.id);
+    setButtonId('');
+    updateWidgetScreen({ enabled: true, widgets: [...widgetScreen.widgets, widget] });
+  }
+
+  function deleteSelectedWidget() {
+    if (!selectedWidget) return;
+    updateWidgetScreen({ widgets: widgetScreen.widgets.filter((widget) => widget.id !== selectedWidget.id) });
+    setWidgetId('');
   }
 
   function updateAutoSwitchApps(apps: string[]) {
@@ -625,9 +1011,9 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
     </div>
     {error ? <p className="usb-error" role="alert">{error}</p> : null}
     <section className="deck-toolbar">
-      <label>Profile<DeckSelect value={profile.id} disabled={busy} options={deck.profiles.map((item) => ({ value: item.id, label: item.name }))} onChange={(value) => { const nextProfile = deck.profiles.find((item) => item.id === value)!; setProfileId(nextProfile.id); setPageId(nextProfile.activePageId); setButtonId(''); void save({ ...deck, activeProfileId: nextProfile.id }); }} /></label>
+      <label>Profile<DeckSelect value={profile.id} disabled={busy} options={deck.profiles.map((item) => ({ value: item.id, label: item.name }))} onChange={(value) => { const nextProfile = deck.profiles.find((item) => item.id === value)!; setProfileId(nextProfile.id); setPageId(nextProfile.activePageId); setButtonId(''); setWidgetId(''); void save({ ...deck, activeProfileId: nextProfile.id }); }} /></label>
       <label>Profile name<input value={profileName} maxLength={32} disabled={busy} onChange={(event) => setProfileName(event.target.value)} onBlur={renameProfile} /></label>
-      <div className="page-control"><label>Pages<div className="page-switcher">{profile.pages.map((item) => item.id === editingPageId ? <input key={item.id} className="page-tab-editor" aria-label={`Rename ${item.name}`} value={pageNameDraft} maxLength={24} style={{ width: `${Math.max(8, pageNameDraft.length + 2)}ch` }} autoFocus disabled={busy} onChange={(event) => setPageNameDraft(event.target.value)} onBlur={() => renamePage(item.id, pageNameDraft)} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} /> : <button key={item.id} className={`transport-tab ${page.id === item.id ? 'selected' : ''}`} disabled={busy} title="Double-click to rename" onDoubleClick={() => { setPageId(item.id); setPageNameDraft(item.name); setEditingPageId(item.id); }} onClick={() => { setPageId(item.id); if (page.id !== item.id) setButtonId(''); if (profile.activePageId !== item.id) void save({ ...deck, activeProfileId: profile.id, profiles: deck.profiles.map((entry) => entry.id === profile.id ? { ...entry, activePageId: item.id } : entry) }); }}>{item.name}</button>)}</div></label><button className="add-page-button" onClick={addPage} disabled={busy || profile.pages.length >= 8} aria-label="Add page" title="Add page"><Plus size={16} /></button></div>
+      <div className="page-control"><label>Pages<div className="page-switcher">{profile.pages.map((item) => item.id === editingPageId ? <input key={item.id} className="page-tab-editor" aria-label={`Rename ${item.name}`} value={pageNameDraft} maxLength={24} style={{ width: `${Math.max(8, pageNameDraft.length + 2)}ch` }} autoFocus disabled={busy} onChange={(event) => setPageNameDraft(event.target.value)} onBlur={() => renamePage(item.id, pageNameDraft)} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} /> : <button key={item.id} className={`transport-tab ${page.id === item.id ? 'selected' : ''}`} disabled={busy} title="Double-click to rename" onDoubleClick={() => { setPageId(item.id); setPageNameDraft(item.name); setEditingPageId(item.id); }} onClick={() => { setPageId(item.id); setWidgetId(''); if (page.id !== item.id) setButtonId(''); if (profile.activePageId !== item.id) void save({ ...deck, activeProfileId: profile.id, profiles: deck.profiles.map((entry) => entry.id === profile.id ? { ...entry, activePageId: item.id } : entry) }); }}>{item.name}</button>)}</div></label><button className="add-page-button" onClick={addPage} disabled={busy || profile.pages.length >= 8} aria-label="Add page" title="Add page"><Plus size={16} /></button></div>
     </section>
     <section className="auto-switch-card">
       <div className="auto-switch-heading"><div><h2>Automatic switching · {profile.name}</h2><p>Switch to this profile when one of its assigned apps is in the foreground on this PC.</p></div><label className="auto-switch-toggle"><input type="checkbox" checked={profile.autoSwitchEnabled} disabled={busy} onChange={(event) => updateProfileAutoSwitch(event.target.checked)} /> Enabled</label></div>
@@ -637,30 +1023,104 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
       </div>
     </section>
     <section className="deck-editor-layout">
+      <div className="deck-canvas-column">
       <div className="deck-canvas-wrap">
-        <div className="deck-canvas-heading"><div><h2>{profile.name} / {page.name}</h2><p>{page.buttons.length} of {page.rows * page.columns} slots · Drag to rearrange</p></div><div className="heading-actions"><label className="grid-size-control">Rows<DeckSelect value={String(page.rows)} disabled={busy} options={Array.from({ length: 6 }, (_, index) => ({ value: String(index + 1), label: String(index + 1) }))} onChange={(value) => resizePage('rows', value)} /></label><label className="grid-size-control">Columns<DeckSelect value={String(page.columns)} disabled={busy} options={Array.from({ length: 6 }, (_, index) => ({ value: String(index + 1), label: String(index + 1) }))} onChange={(value) => resizePage('columns', value)} /></label>{selected ? <button className="secondary-button" onClick={duplicateButton} disabled={busy || page.buttons.length >= page.rows * page.columns}><Copy size={13} /> Duplicate</button> : null}<button className="secondary-button" onClick={addButton} disabled={busy || page.buttons.length >= page.rows * page.columns}><Plus size={14} /> Add button</button></div></div>
-        <div className="deck-canvas" style={{ gridTemplateColumns: `repeat(${page.columns}, minmax(0, 1fr))` }}>{Array.from({ length: page.rows * page.columns }, (_, index) => {
-          const button = page.buttons[index];
-          return button ? <button
+        <div className="deck-canvas-heading"><div><h2>{profile.name} / {page.name}</h2><p>{page.buttons.length} buttons · {occupied.size} of {page.rows * page.columns} cells · Drag to move or resize</p></div><div className="heading-actions"><label className="grid-size-control">Rows<DeckSelect value={String(page.rows)} disabled={busy} options={Array.from({ length: 6 }, (_, index) => ({ value: String(index + 1), label: String(index + 1) }))} onChange={(value) => resizePage('rows', value)} /></label><label className="grid-size-control">Columns<DeckSelect value={String(page.columns)} disabled={busy} options={Array.from({ length: 6 }, (_, index) => ({ value: String(index + 1), label: String(index + 1) }))} onChange={(value) => resizePage('columns', value)} /></label>{selected && page.buttons.some((item) => item.id === selected.id) ? <button className="secondary-button" onClick={duplicateButton} disabled={busy || !firstButtonPlacement(page, buttonPlacement(page, selected).rowSpan, buttonPlacement(page, selected).columnSpan)}><Copy size={13} /> Duplicate</button> : null}<button className="secondary-button" onClick={() => addButton()} disabled={busy || !hasFreeCell}><Plus size={14} /> Add button</button></div></div>
+        <div ref={canvasRef} className="deck-canvas" style={{ gridTemplateColumns: `repeat(${page.columns}, minmax(0, 1fr))`, gridTemplateRows: `repeat(${page.rows}, minmax(100px, auto))` }}>{Array.from({ length: page.rows * page.columns }, (_, index) => {
+          const row = Math.floor(index / page.columns);
+          const column = index % page.columns;
+          const button = occupied.get(index);
+          if (button) {
+            const placement = buttonPlacement(page, button);
+            if (placement.row !== row || placement.column !== column) return null;
+            const preview = resizePreview?.id === button.id ? resizePreview : null;
+            const requestedPlacement = preview?.placement ?? placement;
+            const shownPlacement = {
+              ...requestedPlacement,
+              rowSpan: Math.min(requestedPlacement.rowSpan, page.rows - placement.row),
+              columnSpan: Math.min(requestedPlacement.columnSpan, page.columns - placement.column),
+            };
+            return <button
           key={button.id}
           type="button"
           data-deck-button={button.id}
-          className={`deck-button ${selected?.id === button.id ? 'selected' : ''} ${dragOverButtonId === button.id ? 'drop-target' : ''} ${draggingButtonId === button.id ? 'dragging' : ''}`}
-          onClick={() => setButtonId(button.id)}
-          onPointerDown={(event) => startButtonDrag(event, button.id)}
+          data-deck-item={button.id}
+          data-deck-cell="true"
+          data-surface="page"
+          data-row={placement.row}
+          data-column={placement.column}
+          className={`deck-button ${selected?.id === button.id ? 'selected' : ''} ${dragOverButtonId === button.id ? 'drop-target' : ''} ${draggingButtonId === button.id ? 'dragging' : ''} ${preview && !preview.valid ? 'resize-invalid' : ''}`}
+          style={{ gridColumn: `${placement.column + 1} / span ${shownPlacement.columnSpan}`, gridRow: `${placement.row + 1} / span ${shownPlacement.rowSpan}` }}
+          onClick={() => { setWidgetId(''); setButtonId(button.id); }}
+          onPointerDown={(event) => startButtonDrag(event, button.id, 'page')}
           onPointerMove={moveButtonDrag}
           onPointerUp={finishButtonDrag}
           onPointerCancel={cancelButtonDrag}
           onLostPointerCapture={cancelButtonDrag}
-          onKeyDown={(event) => { if (event.altKey && ['ArrowLeft', 'ArrowRight'].includes(event.key)) { event.preventDefault(); const index = page.buttons.findIndex((item) => item.id === button.id); const target = page.buttons[index + (event.key === 'ArrowLeft' ? -1 : 1)]; if (target) reorderButton(button.id, target.id); } }}
-          title="Drag to rearrange · Alt+Left/Right to move by one slot"
-        ><span>{iconForButton(button, playbackState)}</span><strong>{buttonLabel(button, playbackState)}</strong><small>{actionType(button.action).replace('_', ' ')}</small></button> : <button key={`empty-${index}`} type="button" className="deck-button deck-slot" onClick={addButton} disabled={busy || page.buttons.length >= page.rows * page.columns} aria-label={`Add button in slot ${index + 1}`}><Plus size={17} /><span>Add button</span></button>;
+          onKeyDown={(event) => {
+            if (!event.altKey && !event.shiftKey) return;
+            const current = buttonPlacement(page, button);
+            if (event.altKey && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) {
+              event.preventDefault();
+              moveButtonTo(button.id, current.row + (event.key === 'ArrowDown' ? 1 : event.key === 'ArrowUp' ? -1 : 0), current.column + (event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0));
+            } else if (event.shiftKey && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(event.key)) {
+              event.preventDefault();
+              resizeButtonTo(button.id, { ...current, columnSpan: current.columnSpan + (event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0), rowSpan: current.rowSpan + (event.key === 'ArrowDown' ? 1 : event.key === 'ArrowUp' ? -1 : 0) });
+            }
+          }}
+          title="Drag to move · Drag the lower-right corner to resize · Alt+Arrow to move · Shift+Arrow to resize"
+          ><span>{iconForButton(button, playbackState)}</span><strong>{buttonLabel(button, playbackState)}</strong><small>{actionType(button.action).replace('_', ' ')}</small><span className="deck-button-size">{preview ? `${requestedPlacement.columnSpan}×${requestedPlacement.rowSpan}` : placement.rowSpan > 1 || placement.columnSpan > 1 ? `${placement.columnSpan}×${placement.rowSpan}` : null}</span><span className="deck-resize-handle" aria-hidden="true" onPointerDown={(event) => startResize(event, button, 'page')} onPointerMove={moveResize} onPointerUp={finishResize} onPointerCancel={cancelResize} onLostPointerCapture={cancelResize} /></button>;
+          }
+          return <button key={`empty-${index}`} type="button" data-deck-cell="true" data-surface="page" data-row={row} data-column={column} className={`deck-button deck-slot ${dragOverCellKey === `${row}:${column}` ? 'drop-target' : ''}`} onClick={() => addButton(row, column)} disabled={busy || !hasFreeCell} aria-label={`Add button in row ${row + 1}, column ${column + 1}`}><Plus size={17} /><span>Add button</span></button>;
         })}
         </div>
       </div>
-      <div className="button-properties"><div className="properties-heading"><div><h2>Button settings</h2><p>{selected ? 'Edit the selected control' : 'Select a button to configure it'}</p></div>{selected ? <button className="icon-button" aria-label="Remove button" onClick={() => { const next = { ...config, profiles: config.profiles.map((entry) => entry.id === profile.id ? { ...entry, pages: entry.pages.map((candidate) => candidate.id === page.id ? { ...candidate, buttons: candidate.buttons.filter((item) => item.id !== selected.id) } : candidate) } : entry) }; setButtonId(''); void save(next); }}><Trash2 size={15} /></button> : null}</div>
-        {selected ? <ButtonProperties key={selected.id} button={selected} busy={busy} isMacos={isMacos} profiles={deck.profiles} pages={profile.pages} onChange={updateButton} /> : <div className="properties-empty">Select a button from the deck grid.</div>}
-        {selected ? <button className="primary-button save-button" onClick={() => void save(deck)} disabled={busy}><Save size={14} /> {busy ? 'Saving…' : 'Save deck'}</button> : null}
+      <section className="deck-canvas-wrap widget-screen-editor">
+        <div className="deck-canvas-heading">
+          <div><h2>{page.name} / Widget area</h2><p>{widgetScreen.buttons.length + widgetScreen.widgets.length} items · {widgetOccupied.size} of {widgetScreen.rows * widgetScreen.columns} cells · Drag buttons here to move them</p></div>
+          <div className="heading-actions">
+            <label className="widget-screen-toggle"><input type="checkbox" checked={widgetArea.enabled} disabled={busy} onChange={(event) => updateWidgetScreen({ enabled: event.target.checked })} /> Show on phone</label>
+            <label className="grid-size-control">Rows<DeckSelect value={String(widgetScreen.rows)} disabled={busy} options={Array.from({ length: 6 }, (_, index) => ({ value: String(index + 1), label: String(index + 1) }))} onChange={(value) => resizeWidgetScreen('rows', value)} /></label>
+            <label className="grid-size-control">Columns<DeckSelect value={String(widgetScreen.columns)} disabled={busy} options={Array.from({ length: 6 }, (_, index) => ({ value: String(index + 1), label: String(index + 1) }))} onChange={(value) => resizeWidgetScreen('columns', value)} /></label>
+            <button className="secondary-button" onClick={() => addClockWidget()} disabled={busy || !firstWidgetPlacement(widgetScreen)}><Plus size={14} /> Add clock</button>
+          </div>
+        </div>
+        <div className="widget-page-toolbar">
+          <div className="page-switcher">{widgetArea.pages.map((item) => <button key={item.id} className={`transport-tab ${item.id === widgetPage?.id ? 'selected' : ''}`} disabled={busy} onClick={() => selectWidgetPage(item.id)}>{item.name}</button>)}</div>
+          <div className="heading-actions"><button className="secondary-button" onClick={addWidgetPage} disabled={busy || widgetArea.pages.length >= 9}><Plus size={14} /> Add widget page</button>{widgetArea.pages.length > 1 ? <button className="icon-button" aria-label="Delete empty widget page" title="Delete empty widget page" onClick={deleteWidgetPage} disabled={busy || widgetScreen.buttons.length + widgetScreen.widgets.length > 0}><Trash2 size={14} /></button> : null}</div>
+        </div>
+        <div ref={widgetCanvasRef} className="deck-canvas widget-canvas" style={{ gridTemplateColumns: `repeat(${widgetScreen.columns}, minmax(0, 1fr))`, gridTemplateRows: `repeat(${widgetScreen.rows}, minmax(100px, auto))` }}>
+          {Array.from({ length: widgetScreen.rows * widgetScreen.columns }, (_, index) => {
+            const row = Math.floor(index / widgetScreen.columns);
+            const column = index % widgetScreen.columns;
+            const item = widgetOccupied.get(index);
+            if (item) {
+              const placement = item.type === 'button' ? buttonPlacement({ id: 'widgets', name: 'Widgets', rows: widgetScreen.rows, columns: widgetScreen.columns, buttons: widgetScreen.buttons }, item.button) : item.widget.placement;
+              if (placement.row !== row || placement.column !== column) return null;
+              const itemId = item.type === 'button' ? item.button.id : item.widget.id;
+              const preview = resizePreview?.id === itemId ? resizePreview : null;
+              const shown = preview?.placement ?? placement;
+              return <button key={itemId} type="button" data-deck-item={itemId} data-deck-cell="true" data-surface="widgets" data-row={placement.row} data-column={placement.column} className={`deck-button ${item.type === 'widget' ? 'clock-widget' : ''} ${item.type === 'button' && selected?.id === itemId ? 'selected' : ''} ${item.type === 'widget' && selectedWidget?.id === itemId ? 'selected' : ''} ${dragOverButtonId === itemId ? 'drop-target' : ''} ${draggingButtonId === itemId ? 'dragging' : ''} ${preview && !preview.valid ? 'resize-invalid' : ''}`} style={{ gridColumn: `${placement.column + 1} / span ${Math.min(shown.columnSpan, widgetScreen.columns - placement.column)}`, gridRow: `${placement.row + 1} / span ${Math.min(shown.rowSpan, widgetScreen.rows - placement.row)}` }} onClick={() => item.type === 'button' ? (setWidgetId(''), setButtonId(item.button.id)) : (setButtonId(''), setWidgetId(item.widget.id))} onPointerDown={(event) => item.type === 'button' ? startButtonDrag(event, item.button.id, 'widgets') : startWidgetDrag(event, item.widget.id)} onPointerMove={moveButtonDrag} onPointerUp={finishButtonDrag} onPointerCancel={cancelButtonDrag} onLostPointerCapture={cancelButtonDrag}>
+                {item.type === 'button' ? <><span>{iconForButton(item.button, playbackState)}</span><strong>{buttonLabel(item.button, playbackState)}</strong><small>button · {actionType(item.button.action).replace('_', ' ')}</small></> : <><span className="clock-widget-icon"><Clock size={18} /></span><strong>{clock.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</strong><small>{clock.toLocaleDateString()}</small></>}
+                <span className="deck-button-size">{preview ? `${shown.columnSpan}×${shown.rowSpan}` : placement.rowSpan > 1 || placement.columnSpan > 1 ? `${placement.columnSpan}×${placement.rowSpan}` : null}</span>
+                <span className="deck-resize-handle" aria-hidden="true" onPointerDown={(event) => item.type === 'button' ? startResize(event, item.button, 'widgets', 'button') : startResize(event, item.widget, 'widgets', 'widget')} onPointerMove={moveResize} onPointerUp={finishResize} onPointerCancel={cancelResize} onLostPointerCapture={cancelResize} />
+              </button>;
+            }
+            return <button key={`widget-empty-${index}`} type="button" data-deck-cell="true" data-surface="widgets" data-row={row} data-column={column} className={`deck-button deck-slot ${dragOverCellKey === `${row}:${column}` ? 'drop-target' : ''}`} onClick={() => addClockWidget(row, column)} disabled={busy || !firstWidgetPlacement(widgetScreen)} aria-label={`Add clock in row ${row + 1}, column ${column + 1}`}><Plus size={17} /><span>Add clock</span></button>;
+          })}
+        </div>
+      </section>
+      </div>
+      <div className="button-properties"><div className="properties-heading"><div><h2>{selectedWidget ? 'Widget settings' : 'Button settings'}</h2><p>{selectedWidget ? 'Clock · uses this PC’s local time' : selected ? 'Edit the selected control' : 'Select an item from either grid'}</p></div>{selected || selectedWidget ? <button className="icon-button" aria-label={selectedWidget ? 'Remove widget' : 'Remove button'} onClick={() => {
+        if (selectedWidget) { deleteSelectedWidget(); return; }
+        if (!selected) return;
+        setButtonId('');
+        if (page.buttons.some((item) => item.id === selected.id)) replacePage({ ...page, buttons: page.buttons.filter((item) => item.id !== selected.id) });
+        else replaceWidgetScreen({ ...widgetScreen, buttons: widgetScreen.buttons.filter((item) => item.id !== selected.id) });
+      }}><Trash2 size={15} /></button> : null}</div>
+        {selected && !selectedWidget ? <button className="secondary-button widget-transfer-button" onClick={moveSelectedButtonToOtherSurface} disabled={busy}>{page.buttons.some((button) => button.id === selected.id) ? 'Move to widget area' : 'Move to button grid'}</button> : null}
+        {selectedWidget ? <div className="widget-properties"><Clock size={22} /><strong>Clock</strong><span>Displays the phone’s local time and date.</span></div> : selected ? <ButtonProperties key={selected.id} button={selected} busy={busy} isMacos={isMacos} profiles={deck.profiles} pages={profile.pages} onChange={updateButton} /> : <div className="properties-empty">Select a button or widget from either grid.</div>}
+        {selected || selectedWidget ? <button className="primary-button save-button" onClick={() => void save(deck)} disabled={busy}><Save size={14} /> {busy ? 'Saving…' : 'Save deck'}</button> : null}
       </div>
     </section>
   </>;
@@ -683,6 +1143,8 @@ function iconForButton(button: DeckButton, playback: PlaybackState) {
 function autoIcon(action: DeckAction, playback: PlaybackState) {
   if (action.type === 'media') return ({ play_pause: playback === 'playing' ? Pause : Play, next_track: SkipForward, previous_track: SkipBack, volume_up: Volume2, volume_down: Volume1, mute: VolumeX } as const)[action.command];
   if (action.type === 'launch_app') return AppWindow;
+  if (action.type === 'launch_file') return File;
+  if (action.type === 'launch_folder') return FolderOpen;
   if (action.type === 'sequence') return ListOrdered;
   if (action.type === 'select_profile') return Layers2;
   if (action.type === 'select_page') return PanelsTopLeft;
@@ -791,13 +1253,19 @@ function IconPicker({ value, disabled, onChange }: { value: string; disabled: bo
 }
 
 function ButtonProperties({ button, busy, isMacos, profiles, pages, onChange }: { button: DeckButton; busy: boolean; isMacos: boolean; profiles: DeckProfile[]; pages: DeckPage[]; onChange: (patch: Partial<DeckButton>) => void }) {
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
   const action = button.action;
   const kind = action.type === 'sequence' ? 'sequence' : action.type;
   const keys = action.type === 'hotkey' ? action.keys.join('+') : '';
   const app = action.type === 'launch_app' ? action.app : '';
+  const filePath = action.type === 'launch_file' ? action.path : '';
+  const folderPath = action.type === 'launch_folder' ? action.path : '';
   const media = action.type === 'media' ? action.command : 'play_pause';
   const [iconError, setIconError] = useState('');
   const [extractingIcon, setExtractingIcon] = useState(false);
+  const [extractingThumbnail, setExtractingThumbnail] = useState(false);
+  const thumbnailRequestRef = useRef(0);
   function setAppTarget(app: string) {
     if (action.type !== 'launch_app') return;
     onChange({ action: { ...action, app }, ...(button.icon === 'app-icon' ? { icon: 'auto', iconSvg: undefined } : {}), appIconData: undefined });
@@ -828,18 +1296,62 @@ function ButtonProperties({ button, busy, isMacos, profiles, pages, onChange }: 
       setIconError(`Could not open the application picker: ${String(error)}`);
     }
   }
+  function setFileTarget(path: string) {
+    if (action.type !== 'launch_file') return;
+    thumbnailRequestRef.current += 1;
+    setExtractingThumbnail(false);
+    onChange({ action: { ...action, path }, ...(button.icon === 'app-icon' ? { icon: 'auto', iconSvg: undefined } : {}), appIconData: undefined });
+    setIconError('');
+  }
+  function setFolderTarget(path: string) {
+    if (action.type !== 'launch_folder') return;
+    thumbnailRequestRef.current += 1;
+    setExtractingThumbnail(false);
+    onChange({ action: { ...action, path }, ...(button.icon === 'app-icon' ? { icon: 'auto', iconSvg: undefined } : {}), appIconData: undefined });
+    setIconError('');
+  }
+  async function extractFileThumbnail(path: string) {
+    if (!path.trim()) return;
+    const request = ++thumbnailRequestRef.current;
+    setExtractingThumbnail(true);
+    setIconError('');
+    try {
+      const data = await invoke<string>('extract_file_thumbnail', { path });
+      if (request === thumbnailRequestRef.current) onChangeRef.current({ icon: 'app-icon', iconSvg: undefined, appIconData: data });
+    } catch (error) {
+      if (request === thumbnailRequestRef.current) setIconError(String(error));
+    } finally {
+      if (request === thumbnailRequestRef.current) setExtractingThumbnail(false);
+    }
+  }
+  async function browseFileOrFolder(directory: boolean) {
+    try {
+      const path = await openFileDialog({ title: directory ? 'Choose a folder' : 'Choose a file', multiple: false, directory });
+      if (typeof path === 'string') {
+        if (directory) setFolderTarget(path);
+        else setFileTarget(path);
+        void extractFileThumbnail(path);
+      }
+    } catch (error) {
+      setIconError(`Could not open the picker: ${String(error)}`);
+    }
+  }
   const isWindowsShortcut = !isMacos && app.toLowerCase().endsWith('.lnk');
   const setKind = (value: string) => {
-    const next: DeckAction = value === 'media' ? { type: 'media', command: 'play_pause' } : value === 'launch_app' ? { type: 'launch_app', app: '' } : value === 'sequence' ? { type: 'sequence', steps: [{ type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] }, { type: 'hotkey', keys: ['CTRL', 'S'] }] } : value === 'select_profile' ? { type: 'select_profile', profileId: profiles[0]?.id ?? '' } : value === 'select_page' ? { type: 'select_page', pageId: pages[0]?.id ?? '' } : { type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] };
+    thumbnailRequestRef.current += 1;
+    setExtractingThumbnail(false);
+    const next: DeckAction = value === 'media' ? { type: 'media', command: 'play_pause' } : value === 'launch_app' ? { type: 'launch_app', app: '' } : value === 'launch_file' ? { type: 'launch_file', path: '' } : value === 'launch_folder' ? { type: 'launch_folder', path: '' } : value === 'sequence' ? { type: 'sequence', steps: [{ type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] }, { type: 'hotkey', keys: ['CTRL', 'S'] }] } : value === 'select_profile' ? { type: 'select_profile', profileId: profiles[0]?.id ?? '' } : value === 'select_page' ? { type: 'select_page', pageId: pages[0]?.id ?? '' } : { type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] };
     onChange({ action: next, ...(value === 'launch_app' ? {} : { icon: 'auto', iconSvg: undefined, appIconData: undefined }) });
   };
   return <div className="property-fields">
     <label>Button label<input value={button.label} onChange={(event) => onChange({ label: event.target.value })} maxLength={24} disabled={busy} /></label>
-    <label>Icon<IconPicker value={button.icon} disabled={busy} onChange={(name, svg) => onChange({ icon: name, iconSvg: svg, appIconData: undefined })} /></label>
-    <label>Action<DeckSelect value={kind} onChange={setKind} disabled={busy} options={[['media', 'Media'], ['hotkey', 'Keyboard shortcut'], ['launch_app', 'Launch app'], ['sequence', 'Sequence'], ['select_profile', 'Select profile'], ['select_page', 'Select page']].map(([value, label]) => ({ value, label }))} /></label>
+    <label>Icon<IconPicker value={button.icon} disabled={busy} onChange={(name, svg) => { thumbnailRequestRef.current += 1; setExtractingThumbnail(false); onChange({ icon: name, iconSvg: svg, appIconData: undefined }); }} /></label>
+    <label>Action<DeckSelect value={kind} onChange={setKind} disabled={busy} options={[['media', 'Media'], ['hotkey', 'Keyboard shortcut'], ['launch_app', 'Launch app'], ['launch_file', 'Launch file'], ['launch_folder', 'Launch folder'], ['sequence', 'Sequence'], ['select_profile', 'Select profile'], ['select_page', 'Select page']].map(([value, label]) => ({ value, label }))} /></label>
     {kind === 'media' ? <label>Media command<DeckSelect value={media} onChange={(value) => onChange({ action: { type: 'media', command: value as MediaCommand } })} disabled={busy} options={[['play_pause', 'Play / Pause'], ['next_track', 'Next track'], ['previous_track', 'Previous track'], ['volume_up', 'Volume up'], ['volume_down', 'Volume down'], ['mute', 'Mute']].map(([value, label]) => ({ value, label }))} /></label> : null}
     {kind === 'hotkey' ? <label>Keys<input value={keys} onChange={(event) => onChange({ action: { type: 'hotkey', keys: event.target.value.toUpperCase().split('+').map((key) => key.trim()).filter(Boolean) } })} placeholder="CTRL+SHIFT+M" disabled={busy} /></label> : null}
     {kind === 'launch_app' && action.type === 'launch_app' ? <><label>App path or name<div className="app-path-picker"><input value={app} onChange={(event) => setAppTarget(event.target.value)} placeholder="Application, shortcut, or app name" disabled={busy} /><button type="button" className="app-browse-button" aria-label="Browse for an application" title="Browse for an application" disabled={busy} onClick={() => void browseApp()}><FolderOpen size={15} /></button></div></label><button type="button" className="secondary-button app-icon-button" disabled={busy || extractingIcon || !app.trim()} onClick={() => void extractIcon(true)}>{extractingIcon ? 'Reading icon…' : button.appIconData ? isWindowsShortcut ? 'Refresh shortcut icon' : 'Refresh app icon' : isWindowsShortcut ? 'Use shortcut icon' : 'Use original app icon'}</button>{isWindowsShortcut && button.appIconData ? <button type="button" className="secondary-button app-icon-button" disabled={busy || extractingIcon} onClick={() => void extractIcon(false)}>Reset to app icon</button> : null}{iconError ? <small className="form-error">{iconError}</small> : null}</> : null}
+    {kind === 'launch_file' && action.type === 'launch_file' ? <><label>File path<div className="app-path-picker"><input value={filePath} onChange={(event) => setFileTarget(event.target.value)} placeholder="Choose a file" disabled={busy} /><button type="button" className="app-browse-button" aria-label="Browse for a file" title="Browse for a file" disabled={busy} onClick={() => void browseFileOrFolder(false)}><File size={15} /></button></div></label><button type="button" className="secondary-button app-icon-button" disabled={busy || extractingThumbnail || !filePath.trim()} onClick={() => void extractFileThumbnail(filePath)}>{extractingThumbnail ? 'Reading thumbnail…' : button.appIconData ? 'Refresh thumbnail' : 'Use file thumbnail'}</button>{iconError ? <small className="form-error">{iconError}</small> : null}</> : null}
+    {kind === 'launch_folder' && action.type === 'launch_folder' ? <><label>Folder path<div className="app-path-picker"><input value={folderPath} onChange={(event) => setFolderTarget(event.target.value)} placeholder="Choose a folder" disabled={busy} /><button type="button" className="app-browse-button" aria-label="Browse for a folder" title="Browse for a folder" disabled={busy} onClick={() => void browseFileOrFolder(true)}><FolderOpen size={15} /></button></div></label><button type="button" className="secondary-button app-icon-button" disabled={busy || extractingThumbnail || !folderPath.trim()} onClick={() => void extractFileThumbnail(folderPath)}>{extractingThumbnail ? 'Reading icon…' : button.appIconData ? 'Refresh folder icon' : 'Use folder icon'}</button>{iconError ? <small className="form-error">{iconError}</small> : null}</> : null}
     {kind === 'sequence' && action.type === 'sequence' ? <SequenceEditor steps={action.steps} disabled={busy} isMacos={isMacos} onChange={(steps) => onChange({ action: { type: 'sequence', steps } })} /> : null}
     {kind === 'select_profile' && action.type === 'select_profile' ? <label>Profile<DeckSelect value={action.profileId} options={profiles.map((item) => ({ value: item.id, label: item.name }))} onChange={(profileId) => onChange({ action: { type: 'select_profile', profileId } })} disabled={busy} /></label> : null}
     {kind === 'select_page' && action.type === 'select_page' ? <label>Page<DeckSelect value={action.pageId} options={pages.map((item) => ({ value: item.id, label: item.name }))} onChange={(pageId) => onChange({ action: { type: 'select_page', pageId } })} disabled={busy} /></label> : null}
@@ -886,12 +1398,21 @@ function SequenceEditor({ steps, disabled, isMacos, onChange }: { steps: DeckSte
     }
   }
 
+  async function browseFileOrFolder(index: number, directory: boolean) {
+    try {
+      const path = await openFileDialog({ title: directory ? 'Choose a folder for this step' : 'Choose a file for this step', multiple: false, directory });
+      if (typeof path === 'string') changeStep(index, directory ? { type: 'launch_folder', path } : { type: 'launch_file', path });
+    } catch (cause) {
+      setError(`Could not open the picker: ${String(cause)}`);
+    }
+  }
+
   return <div className="sequence-editor">
     <div className="sequence-heading"><strong>Sequence steps</strong><span>Runs in order on this PC · {draft.length}/10</span></div>
     {draft.map((step, index) => <section className="sequence-step" key={index} aria-label={`Sequence step ${index + 1}`}>
       <div className="sequence-step-heading">
         <span className="sequence-step-number">{index + 1}</span>
-        <div className="sequence-step-type"><DeckSelect value={step.type} disabled={disabled} options={[['hotkey', 'Keyboard shortcut'], ['media', 'Media command'], ['launch_app', 'Launch app']].map(([value, label]) => ({ value, label }))} onChange={(value) => changeStep(index, value === 'media' ? { type: 'media', command: 'play_pause' } : value === 'launch_app' ? { type: 'launch_app', app: '' } : { type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] })} /></div>
+        <div className="sequence-step-type"><DeckSelect value={step.type} disabled={disabled} options={[['hotkey', 'Keyboard shortcut'], ['media', 'Media command'], ['launch_app', 'Launch app'], ['launch_file', 'Launch file'], ['launch_folder', 'Launch folder']].map(([value, label]) => ({ value, label }))} onChange={(value) => changeStep(index, value === 'media' ? { type: 'media', command: 'play_pause' } : value === 'launch_app' ? { type: 'launch_app', app: '' } : value === 'launch_file' ? { type: 'launch_file', path: '' } : value === 'launch_folder' ? { type: 'launch_folder', path: '' } : { type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] })} /></div>
         <button type="button" className="sequence-order-button" aria-label={`Move step ${index + 1} up`} title="Move up" disabled={disabled || index === 0} onClick={() => moveStep(index, -1)}><ChevronUp size={14} /></button>
         <button type="button" className="sequence-order-button" aria-label={`Move step ${index + 1} down`} title="Move down" disabled={disabled || index === draft.length - 1} onClick={() => moveStep(index, 1)}><ChevronDown size={14} /></button>
         <button type="button" className="sequence-order-button sequence-remove-button" aria-label={`Remove step ${index + 1}`} title="Remove step" disabled={disabled || draft.length === 1} onClick={() => commit(draft.filter((_, itemIndex) => itemIndex !== index))}><Trash2 size={14} /></button>
@@ -913,6 +1434,11 @@ function SequenceEditor({ steps, disabled, isMacos, onChange }: { steps: DeckSte
         next[index] = { type: 'launch_app', app: event.target.value };
         setDraft(next);
       }} onBlur={() => changeStep(index, step)} /><button type="button" className="app-browse-button" aria-label={`Browse for application in step ${index + 1}`} title="Browse for an application" disabled={disabled} onClick={() => void browseApp(index)}><FolderOpen size={15} /></button></div></label> : null}
+      {step.type === 'launch_file' || step.type === 'launch_folder' ? <label>{step.type === 'launch_file' ? 'File' : 'Folder'}<div className="app-path-picker"><input value={step.path} disabled={disabled} placeholder={`${step.type === 'launch_file' ? 'File' : 'Folder'} path`} onChange={(event) => {
+        const next = [...draft];
+        next[index] = { type: step.type, path: event.target.value };
+        setDraft(next);
+      }} onBlur={() => changeStep(index, step)} /><button type="button" className="app-browse-button" aria-label={`Browse for ${step.type === 'launch_file' ? 'file' : 'folder'} in step ${index + 1}`} title={`Browse for a ${step.type === 'launch_file' ? 'file' : 'folder'}`} disabled={disabled} onClick={() => void browseFileOrFolder(index, step.type === 'launch_folder')}>{step.type === 'launch_file' ? <File size={15} /> : <FolderOpen size={15} />}</button></div></label> : null}
     </section>)}
     {draft.length < 10 ? <button type="button" className="secondary-button sequence-add-button" disabled={disabled} onClick={() => commit([...draft, { type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] }])}><Plus size={14} /> Add step</button> : null}
     {error ? <small className="form-error">{error}</small> : null}

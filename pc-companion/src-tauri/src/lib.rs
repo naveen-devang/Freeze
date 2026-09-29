@@ -99,6 +99,54 @@ struct DeckProfile {
     auto_switch_apps: Vec<String>,
     #[serde(default)]
     auto_switch_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    widget_screen: Option<DeckWidgetScreen>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeckWidgetScreen {
+    enabled: bool,
+    rows: u8,
+    columns: u8,
+    buttons: Vec<DeckButton>,
+    widgets: Vec<DeckWidget>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeckWidgetArea {
+    enabled: bool,
+    rows: u8,
+    columns: u8,
+    #[serde(default)]
+    pages: Vec<DeckWidgetPage>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeckWidgetPage {
+    id: String,
+    name: String,
+    #[serde(default)]
+    buttons: Vec<DeckButton>,
+    #[serde(default)]
+    widgets: Vec<DeckWidget>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeckWidget {
+    id: String,
+    #[serde(rename = "type")]
+    kind: DeckWidgetType,
+    placement: DeckPlacement,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DeckWidgetType {
+    Clock,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -111,6 +159,8 @@ struct DeckPage {
     #[serde(default)]
     columns: u8,
     buttons: Vec<DeckButton>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    widget_area: Option<DeckWidgetArea>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -120,10 +170,21 @@ struct DeckButton {
     label: String,
     icon: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    placement: Option<DeckPlacement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     icon_svg: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     app_icon_data: Option<String>,
     action: DeckAction,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeckPlacement {
+    row: u8,
+    column: u8,
+    row_span: u8,
+    column_span: u8,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -132,6 +193,8 @@ enum DeckAction {
     Media { command: MediaCommand },
     Hotkey { keys: Vec<String> },
     LaunchApp { app: String },
+    LaunchFile { path: String },
+    LaunchFolder { path: String },
     Sequence { steps: Vec<DeckStep> },
     SelectProfile { profile_id: String },
     SelectPage { page_id: String },
@@ -143,6 +206,8 @@ enum DeckStep {
     Media { command: MediaCommand },
     Hotkey { keys: Vec<String> },
     LaunchApp { app: String },
+    LaunchFile { path: String },
+    LaunchFolder { path: String },
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -222,10 +287,17 @@ fn default_deck_config() -> DeckConfig {
         ("mute", "Mute", "auto", MediaCommand::Mute),
     ]
     .into_iter()
-    .map(|(id, label, icon, command)| DeckButton {
+    .enumerate()
+    .map(|(index, (id, label, icon, command))| DeckButton {
         id: id.to_owned(),
         label: label.to_owned(),
         icon: icon.to_owned(),
+        placement: Some(DeckPlacement {
+            row: (index / 3) as u8,
+            column: (index % 3) as u8,
+            row_span: 1,
+            column_span: 1,
+        }),
         icon_svg: None,
         app_icon_data: None,
         action: DeckAction::Media { command },
@@ -243,10 +315,12 @@ fn default_deck_config() -> DeckConfig {
                 rows: 2,
                 columns: 3,
                 buttons,
+                widget_area: None,
             }],
             active_page_id: "main".to_owned(),
             auto_switch_apps: Vec::new(),
             auto_switch_enabled: false,
+            widget_screen: None,
         }],
         active_profile_id: "default".to_owned(),
         legacy_auto_switch_enabled: false,
@@ -273,7 +347,7 @@ fn validate_deck_config(config: &DeckConfig) -> Result<(), String> {
         }
         let mut page_ids = std::collections::HashSet::new();
         let mut page_names = std::collections::HashSet::new();
-        let mut button_ids = std::collections::HashSet::new();
+        let mut button_ids = std::collections::HashSet::<String>::new();
         for page in &profile.pages {
             if !valid_id(&page.id)
                 || !page_ids.insert(&page.id)
@@ -288,75 +362,95 @@ fn validate_deck_config(config: &DeckConfig) -> Result<(), String> {
             if page.buttons.len() > usize::from(page.rows) * usize::from(page.columns) {
                 return Err("A page cannot contain more buttons than its grid slots".into());
             }
+            validate_page_layout(page)?;
             for button in &page.buttons {
-                if !valid_id(&button.id)
-                    || !button_ids.insert(&button.id)
-                    || !valid_label(&button.label, 24)
-                {
-                    return Err(
-                        "Button IDs and labels must be valid and unique within a profile".into(),
-                    );
-                }
-                if !valid_icon_name(&button.icon) {
-                    return Err("A button uses an unsupported icon".into());
-                }
-                if let Some(svg) = &button.icon_svg {
-                    let lower = svg.to_ascii_lowercase();
-                    if button.icon == "auto"
-                        || button.icon == "app-icon"
-                        || svg.len() > 8_192
-                        || !svg.starts_with("<svg")
-                        || !svg.ends_with("</svg>")
-                        || [
-                            "<script",
-                            "<foreignobject",
-                            "<!",
-                            "<?",
-                            "onload=",
-                            "onclick=",
-                            "href=",
-                            "url(",
-                        ]
-                        .iter()
-                        .any(|blocked| lower.contains(blocked))
-                    {
-                        return Err("A button contains an invalid Lucide icon".into());
-                    }
-                }
-                if button
-                    .icon
-                    .as_bytes()
-                    .first()
-                    .is_some_and(u8::is_ascii_uppercase)
-                    && ![
-                        "Command",
-                        "Monitor",
-                        "Music",
-                        "Mic",
-                        "Headphones",
-                        "AppWindow",
-                    ]
-                    .contains(&button.icon.as_str())
-                    && button.icon_svg.is_none()
-                {
-                    return Err("A custom Lucide icon needs its vector data".into());
-                }
-                if let Some(data) = &button.app_icon_data {
-                    if data.len() > 65_536
-                        || !data.starts_with("data:image/png;base64,")
-                        || button.icon != "app-icon"
-                    {
-                        return Err("A button contains an invalid app icon".into());
-                    }
-                }
-                if button.icon == "app-icon"
-                    && (button.app_icon_data.is_none()
-                        || !matches!(&button.action, DeckAction::LaunchApp { .. }))
-                {
-                    return Err("An app icon requires a launch app action".into());
-                }
-                validate_action(&button.action)?;
+                validate_deck_button(button, &mut button_ids)?;
             }
+            if let Some(area) = &page.widget_area {
+                if !(1..=6).contains(&area.rows) || !(1..=6).contains(&area.columns) {
+                    return Err("Widget area rows and columns must be between 1 and 6".into());
+                }
+                if area.pages.is_empty() || area.pages.len() > 9 {
+                    return Err("A widget area must contain 1–9 pages".into());
+                }
+                let mut widget_page_ids = std::collections::HashSet::new();
+                let mut widget_page_names = std::collections::HashSet::new();
+                for widget_page in &area.pages {
+                    if !valid_id(&widget_page.id)
+                        || !widget_page_ids.insert(&widget_page.id)
+                        || !valid_label(&widget_page.name, 24)
+                        || !widget_page_names.insert(widget_page.name.to_lowercase())
+                    {
+                        return Err("Widget page IDs and names must be valid and unique".into());
+                    }
+                    if widget_page.buttons.len() + widget_page.widgets.len()
+                        > usize::from(area.rows) * usize::from(area.columns)
+                    {
+                        return Err(
+                            "A widget page cannot contain more items than its grid slots".into(),
+                        );
+                    }
+                    for button in &widget_page.buttons {
+                        validate_deck_button(button, &mut button_ids)?;
+                    }
+                    let mut placements =
+                        Vec::with_capacity(widget_page.buttons.len() + widget_page.widgets.len());
+                    placements.extend(
+                        widget_page
+                            .buttons
+                            .iter()
+                            .map(|button| {
+                                button.placement.ok_or_else(|| {
+                                    "Every widget button must have a grid position".to_owned()
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                    );
+                    for widget in &widget_page.widgets {
+                        if !valid_id(&widget.id) || !button_ids.insert(widget.id.clone()) {
+                            return Err(
+                                "Widget IDs must be valid and unique within a profile".into()
+                            );
+                        }
+                        placements.push(widget.placement);
+                    }
+                    validate_layout(area.rows, area.columns, &placements)?;
+                }
+            }
+        }
+        if let Some(screen) = &profile.widget_screen {
+            if !(1..=6).contains(&screen.rows) || !(1..=6).contains(&screen.columns) {
+                return Err("Widget screen rows and columns must be between 1 and 6".into());
+            }
+            if screen.buttons.len() + screen.widgets.len()
+                > usize::from(screen.rows) * usize::from(screen.columns)
+            {
+                return Err(
+                    "The widget screen cannot contain more items than its grid slots".into(),
+                );
+            }
+            for button in &screen.buttons {
+                validate_deck_button(button, &mut button_ids)?;
+            }
+            let mut placements = Vec::with_capacity(screen.buttons.len() + screen.widgets.len());
+            placements.extend(
+                screen
+                    .buttons
+                    .iter()
+                    .map(|button| {
+                        button.placement.ok_or_else(|| {
+                            "Every widget screen button must have a grid position".to_owned()
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            for widget in &screen.widgets {
+                if !valid_id(&widget.id) || !button_ids.insert(widget.id.clone()) {
+                    return Err("Widget IDs must be valid and unique within a profile".into());
+                }
+                placements.push(widget.placement);
+            }
+            validate_layout(screen.rows, screen.columns, &placements)?;
         }
         if !page_ids.contains(&profile.active_page_id) {
             return Err("The active page must exist in its profile".into());
@@ -388,7 +482,14 @@ fn validate_deck_config(config: &DeckConfig) -> Result<(), String> {
     for profile in &config.profiles {
         let page_ids: std::collections::HashSet<_> =
             profile.pages.iter().map(|page| page.id.as_str()).collect();
-        for button in profile.pages.iter().flat_map(|page| &page.buttons) {
+        for button in profile.pages.iter().flat_map(|page| {
+            page.buttons.iter().chain(
+                page.widget_area
+                    .iter()
+                    .flat_map(|area| &area.pages)
+                    .flat_map(|widget_page| &widget_page.buttons),
+            )
+        }) {
             match &button.action {
                 DeckAction::SelectProfile { profile_id } if !profile_ids.contains(profile_id) => {
                     return Err("A button references an unknown profile".into())
@@ -401,6 +502,263 @@ fn validate_deck_config(config: &DeckConfig) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn validate_page_layout(page: &DeckPage) -> Result<(), String> {
+    let placements = page
+        .buttons
+        .iter()
+        .map(|button| {
+            button
+                .placement
+                .ok_or_else(|| "Every button must have a grid position".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_layout(page.rows, page.columns, &placements)
+}
+
+fn validate_layout(rows: u8, columns: u8, placements: &[DeckPlacement]) -> Result<(), String> {
+    for (index, placement) in placements.iter().enumerate() {
+        if placement.row_span == 0
+            || placement.column_span == 0
+            || usize::from(placement.row) + usize::from(placement.row_span) > usize::from(rows)
+            || usize::from(placement.column) + usize::from(placement.column_span)
+                > usize::from(columns)
+        {
+            return Err("An item must fit inside its grid".into());
+        }
+        for other in placements.iter().skip(index + 1) {
+            let rows_overlap = placement.row < other.row.saturating_add(other.row_span)
+                && other.row < placement.row.saturating_add(placement.row_span);
+            let columns_overlap = placement.column < other.column.saturating_add(other.column_span)
+                && other.column < placement.column.saturating_add(placement.column_span);
+            if rows_overlap && columns_overlap {
+                return Err("Items cannot overlap on the grid".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_deck_button(
+    button: &DeckButton,
+    button_ids: &mut std::collections::HashSet<String>,
+) -> Result<(), String> {
+    if !valid_id(&button.id)
+        || !button_ids.insert(button.id.clone())
+        || !valid_label(&button.label, 24)
+    {
+        return Err("Button IDs and labels must be valid and unique within a profile".into());
+    }
+    if !valid_icon_name(&button.icon) {
+        return Err("A button uses an unsupported icon".into());
+    }
+    if let Some(svg) = &button.icon_svg {
+        let lower = svg.to_ascii_lowercase();
+        if button.icon == "auto"
+            || button.icon == "app-icon"
+            || svg.len() > 8_192
+            || !svg.starts_with("<svg")
+            || !svg.ends_with("</svg>")
+            || [
+                "<script",
+                "<foreignobject",
+                "<!",
+                "<?",
+                "onload=",
+                "onclick=",
+                "href=",
+                "url(",
+            ]
+            .iter()
+            .any(|blocked| lower.contains(blocked))
+        {
+            return Err("A button contains an invalid Lucide icon".into());
+        }
+    }
+    if button
+        .icon
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_uppercase)
+        && ![
+            "Command",
+            "Monitor",
+            "Music",
+            "Mic",
+            "Headphones",
+            "AppWindow",
+        ]
+        .contains(&button.icon.as_str())
+        && button.icon_svg.is_none()
+    {
+        return Err("A custom Lucide icon needs its vector data".into());
+    }
+    let supports_extracted_icon = matches!(
+        &button.action,
+        DeckAction::LaunchApp { .. }
+            | DeckAction::LaunchFile { .. }
+            | DeckAction::LaunchFolder { .. }
+    );
+    if let Some(data) = &button.app_icon_data {
+        if data.len() > 65_536
+            || !data.starts_with("data:image/png;base64,")
+            || button.icon != "app-icon"
+            || !supports_extracted_icon
+        {
+            return Err("A button contains an invalid extracted icon".into());
+        }
+    }
+    if button.icon == "app-icon"
+        && (button.app_icon_data.is_none() || !supports_extracted_icon)
+    {
+        return Err("An extracted icon requires a launch action".into());
+    }
+    validate_action(&button.action)
+}
+
+fn normalize_deck_layout(config: &mut DeckConfig) {
+    for profile in &mut config.profiles {
+        if let Some(legacy) = profile.widget_screen.take() {
+            let target_page_index = profile
+                .pages
+                .iter()
+                .position(|page| page.id == profile.active_page_id)
+                .unwrap_or(0);
+
+            let mut item_ids = profile
+                .pages
+                .iter()
+                .flat_map(|page| {
+                    page.buttons.iter().map(|button| button.id.as_str()).chain(
+                        page.widget_area.iter().flat_map(|area| {
+                            area.pages.iter().flat_map(|widget_page| {
+                                widget_page
+                                    .buttons
+                                    .iter()
+                                    .map(|button| button.id.as_str())
+                                    .chain(
+                                        widget_page.widgets.iter().map(|widget| widget.id.as_str()),
+                                    )
+                            })
+                        }),
+                    )
+                })
+                .map(str::to_owned)
+                .collect::<std::collections::HashSet<_>>();
+
+            if let Some(page) = profile.pages.get_mut(target_page_index) {
+                let area = page.widget_area.get_or_insert_with(|| DeckWidgetArea {
+                    enabled: legacy.enabled,
+                    rows: legacy.rows,
+                    columns: legacy.columns,
+                    pages: Vec::new(),
+                });
+                area.enabled |= legacy.enabled;
+                area.rows = area.rows.max(legacy.rows);
+                area.columns = area.columns.max(legacy.columns);
+
+                let mut page_number = 1;
+                let widget_page_id = loop {
+                    let candidate = format!("widgets-migrated-{page_number}");
+                    if area
+                        .pages
+                        .iter()
+                        .all(|widget_page| widget_page.id != candidate)
+                    {
+                        break candidate;
+                    }
+                    page_number += 1;
+                };
+                let mut name_number = 1;
+                let widget_page_name = loop {
+                    let candidate = format!("Migrated {name_number}");
+                    if area
+                        .pages
+                        .iter()
+                        .all(|widget_page| !widget_page.name.eq_ignore_ascii_case(&candidate))
+                    {
+                        break candidate;
+                    }
+                    name_number += 1;
+                };
+
+                let mut buttons = legacy.buttons;
+                for (index, button) in buttons.iter_mut().enumerate() {
+                    if !item_ids.insert(button.id.clone()) {
+                        let mut suffix = index + 1;
+                        loop {
+                            let candidate = format!("legacy-button-{suffix}");
+                            if item_ids.insert(candidate.clone()) {
+                                button.id = candidate;
+                                break;
+                            }
+                            suffix += 1;
+                        }
+                    }
+                }
+                let mut widgets = legacy.widgets;
+                for (index, widget) in widgets.iter_mut().enumerate() {
+                    if !item_ids.insert(widget.id.clone()) {
+                        let mut suffix = index + 1;
+                        loop {
+                            let candidate = format!("legacy-widget-{suffix}");
+                            if item_ids.insert(candidate.clone()) {
+                                widget.id = candidate;
+                                break;
+                            }
+                            suffix += 1;
+                        }
+                    }
+                }
+
+                area.pages.push(DeckWidgetPage {
+                    id: widget_page_id,
+                    name: widget_page_name,
+                    buttons,
+                    widgets,
+                });
+            }
+        }
+
+        for page in &mut profile.pages {
+            normalize_button_placements(&mut page.buttons, page.rows, page.columns);
+            if let Some(area) = &mut page.widget_area {
+                for widget_page in &mut area.pages {
+                    normalize_button_placements(&mut widget_page.buttons, area.rows, area.columns);
+                }
+            }
+        }
+    }
+}
+
+fn normalize_button_placements(buttons: &mut [DeckButton], rows: u8, columns: u8) {
+    let mut occupied = vec![false; usize::from(rows) * usize::from(columns)];
+    for placement in buttons.iter().filter_map(|button| button.placement) {
+        for row in placement.row..placement.row.saturating_add(placement.row_span) {
+            for column in placement.column..placement.column.saturating_add(placement.column_span) {
+                if let Some(slot) =
+                    occupied.get_mut(usize::from(row) * usize::from(columns) + usize::from(column))
+                {
+                    *slot = true;
+                }
+            }
+        }
+    }
+    for button in buttons
+        .iter_mut()
+        .filter(|button| button.placement.is_none())
+    {
+        if let Some(index) = occupied.iter().position(|slot| !slot) {
+            occupied[index] = true;
+            button.placement = Some(DeckPlacement {
+                row: (index / usize::from(columns)) as u8,
+                column: (index % usize::from(columns)) as u8,
+                row_span: 1,
+                column_span: 1,
+            });
+        }
+    }
 }
 
 fn valid_icon_name(value: &str) -> bool {
@@ -437,7 +795,9 @@ fn validate_action(action: &DeckAction) -> Result<(), String> {
         | DeckAction::SelectProfile { .. }
         | DeckAction::SelectPage { .. } => Ok(()),
         DeckAction::Hotkey { keys } => validate_hotkey(keys),
-        DeckAction::LaunchApp { app, .. } => validate_app_target(app),
+        DeckAction::LaunchApp { app } => validate_app_target(app),
+        DeckAction::LaunchFile { path } => validate_file_target(path),
+        DeckAction::LaunchFolder { path } => validate_file_target(path),
         DeckAction::Sequence { steps } => {
             if steps.is_empty() || steps.len() > 10 {
                 return Err("A sequence must contain 1–10 steps".into());
@@ -447,6 +807,8 @@ fn validate_action(action: &DeckAction) -> Result<(), String> {
                     DeckStep::Media { .. } => (),
                     DeckStep::Hotkey { keys } => validate_hotkey(keys)?,
                     DeckStep::LaunchApp { app, .. } => validate_app_target(app)?,
+                    DeckStep::LaunchFile { path } => validate_file_target(path)?,
+                    DeckStep::LaunchFolder { path } => validate_file_target(path)?,
                 }
             }
             Ok(())
@@ -473,6 +835,14 @@ fn validate_hotkey(keys: &[String]) -> Result<(), String> {
 fn validate_app_target(app: &str) -> Result<(), String> {
     if app.trim().is_empty() || app.len() > 512 || app.chars().any(char::is_control) {
         Err("Enter a valid app name or path".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_file_target(path: &str) -> Result<(), String> {
+    if path.trim().is_empty() || path.len() > 4096 || path.chars().any(char::is_control) {
+        Err("Choose a valid file or folder path".into())
     } else {
         Ok(())
     }
@@ -536,6 +906,7 @@ fn load_deck_config(path: &Path) -> DeckConfig {
                                 as u8;
                         }
                     }
+                    normalize_deck_layout(&mut config);
                     for button in config
                         .profiles
                         .iter_mut()
@@ -616,6 +987,8 @@ enum ClientAction {
     Hotkey { keys: Vec<String> },
     Media { command: MediaCommand },
     LaunchApp { app: String },
+    LaunchFile { path: String },
+    LaunchFolder { path: String },
     Sequence { actions: Vec<SequenceAction> },
 }
 
@@ -623,6 +996,8 @@ enum SequenceAction {
     Hotkey { keys: Vec<String> },
     Media { command: MediaCommand },
     LaunchApp { app: String },
+    LaunchFile { path: String },
+    LaunchFolder { path: String },
 }
 
 #[tauri::command]
@@ -775,6 +1150,12 @@ fn import_legacy_deck(
                             })
                             .unwrap_or("command")
                             .to_owned(),
+                        placement: Some(DeckPlacement {
+                            row: (button_index / 3) as u8,
+                            column: (button_index % 3) as u8,
+                            row_span: 1,
+                            column_span: 1,
+                        }),
                         icon_svg: None,
                         app_icon_data: None,
                         action,
@@ -791,6 +1172,7 @@ fn import_legacy_deck(
                 rows: 4,
                 columns: 3,
                 buttons: buttons?,
+                widget_area: None,
             })
         })
         .collect::<Result<_, String>>()?;
@@ -805,6 +1187,7 @@ fn import_legacy_deck(
         active_page_id,
         auto_switch_apps: Vec::new(),
         auto_switch_enabled: false,
+        widget_screen: None,
     });
     config.active_profile_id = format!("import-{}", pending.source_id);
     config.revision = config.revision.saturating_add(1);
@@ -876,6 +1259,7 @@ fn save_deck_config(
     mut config: DeckConfig,
     state: tauri::State<'_, Arc<AppState>>,
 ) -> Result<DeckConfig, String> {
+    normalize_deck_layout(&mut config);
     validate_deck_config(&config)?;
     let mut current = state
         .deck_config
@@ -1734,6 +2118,14 @@ fn invoke_button(state: &AppState, revision: u64, button_id: &str) -> Result<(),
     let button = page
         .buttons
         .iter()
+        .chain(
+            page.widget_area
+                .as_ref()
+                .filter(|area| area.enabled)
+                .into_iter()
+                .flat_map(|area| &area.pages)
+                .flat_map(|widget_page| &widget_page.buttons),
+        )
         .find(|button| button.id == button_id)
         .ok_or_else(|| "unknown_button".to_owned())?;
     run_deck_action(&button.action, state, revision)
@@ -1744,6 +2136,8 @@ fn run_deck_action(action: &DeckAction, state: &AppState, revision: u64) -> Resu
         DeckAction::Media { command } => run_action(ClientAction::Media { command: *command }),
         DeckAction::Hotkey { keys } => run_action(ClientAction::Hotkey { keys: keys.clone() }),
         DeckAction::LaunchApp { app } => run_action(ClientAction::LaunchApp { app: app.clone() }),
+        DeckAction::LaunchFile { path } => run_action(ClientAction::LaunchFile { path: path.clone() }),
+        DeckAction::LaunchFolder { path } => run_action(ClientAction::LaunchFolder { path: path.clone() }),
         DeckAction::Sequence { steps } => {
             let mut actions = Vec::with_capacity(steps.len());
             for step in steps {
@@ -1751,6 +2145,8 @@ fn run_deck_action(action: &DeckAction, state: &AppState, revision: u64) -> Resu
                     DeckStep::Media { command } => SequenceAction::Media { command: *command },
                     DeckStep::Hotkey { keys } => SequenceAction::Hotkey { keys: keys.clone() },
                     DeckStep::LaunchApp { app } => SequenceAction::LaunchApp { app: app.clone() },
+                    DeckStep::LaunchFile { path } => SequenceAction::LaunchFile { path: path.clone() },
+                    DeckStep::LaunchFolder { path } => SequenceAction::LaunchFolder { path: path.clone() },
                 });
             }
             run_action(ClientAction::Sequence { actions })
@@ -1851,6 +2247,8 @@ fn run_action(action: ClientAction) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
         }
         ClientAction::LaunchApp { app } => launch_app(&app)?,
+        ClientAction::LaunchFile { path } => launch_file(&path)?,
+        ClientAction::LaunchFolder { path } => launch_file(&path)?,
         ClientAction::Sequence { actions } => {
             if actions.is_empty() || actions.len() > 10 {
                 return Err("An action sequence must contain between 1 and 10 steps".into());
@@ -1863,6 +2261,8 @@ fn run_action(action: ClientAction) -> Result<(), String> {
                     SequenceAction::Hotkey { keys } => ClientAction::Hotkey { keys },
                     SequenceAction::Media { command } => ClientAction::Media { command },
                     SequenceAction::LaunchApp { app } => ClientAction::LaunchApp { app },
+                    SequenceAction::LaunchFile { path } => ClientAction::LaunchFile { path },
+                    SequenceAction::LaunchFolder { path } => ClientAction::LaunchFolder { path },
                 };
                 run_action(action)?;
             }
@@ -1894,6 +2294,133 @@ fn launch_app(app: &str) -> Result<(), String> {
     result
         .map(|_| ())
         .map_err(|error| format!("Could not launch app: {error}"))
+}
+
+fn launch_file(path: &str) -> Result<(), String> {
+    validate_file_target(path)?;
+    let path = Path::new(path.trim());
+    if !path.exists() {
+        return Err("That file or folder no longer exists".into());
+    }
+    #[cfg(windows)]
+    let result = Command::new("explorer.exe").arg(path).spawn();
+    #[cfg(target_os = "macos")]
+    let result = Command::new("open").arg(path).spawn();
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let result: Result<std::process::Child, std::io::Error> = Err(std::io::Error::other(
+        "File and folder launching is supported on Windows and macOS",
+    ));
+    result
+        .map(|_| ())
+        .map_err(|error| format!("Could not open file or folder: {error}"))
+}
+
+#[tauri::command]
+fn extract_file_thumbnail(path: String) -> Result<String, String> {
+    validate_file_target(&path)?;
+    let path = PathBuf::from(path.trim());
+    if !path.exists() {
+        return Err("Choose an existing file or folder".into());
+    }
+    #[cfg(windows)]
+    {
+        let script = r#"
+Add-Type -AssemblyName System.Drawing
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+[StructLayout(LayoutKind.Sequential)]
+public struct FreezeThumbnailSize { public int cx; public int cy; public FreezeThumbnailSize(int x, int y) { cx = x; cy = y; } }
+[ComImport, Guid("BCC18B79-BA16-442F-80C4-8A59C30C463B"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface FreezeShellItemImageFactory { [PreserveSig] int GetImage(FreezeThumbnailSize size, uint flags, out IntPtr bitmap); }
+public static class FreezeShellThumbnail {
+  [DllImport("shell32.dll", CharSet = CharSet.Unicode, PreserveSig = true)]
+  static extern int SHCreateItemFromParsingName(string path, IntPtr bindContext, ref Guid interfaceId, out FreezeShellItemImageFactory item);
+  [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr handle);
+  public static IntPtr Get(string path) {
+    FreezeShellItemImageFactory item = null;
+    IntPtr bitmap = IntPtr.Zero;
+    Guid iid = new Guid("BCC18B79-BA16-442F-80C4-8A59C30C463B");
+    int result = SHCreateItemFromParsingName(path, IntPtr.Zero, ref iid, out item);
+    if (result < 0 || item == null) Marshal.ThrowExceptionForHR(result);
+    try {
+      result = item.GetImage(new FreezeThumbnailSize(96, 96), 0, out bitmap);
+      if (result < 0 || bitmap == IntPtr.Zero) Marshal.ThrowExceptionForHR(result);
+      return bitmap;
+    } finally {
+      if (item != null && Marshal.IsComObject(item)) Marshal.ReleaseComObject(item);
+    }
+  }
+}
+'@
+$path = $env:FREEZE_FILE_PATH
+$hbitmap = [FreezeShellThumbnail]::Get($path)
+$bitmap = [System.Drawing.Bitmap]::FromHbitmap($hbitmap)
+$stream = New-Object System.IO.MemoryStream
+$bitmap.Save($stream, [System.Drawing.Imaging.ImageFormat]::Png)
+[Console]::Out.Write([Convert]::ToBase64String($stream.ToArray()))
+$bitmap.Dispose()
+$stream.Dispose()
+$null = [FreezeShellThumbnail]::DeleteObject($hbitmap)
+"#;
+        let output = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env("FREEZE_FILE_PATH", &path)
+            .output()
+            .map_err(|_| "Could not read a thumbnail from that file".to_owned())?;
+        if !output.status.success() {
+            return Err("Windows could not create a thumbnail for that file or folder".into());
+        }
+        let encoded = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if encoded.is_empty() || encoded.len() > 65_500 {
+            return Err("The file thumbnail is too large to use".into());
+        }
+        return Ok(format!("data:image/png;base64,{encoded}"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let directory = std::env::temp_dir().join(format!("freeze-thumbnail-{}", rand::random::<u64>()));
+        fs::create_dir(&directory).map_err(|_| "Could not prepare a thumbnail location".to_owned())?;
+        let result = Command::new("/usr/bin/qlmanage")
+            .args(["-t", "-s", "96", "-o"])
+            .arg(&directory)
+            .arg(&path)
+            .output();
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => {
+                let _ = fs::remove_dir(&directory);
+                return Err("Could not create a Quick Look thumbnail".into());
+            }
+        };
+        let thumbnail = fs::read_dir(&directory)
+            .ok()
+            .and_then(|entries| entries.flatten().map(|entry| entry.path()).find(|file| file.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("png"))));
+        if !result.status.success() {
+            if let Some(file) = thumbnail { let _ = fs::remove_file(file); }
+            let _ = fs::remove_dir(&directory);
+            return Err("macOS could not create a thumbnail for that file or folder".into());
+        }
+        let Some(thumbnail) = thumbnail else {
+            let _ = fs::remove_dir(&directory);
+            return Err("macOS has no thumbnail available for that item".into());
+        };
+        let encoded = Command::new("/usr/bin/base64")
+            .arg("-i")
+            .arg(&thumbnail)
+            .output()
+            .map_err(|_| "Could not encode the file thumbnail".to_owned());
+        let _ = fs::remove_file(&thumbnail);
+        let _ = fs::remove_dir(&directory);
+        let encoded = encoded?;
+        if !encoded.status.success() || encoded.stdout.len() > 65_500 {
+            return Err("The file thumbnail is too large to use".into());
+        }
+        let data = String::from_utf8_lossy(&encoded.stdout).replace('\n', "").replace('\r', "");
+        return Ok(format!("data:image/png;base64,{data}"));
+    }
+    #[allow(unreachable_code)]
+    Err("File thumbnails are not supported on this platform".into())
 }
 
 fn parse_key(key: &str) -> Result<Key, String> {
@@ -1984,6 +2511,7 @@ pub fn run() {
             save_deck_config,
             get_playback_state,
             extract_app_icon,
+            extract_file_thumbnail,
             pending_legacy_imports,
             request_legacy_deck_import,
             import_legacy_deck,

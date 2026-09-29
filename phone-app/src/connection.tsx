@@ -1,14 +1,19 @@
 import * as SecureStore from 'expo-secure-store';
 import Storage from 'expo-sqlite/kv-store';
 import { loadDeckPages } from './deck';
+import { validDeckPageLayout, validDeckWidgetAreaLayout } from './deck-layout';
 import { createContext, PropsWithChildren, useCallback, useContext, useEffect, useRef, useState } from 'react';
 
 export type PcConnection = { host: string; port: number; token: string; deviceName?: string; transport?: 'wifi' | 'usb' };
 export type DeckMediaCommand = 'play_pause' | 'next_track' | 'previous_track' | 'volume_up' | 'volume_down' | 'mute';
-export type DeckStep = { type: 'media'; command: DeckMediaCommand } | { type: 'hotkey'; keys: string[] } | { type: 'launch_app'; app: string };
+export type DeckStep = { type: 'media'; command: DeckMediaCommand } | { type: 'hotkey'; keys: string[] } | { type: 'launch_app'; app: string } | { type: 'launch_file'; path: string } | { type: 'launch_folder'; path: string };
 export type DeckAction = DeckStep | { type: 'sequence'; steps: DeckStep[] } | { type: 'select_profile'; profileId: string } | { type: 'select_page'; pageId: string };
-export type DeckButton = { id: string; label: string; icon: string; iconSvg?: string; appIconData?: string; action: DeckAction };
-export type DeckPage = { id: string; name: string; rows?: number; columns?: number; buttons: DeckButton[] };
+export type DeckPlacement = { row: number; column: number; rowSpan: number; columnSpan: number };
+export type DeckButton = { id: string; label: string; icon: string; placement?: DeckPlacement; iconSvg?: string; appIconData?: string; action: DeckAction };
+export type DeckWidget = { id: string; type: 'clock'; placement: DeckPlacement };
+export type DeckWidgetPage = { id: string; name: string; buttons: DeckButton[]; widgets: DeckWidget[] };
+export type DeckWidgetArea = { enabled: boolean; rows: number; columns: number; pages: DeckWidgetPage[] };
+export type DeckPage = { id: string; name: string; rows?: number; columns?: number; buttons: DeckButton[]; widgetArea?: DeckWidgetArea };
 export type DeckProfile = { id: string; name: string; pages: DeckPage[]; activePageId: string };
 export type DeckConfig = { schemaVersion: number; revision: number; profiles: DeckProfile[]; activeProfileId: string };
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
@@ -62,13 +67,47 @@ function websocketUrl(connection: PcConnection) {
   return `ws://${formattedHost}:${connection.port}/ws`;
 }
 
+function validDeckButton(value: unknown): value is DeckButton {
+  if (!value || typeof value !== 'object') return false;
+  const button = value as Partial<DeckButton>;
+  const placement = button.placement;
+  return typeof button.id === 'string' && typeof button.label === 'string' && typeof button.icon === 'string' &&
+    (placement === undefined || (placement !== null && typeof placement === 'object' && Number.isInteger(placement.row) && Number.isInteger(placement.column) && Number.isInteger(placement.rowSpan) && Number.isInteger(placement.columnSpan))) &&
+    (!button.iconSvg || (typeof button.iconSvg === 'string' && button.iconSvg.length <= 8192 && button.iconSvg.startsWith('<svg') && button.iconSvg.endsWith('</svg>') && !/<script|<foreignobject|onload=|onclick=|href=|url\(/i.test(button.iconSvg))) &&
+    (!button.appIconData || (typeof button.appIconData === 'string' && button.appIconData.length <= 65536 && button.appIconData.startsWith('data:image/png;base64,'))) &&
+    !!button.action && typeof button.action.type === 'string';
+}
+
+function validWidgetArea(value: unknown): value is DeckWidgetArea {
+  if (!value || typeof value !== 'object') return false;
+  const area = value as Partial<DeckWidgetArea>;
+  return typeof area.enabled === 'boolean' && Number.isInteger(area.rows) && Number.isInteger(area.columns) &&
+    (area.rows ?? 0) >= 1 && (area.rows ?? 0) <= 6 && (area.columns ?? 0) >= 1 && (area.columns ?? 0) <= 6 &&
+    Array.isArray(area.pages) && area.pages.length > 0 && area.pages.length <= 9 &&
+    area.pages.every((page) => page && typeof page.id === 'string' && typeof page.name === 'string' && Array.isArray(page.buttons) && Array.isArray(page.widgets) &&
+      page.buttons.length + page.widgets.length <= (area.rows ?? 0) * (area.columns ?? 0) && page.buttons.every(validDeckButton) &&
+      page.widgets.every((widget) => widget && typeof widget.id === 'string' && widget.type === 'clock' && widget.placement &&
+        [widget.placement.row, widget.placement.column, widget.placement.rowSpan, widget.placement.columnSpan].every(Number.isInteger))) &&
+    validDeckWidgetAreaLayout(area as DeckWidgetArea);
+}
+
+function validDeckPage(value: unknown): value is DeckPage {
+  if (!value || typeof value !== 'object') return false;
+  const page = value as Partial<DeckPage>;
+  return typeof page.id === 'string' && typeof page.name === 'string' &&
+    (page.rows === undefined || (Number.isInteger(page.rows) && page.rows >= 1 && page.rows <= 6)) &&
+    (page.columns === undefined || (Number.isInteger(page.columns) && page.columns >= 1 && page.columns <= 6)) &&
+    Array.isArray(page.buttons) && page.buttons.length <= 36 && page.buttons.every(validDeckButton) &&
+    (page.widgetArea === undefined || validWidgetArea(page.widgetArea)) &&
+    validDeckPageLayout(page as DeckPage);
+}
+
 function validDeckConfig(value: unknown): value is DeckConfig {
   if (!value || typeof value !== 'object') return false;
   const config = value as Partial<DeckConfig>;
   return config.schemaVersion === 1 && Number.isSafeInteger(config.revision) && Array.isArray(config.profiles) && config.profiles.length > 0 && config.profiles.length <= 32 &&
     config.profiles.every((profile) => profile && typeof profile.id === 'string' && typeof profile.name === 'string' && Array.isArray(profile.pages) && profile.pages.length > 0 && profile.pages.length <= 8 &&
-      profile.pages.every((page) => page && typeof page.id === 'string' && typeof page.name === 'string' && (page.rows === undefined || (Number.isInteger(page.rows) && page.rows >= 1 && page.rows <= 6)) && (page.columns === undefined || (Number.isInteger(page.columns) && page.columns >= 1 && page.columns <= 6)) && Array.isArray(page.buttons) && page.buttons.length <= 36 && (page.rows === undefined || page.columns === undefined || page.buttons.length <= page.rows * page.columns) &&
-        page.buttons.every((button) => button && typeof button.id === 'string' && typeof button.label === 'string' && typeof button.icon === 'string' && (!button.iconSvg || (typeof button.iconSvg === 'string' && button.iconSvg.length <= 8192 && button.iconSvg.startsWith('<svg') && button.iconSvg.endsWith('</svg>') && !/<script|<foreignobject|onload=|onclick=|href=|url\(/i.test(button.iconSvg))) && (!button.appIconData || (typeof button.appIconData === 'string' && button.appIconData.length <= 65536 && button.appIconData.startsWith('data:image/png;base64,'))) && button.action && typeof button.action.type === 'string')));
+      profile.pages.every(validDeckPage));
 }
 
 export function ConnectionProvider({ children }: PropsWithChildren) {
