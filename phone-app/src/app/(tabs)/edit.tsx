@@ -5,8 +5,8 @@ import { usePcConnection } from '../../connection';
 import { colors } from '../../theme';
 
 export default function ProfilesScreen() {
-  const { status, deckConfig, actionError, selectProfile } = usePcConnection();
-  const activeProfileId = deckConfig?.activeProfileId;
+  const { status, deckConfig, actionError, independentNavigation, selectedProfileId, selectProfile } = usePcConnection();
+  const activeProfileId = independentNavigation ? selectedProfileId : deckConfig?.activeProfileId;
 
   const chooseProfile = (profileId: string) => {
     selectProfile(profileId);
@@ -15,7 +15,7 @@ export default function ProfilesScreen() {
   return <SafeAreaView style={styles.safe} edges={['top']}>
     <ScrollView contentContainerStyle={styles.content}>
       <View style={styles.heading}><Layers2 size={19} color={colors.muted} /><Text style={styles.title}>Profiles</Text></View>
-      <Text style={styles.description}>Choose a profile already set up on your Freeze desktop app.</Text>
+      <Text style={styles.description}>{independentNavigation ? 'Choose a profile for this device.' : 'Choose a profile shared with connected devices.'}</Text>
       {actionError ? <Text style={styles.error}>Could not switch profiles. Check the connection and try again.</Text> : null}
       {status !== 'connected' ? <View style={styles.info}><Wifi size={16} color={colors.muted} /><Text style={styles.infoText}>Connect to a PC to view and switch its profiles.</Text></View> : null}
       {deckConfig?.profiles.map((profile) => {

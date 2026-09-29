@@ -74,7 +74,7 @@ function ClockWidget({ immersive = false }: { immersive?: boolean }) {
 export default function DeckScreen() {
   const router = useRouter();
   const setTabBarHidden = useContext(TabBarHiddenContext);
-  const { connection, status, playbackState, actionError, deckConfig, sendButton, selectPage } = usePcConnection();
+  const { connection, status, playbackState, actionError, deckConfig, independentNavigation, selectedProfileId, selectedPageId, sendButton, selectPage } = usePcConnection();
   const [feedback, setFeedback] = useState('');
   const [immersive, setImmersive] = useState(false);
   const [showImmersiveTools, setShowImmersiveTools] = useState(false);
@@ -84,8 +84,8 @@ export default function DeckScreen() {
   const [widgetGridWidth, setWidgetGridWidth] = useState(0);
   const feedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const immersiveToolsTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const activeProfile = deckConfig?.profiles.find((profile) => profile.id === deckConfig.activeProfileId);
-  const activePage = activeProfile?.pages.find((page) => page.id === activeProfile.activePageId);
+  const activeProfile = deckConfig?.profiles.find((profile) => profile.id === (independentNavigation ? selectedProfileId : deckConfig.activeProfileId));
+  const activePage = activeProfile?.pages.find((page) => page.id === (independentNavigation ? selectedPageId : activeProfile.activePageId));
   const activePageIndex = activeProfile?.pages.findIndex((page) => page.id === activePage?.id) ?? -1;
   const widgetArea = activePage?.widgetArea;
   const widgetPageIndex = Math.min(widgetPageIndices[`${activeProfile?.id}:${activePage?.id}`] ?? 0, Math.max(0, (widgetArea?.pages.length ?? 1) - 1));
@@ -177,22 +177,38 @@ export default function DeckScreen() {
   const isPlaying = playbackState === 'playing';
   const columns = activePage?.columns ?? 3;
   const rows = activePage?.rows ?? Math.max(1, Math.ceil((activePage?.buttons.length ?? 0) / columns));
+  const hasButtons = !!activePage?.buttons.length;
   const occupied = activePage ? deckOccupancy(activePage) : new Map<number, DeckButton>();
   const widgetColumns = widgetArea?.columns ?? 3;
   const widgetRows = widgetArea?.rows ?? 2;
   const widgetOccupied = widgetArea && widgetScreen ? widgetPageOccupancy(widgetArea, widgetScreen) : new Map<number, WidgetScreenItem>();
+  const widgetOnlyMode = rows === 0 && columns === 0 && hasWidgetArea;
+  const showWidgetArea = hasWidgetArea && (widgetOnlyMode || widgetOccupied.size > 0);
+  const widgetPlacements = widgetScreen ? [
+    ...widgetScreen.buttons.map((button) => buttonPlacement({ id: widgetScreen.id, name: widgetScreen.name, rows: widgetRows, columns: widgetColumns, buttons: widgetScreen.buttons }, button)),
+    ...widgetScreen.widgets.map((widget) => widget.placement),
+  ] : [];
+  const widgetTopRow = widgetOnlyMode && widgetPlacements.length ? Math.min(...widgetPlacements.map((placement) => placement.row)) : 0;
+  const widgetLeftColumn = widgetOnlyMode && widgetPlacements.length ? Math.min(...widgetPlacements.map((placement) => placement.column)) : 0;
+  const displayWidgetRows = widgetOnlyMode && widgetPlacements.length
+    ? Math.max(...widgetPlacements.map((placement) => placement.row + placement.rowSpan)) - widgetTopRow
+    : widgetRows;
+  const displayWidgetColumns = widgetOnlyMode && widgetPlacements.length
+    ? Math.max(...widgetPlacements.map((placement) => placement.column + placement.columnSpan)) - widgetLeftColumn
+    : widgetColumns;
   const regularGap = 9;
   const regularCellWidth = Math.max(0, (regularGridWidth - regularGap * (columns - 1)) / columns);
-  const widgetCellWidth = Math.max(0, (widgetGridWidth - regularGap * (widgetColumns - 1)) / widgetColumns);
+  const widgetCellWidth = Math.max(0, (widgetGridWidth - regularGap * (displayWidgetColumns - 1)) / displayWidgetColumns);
   const immersiveGap = 10;
-  const immersiveAvailableHeight = immersiveSize.height - 24;
-  const buttonImmersiveHeight = immersiveAvailableHeight * (hasWidgetArea ? rows / (rows + widgetRows) : 1);
-  const widgetImmersiveHeight = hasWidgetArea ? immersiveAvailableHeight - buttonImmersiveHeight : 0;
+  const immersiveAvailableHeight = Math.max(0, immersiveSize.height - 24);
+  const buttonImmersiveHeight = hasButtons ? immersiveAvailableHeight * (showWidgetArea ? rows / (rows + widgetRows) : 1) : 0;
+  const widgetImmersiveHeight = showWidgetArea ? immersiveAvailableHeight - buttonImmersiveHeight : 0;
   const immersiveCellWidth = Math.max(0, (immersiveSize.width - 24 - immersiveGap * (columns - 1)) / columns);
   const immersiveCellHeight = Math.max(1, (buttonImmersiveHeight - 24 - immersiveGap * (rows - 1)) / rows);
-  const immersiveWidgetCellWidth = Math.max(0, (immersiveSize.width - 24 - immersiveGap * (widgetColumns - 1)) / widgetColumns);
-  const immersiveWidgetCellHeight = Math.max(1, (widgetImmersiveHeight - 24 - immersiveGap * (widgetRows - 1)) / widgetRows);
+  const immersiveWidgetCellWidth = Math.max(0, (immersiveSize.width - 24 - immersiveGap * (displayWidgetColumns - 1)) / displayWidgetColumns);
+  const immersiveWidgetCellHeight = Math.max(1, (widgetImmersiveHeight - 24 - immersiveGap * (displayWidgetRows - 1)) / displayWidgetRows);
   const immersiveIconSize = Math.min(52, Math.max(26, Math.min(immersiveCellHeight, immersiveCellWidth) * 0.34));
+  const immersiveWidgetIconSize = Math.min(52, Math.max(20, Math.min(immersiveWidgetCellHeight, immersiveWidgetCellWidth) * 0.34));
   const actionErrorText = actionError === 'accessibility_permission_required' ? 'Allow Freeze in Mac Accessibility settings'
     : actionError === 'app_launch_failed' ? 'PC could not launch this app. Check its target path'
     : actionError === 'stale_revision' ? 'Deck changed. Wait for sync, then try again'
@@ -248,7 +264,7 @@ export default function DeckScreen() {
       }}>
         <Pressable style={styles.immersiveBackdrop} onPress={revealImmersiveTools} accessibilityLabel="Deck background. Tap for controls" />
         <View style={styles.immersiveGrid} pointerEvents="box-none">
-          {activePage ? <View style={[styles.immersiveDeckCanvas, { top: 12, height: buttonImmersiveHeight }]} {...pageSwipeResponder.panHandlers}>
+          {activePage && hasButtons ? <View style={[styles.immersiveDeckCanvas, { top: 12, height: buttonImmersiveHeight }]} {...pageSwipeResponder.panHandlers}>
           {Array.from({ length: rows * columns }, (_, index) => {
             const row = Math.floor(index / columns);
             const column = index % columns;
@@ -265,24 +281,26 @@ export default function DeckScreen() {
             </Pressable>;
           })}
           </View> : null}
-          {hasWidgetArea && widgetArea && widgetScreen ? <View style={[styles.immersiveWidgetCanvas, { top: 12 + buttonImmersiveHeight, height: widgetImmersiveHeight }]} {...widgetSwipeResponder.panHandlers}>
-            {Array.from({ length: widgetRows * widgetColumns }, (_, index) => {
-              const row = Math.floor(index / widgetColumns);
-              const column = index % widgetColumns;
-              const item = widgetOccupied.get(index);
+          {showWidgetArea && widgetArea && widgetScreen ? <View style={[styles.immersiveWidgetCanvas, { top: widgetOnlyMode ? 12 : 12 + buttonImmersiveHeight, height: widgetImmersiveHeight }]} {...widgetSwipeResponder.panHandlers}>
+            {Array.from({ length: displayWidgetRows * displayWidgetColumns }, (_, index) => {
+              const row = Math.floor(index / displayWidgetColumns);
+              const column = index % displayWidgetColumns;
+              const sourceRow = row + widgetTopRow;
+              const sourceColumn = column + widgetLeftColumn;
+              const item = widgetOccupied.get(sourceRow * widgetColumns + sourceColumn);
               if (!item) return null;
               if (item.type === 'widget') {
                 const placement = item.widget.placement;
-                if (placement.row !== row || placement.column !== column) return null;
-                return <View key={item.widget.id} style={[styles.immersiveKey, styles.clockWidgetKey, cellFrame(placement.row, placement.column, placement.rowSpan, placement.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12, 0)]}><ClockWidget immersive /></View>;
+                if (placement.row !== sourceRow || placement.column !== sourceColumn) return null;
+                return <View key={item.widget.id} style={[styles.immersiveKey, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12, 0)]}><ClockWidget immersive /></View>;
               }
               const button = item.button;
               const placement = buttonPlacement({ id: widgetScreen.id, name: widgetScreen.name, rows: widgetRows, columns: widgetColumns, buttons: widgetScreen.buttons }, button);
-              if (placement.row !== row || placement.column !== column) return null;
+              if (placement.row !== sourceRow || placement.column !== sourceColumn) return null;
               const label = button.icon === 'auto' && button.action.type === 'media' && button.action.command === 'play_pause' ? (isPlaying ? 'Pause' : 'Play') : button.label;
               const Icon = controlIcon(button, playbackState);
-              return <Pressable key={button.id} style={({ pressed }) => [styles.immersiveKey, cellFrame(placement.row, placement.column, placement.rowSpan, placement.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12), pressed && styles.keyPressed, !connected && styles.keyDisabled]} onPress={() => press(button, label)} disabled={!connected} accessibilityRole="button" accessibilityLabel={label}>
-                {button.appIconData ? <Image source={{ uri: button.appIconData }} style={{ width: immersiveIconSize, height: immersiveIconSize }} resizeMode="contain" /> : button.iconSvg && button.icon !== 'auto' ? <SvgXml xml={button.iconSvg} width={immersiveIconSize} height={immersiveIconSize} /> : <Icon size={immersiveIconSize} color={colors.text} strokeWidth={1.7} />}
+              return <Pressable key={button.id} style={({ pressed }) => [styles.immersiveKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12), pressed && styles.keyPressed, !connected && styles.keyDisabled]} onPress={() => press(button, label)} disabled={!connected} accessibilityRole="button" accessibilityLabel={label}>
+                {button.appIconData ? <Image source={{ uri: button.appIconData }} style={{ width: immersiveWidgetIconSize, height: immersiveWidgetIconSize }} resizeMode="contain" /> : button.iconSvg && button.icon !== 'auto' ? <SvgXml xml={button.iconSvg} width={immersiveWidgetIconSize} height={immersiveWidgetIconSize} /> : <Icon size={immersiveWidgetIconSize} color={colors.text} strokeWidth={1.7} />}
               </Pressable>;
             })}
             {(widgetArea.pages.length > 1) ? <View style={styles.immersiveWidgetPageIndicator} pointerEvents="none"><Text style={styles.pageTabText}>{widgetPageIndex + 1} / {widgetArea.pages.length}</Text></View> : null}
@@ -303,7 +321,7 @@ export default function DeckScreen() {
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
       <StatusBar style="light" />
-      <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
+      <ScrollView contentContainerStyle={[styles.content, widgetOnlyMode && styles.widgetOnlyContent]} showsVerticalScrollIndicator={false}>
         <View style={styles.header}>
           <View style={styles.brand}><Snowflake size={19} color={colors.text} strokeWidth={1.8} /><Text style={styles.brandName}>Freeze</Text></View>
           <View style={styles.headerActions}>
@@ -335,7 +353,7 @@ export default function DeckScreen() {
           <ChevronRight size={16} color={colors.faint} />
         </Pressable>}
 
-        {activePage ? <>
+        {activePage && hasButtons ? <>
           <Text style={styles.sectionTitle}>{activePage.name}</Text>
           <View style={[styles.grid, { height: rows * 100 + Math.max(0, rows - 1) * regularGap }]} onLayout={(event) => {
             const width = event.nativeEvent.layout.width;
@@ -358,30 +376,34 @@ export default function DeckScreen() {
               </Pressable>;
             })}
           </View>
-        </> : <View style={styles.emptyDeck}><Command size={20} color={colors.faint} /><Text style={styles.feedbackText}>{connected ? 'The desktop has no active deck page.' : 'Connect to a PC to load its deck.'}</Text></View>}
+        </> : !widgetOnlyMode ? <View style={styles.emptyDeck}><Command size={20} color={colors.faint} /><Text style={styles.feedbackText}>{connected ? 'The desktop has no active deck page.' : 'Connect to a PC to load its deck.'}</Text></View> : null}
 
-        {hasWidgetArea && widgetArea && widgetScreen ? <View style={styles.widgetArea} {...widgetSwipeResponder.panHandlers}>
+        {showWidgetArea && widgetArea && widgetScreen ? <View style={[styles.widgetArea, widgetOnlyMode && styles.widgetOnlyArea]} {...widgetSwipeResponder.panHandlers}>
           <View style={styles.widgetAreaHeading}><Text style={styles.widgetAreaTitle}>Widgets</Text>{widgetArea.pages.length > 1 ? <Text style={styles.widgetAreaPage}>{widgetPageIndex + 1} / {widgetArea.pages.length}</Text> : null}</View>
-          <View style={[styles.grid, { height: widgetRows * 100 + Math.max(0, widgetRows - 1) * regularGap }]} onLayout={(event) => {
+          {widgetOccupied.size === 0 ? <View pointerEvents="none" style={styles.widgetOnlyEmpty}><Command size={20} color={colors.faint} /><Text style={styles.feedbackText}>Add widgets to this page in the desktop editor.</Text></View> : null}
+          <View style={[styles.grid, { height: displayWidgetRows * 100 + Math.max(0, displayWidgetRows - 1) * regularGap }]} onLayout={(event) => {
             const width = event.nativeEvent.layout.width;
             setWidgetGridWidth((current) => Math.abs(current - width) < 0.5 ? current : width);
           }}>
-            {Array.from({ length: widgetRows * widgetColumns }, (_, index) => {
-              const row = Math.floor(index / widgetColumns);
-              const column = index % widgetColumns;
-              const item = widgetOccupied.get(index);
-              if (!item) return <View key={`widget-empty-${index}`} style={[styles.key, styles.emptyKey, cellFrame(row, column, 1, 1, widgetCellWidth)]} />;
+            {Array.from({ length: displayWidgetRows * displayWidgetColumns }, (_, index) => {
+              const row = Math.floor(index / displayWidgetColumns);
+              const column = index % displayWidgetColumns;
+              const sourceRow = row + widgetTopRow;
+              const sourceColumn = column + widgetLeftColumn;
+              const item = widgetOccupied.get(sourceRow * widgetColumns + sourceColumn);
+              const widgetCellHeight = 100;
+              if (!item) return <View key={`widget-empty-${index}`} style={[styles.key, styles.emptyKey, cellFrame(row, column, 1, 1, widgetCellWidth, widgetCellHeight)]} />;
               if (item.type === 'widget') {
                 const placement = item.widget.placement;
-                if (placement.row !== row || placement.column !== column) return null;
-                return <View key={item.widget.id} style={[styles.key, styles.clockWidgetKey, cellFrame(placement.row, placement.column, placement.rowSpan, placement.columnSpan, widgetCellWidth)]}><ClockWidget /></View>;
+                if (placement.row !== sourceRow || placement.column !== sourceColumn) return null;
+                return <View key={item.widget.id} style={[styles.key, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, widgetCellWidth, widgetCellHeight)]}><ClockWidget /></View>;
               }
               const button = item.button;
               const placement = buttonPlacement({ id: widgetScreen.id, name: widgetScreen.name, rows: widgetRows, columns: widgetColumns, buttons: widgetScreen.buttons }, button);
-              if (placement.row !== row || placement.column !== column) return null;
+              if (placement.row !== sourceRow || placement.column !== sourceColumn) return null;
               const label = button.icon === 'auto' && button.action.type === 'media' && button.action.command === 'play_pause' ? (isPlaying ? 'Pause' : 'Play') : button.label;
               const Icon = controlIcon(button, playbackState);
-              return <Pressable key={button.id} style={({ pressed }) => [styles.key, cellFrame(placement.row, placement.column, placement.rowSpan, placement.columnSpan, widgetCellWidth), pressed && styles.keyPressed, !connected && styles.keyDisabled]} onPress={() => press(button, label)} disabled={!connected} accessibilityRole="button" accessibilityLabel={label}>
+              return <Pressable key={button.id} style={({ pressed }) => [styles.key, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, widgetCellWidth, widgetCellHeight), pressed && styles.keyPressed, !connected && styles.keyDisabled]} onPress={() => press(button, label)} disabled={!connected} accessibilityRole="button" accessibilityLabel={label}>
                 {button.appIconData ? <Image source={{ uri: button.appIconData }} style={styles.appIcon} resizeMode="contain" /> : button.iconSvg && button.icon !== 'auto' ? <SvgXml xml={button.iconSvg} width={21} height={21} /> : <Icon size={21} color={colors.text} strokeWidth={1.7} />}
                 <Text style={styles.keyLabel} numberOfLines={2}>{label}</Text>
               </Pressable>;
@@ -417,7 +439,8 @@ const styles = StyleSheet.create({
   immersivePageTools: { flexGrow: 1, flexDirection: 'row', alignItems: 'center', gap: 5 },
   immersivePageButton: { height: 30, justifyContent: 'center', paddingHorizontal: 10, borderRadius: 5 },
   immersiveExit: { width: 34, height: 34, borderRadius: 6, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border },
-  content: { paddingHorizontal: 18, paddingBottom: 24 },
+  content: { flexGrow: 1, paddingHorizontal: 18, paddingBottom: 24 },
+  widgetOnlyContent: { flexGrow: 0 },
   header: { height: 52, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   headerActions: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   immersiveToggle: { width: 34, height: 34, borderWidth: 1, borderColor: colors.border, borderRadius: 6, backgroundColor: colors.panel, alignItems: 'center', justifyContent: 'center' },
@@ -445,6 +468,8 @@ const styles = StyleSheet.create({
   bannerSub: { color: colors.muted, fontSize: 12, marginTop: 4 },
   sectionTitle: { color: colors.muted, fontSize: 14, fontWeight: '500', marginBottom: 10 },
   widgetArea: { marginTop: 18, padding: 12, borderWidth: 1, borderColor: colors.border, borderRadius: 10, backgroundColor: colors.panel },
+  widgetOnlyArea: { position: 'relative', marginTop: 0 },
+  widgetOnlyEmpty: { ...StyleSheet.absoluteFill, zIndex: 1, alignItems: 'center', justifyContent: 'center', gap: 8, padding: 20 },
   widgetAreaHeading: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 },
   widgetAreaTitle: { color: colors.text, fontSize: 14, fontWeight: '600' },
   widgetAreaPage: { color: colors.muted, fontSize: 12, fontVariant: ['tabular-nums'] },

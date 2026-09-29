@@ -28,6 +28,7 @@ function validLayout(rows: number, columns: number, items: PlacedItem[], allowRo
 }
 
 export function validDeckPageLayout(page: DeckPage): boolean {
+  if (page.rows === 0 && page.columns === 0) return page.buttons.length === 0;
   const columns = page.columns ?? 3;
   const rows = page.rows ?? Math.max(1, Math.ceil(page.buttons.length / columns));
   return validLayout(rows, columns, page.buttons, true);

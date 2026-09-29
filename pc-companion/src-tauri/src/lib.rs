@@ -39,6 +39,9 @@ struct AppState {
     config_dir: RwLock<Option<PathBuf>>,
     deck_config: RwLock<DeckConfig>,
     deck_updates: broadcast::Sender<DeckConfig>,
+    independent_navigation: AtomicBool,
+    navigation_updates: broadcast::Sender<bool>,
+    auto_profile_updates: broadcast::Sender<String>,
     pending_legacy: RwLock<HashMap<String, LegacyPhonePageSet>>,
     legacy_offers: RwLock<HashMap<String, LegacyImportSummary>>,
     legacy_requests: broadcast::Sender<String>,
@@ -356,7 +359,8 @@ fn validate_deck_config(config: &DeckConfig) -> Result<(), String> {
             {
                 return Err("Page IDs and names must be valid and unique".into());
             }
-            if !(1..=6).contains(&page.rows) || !(1..=6).contains(&page.columns) {
+            let widget_only = page.rows == 0 && page.columns == 0 && page.buttons.is_empty();
+            if !widget_only && (!(1..=6).contains(&page.rows) || !(1..=6).contains(&page.columns)) {
                 return Err("Page rows and columns must be between 1 and 6".into());
             }
             if page.buttons.len() > usize::from(page.rows) * usize::from(page.columns) {
@@ -609,9 +613,7 @@ fn validate_deck_button(
             return Err("A button contains an invalid extracted icon".into());
         }
     }
-    if button.icon == "app-icon"
-        && (button.app_icon_data.is_none() || !supports_extracted_icon)
-    {
+    if button.icon == "app-icon" && (button.app_icon_data.is_none() || !supports_extracted_icon) {
         return Err("An extracted icon requires a launch action".into());
     }
     validate_action(&button.action)
@@ -877,6 +879,119 @@ fn get_deck_config(state: &AppState) -> Option<DeckConfig> {
     state.deck_config.read().ok().map(|config| config.clone())
 }
 
+fn device_deck_snapshot(
+    config: &DeckConfig,
+    independent: bool,
+    profile_id: &mut String,
+    page_id: &mut String,
+) -> serde_json::Value {
+    if !independent {
+        let active_page_id = config
+            .profiles
+            .iter()
+            .find(|profile| profile.id == config.active_profile_id)
+            .map(|profile| profile.active_page_id.as_str())
+            .unwrap_or_default();
+        return serde_json::json!({
+            "type": "deck_snapshot",
+            "protocolVersion": 1,
+            "config": config,
+            "independentNavigation": false,
+            "selection": { "profileId": config.active_profile_id, "pageId": active_page_id }
+        });
+    }
+
+    if !config
+        .profiles
+        .iter()
+        .any(|profile| profile.id == *profile_id)
+    {
+        *profile_id = config.active_profile_id.clone();
+    }
+    let Some(profile) = config
+        .profiles
+        .iter()
+        .find(|profile| profile.id == *profile_id)
+    else {
+        *profile_id = config.profiles[0].id.clone();
+        return device_deck_snapshot(config, independent, profile_id, page_id);
+    };
+    if !profile.pages.iter().any(|page| page.id == *page_id) {
+        *page_id = profile.active_page_id.clone();
+    }
+    if !profile.pages.iter().any(|page| page.id == *page_id) {
+        *page_id = profile.pages[0].id.clone();
+    }
+    serde_json::json!({
+        "type": "deck_snapshot",
+        "protocolVersion": 1,
+        "config": config,
+        "independentNavigation": true,
+        "selection": { "profileId": profile_id, "pageId": page_id }
+    })
+}
+
+fn update_device_selection(
+    state: &AppState,
+    expected_revision: u64,
+    profile_id: Option<&str>,
+    page_id: Option<&str>,
+    selected_profile_id: &mut String,
+    selected_page_id: &mut String,
+) -> Result<(), String> {
+    let config = get_deck_config(state).ok_or_else(|| "Deck config is unavailable".to_owned())?;
+    if config.revision != expected_revision {
+        return Err("stale_revision".into());
+    }
+    let target_profile_id = profile_id.unwrap_or(selected_profile_id);
+    let profile = config
+        .profiles
+        .iter()
+        .find(|profile| profile.id == target_profile_id)
+        .ok_or_else(|| "unknown_profile".to_owned())?;
+    let target_page_id = page_id.unwrap_or_else(|| {
+        if profile_id.is_some() {
+            profile.active_page_id.as_str()
+        } else {
+            selected_page_id.as_str()
+        }
+    });
+    if !profile.pages.iter().any(|page| page.id == target_page_id) {
+        return Err("unknown_page".into());
+    }
+    *selected_profile_id = profile.id.clone();
+    *selected_page_id = target_page_id.to_owned();
+    Ok(())
+}
+
+#[tauri::command]
+fn get_independent_navigation(state: tauri::State<'_, Arc<AppState>>) -> bool {
+    state.independent_navigation.load(Ordering::Relaxed)
+}
+
+#[tauri::command]
+fn set_independent_navigation(
+    enabled: bool,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    let config_dir = state
+        .config_dir
+        .read()
+        .map_err(|_| "Freeze settings are unavailable".to_owned())?
+        .clone()
+        .ok_or_else(|| "Freeze settings are unavailable".to_owned())?;
+    fs::write(
+        config_dir.join("independent-navigation"),
+        if enabled { "true" } else { "false" },
+    )
+    .map_err(|_| "Could not save navigation setting".to_owned())?;
+    state
+        .independent_navigation
+        .store(enabled, Ordering::Relaxed);
+    let _ = state.navigation_updates.send(enabled);
+    Ok(enabled)
+}
+
 fn load_deck_config(path: &Path) -> DeckConfig {
     for candidate in [path.to_path_buf(), path.with_extension("json.bak")] {
         if candidate
@@ -897,6 +1012,9 @@ fn load_deck_config(path: &Path) -> DeckConfig {
                         .flat_map(|profile| &mut profile.pages)
                     {
                         if page.rows == 0 || page.columns == 0 {
+                            if page.rows == 0 && page.columns == 0 && page.buttons.is_empty() {
+                                continue;
+                            }
                             page.columns = if page.buttons.len() > 18 { 6 } else { 3 };
                             page.rows = page
                                 .buttons
@@ -955,6 +1073,12 @@ enum ClientMessage {
         legacy_source_id: Option<String>,
         #[serde(default, rename = "legacyDeckAvailable")]
         legacy_deck_available: bool,
+        #[serde(default, rename = "supportsIndependentNavigation")]
+        supports_independent_navigation: bool,
+        #[serde(default, rename = "selectedProfileId")]
+        selected_profile_id: Option<String>,
+        #[serde(default, rename = "selectedPageId")]
+        selected_page_id: Option<String>,
     },
     InvokeButton {
         #[serde(rename = "requestId")]
@@ -1399,7 +1523,7 @@ fn switch_profile_for_foreground(state: &AppState, foreground: &ForegroundApp) {
     if config.active_profile_id == target_id {
         return;
     }
-    config.active_profile_id = target_id;
+    config.active_profile_id = target_id.clone();
     config.revision = config.revision.saturating_add(1);
     let config_dir = state
         .config_dir
@@ -1412,6 +1536,7 @@ fn switch_profile_for_foreground(state: &AppState, foreground: &ForegroundApp) {
         return;
     }
     let _ = state.deck_updates.send(config.clone());
+    let _ = state.auto_profile_updates.send(target_id);
 }
 
 #[tauri::command]
@@ -1705,8 +1830,13 @@ async fn upgrade_socket(
 
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let mut authenticated = false;
+    let mut supports_independent_navigation = false;
+    let mut selected_profile_id = String::new();
+    let mut selected_page_id = String::new();
     let mut session_epoch = 0;
     let mut deck_updates = state.deck_updates.subscribe();
+    let mut navigation_updates = state.navigation_updates.subscribe();
+    let mut auto_profile_updates = state.auto_profile_updates.subscribe();
     let mut legacy_requests = state.legacy_requests.subscribe();
     let mut legacy_source_id: Option<String> = None;
     let mut playback_updates = tokio::time::interval(Duration::from_millis(500));
@@ -1717,12 +1847,68 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             update = deck_updates.recv(), if authenticated => {
                 match update {
                     Ok(config) => {
-                        let message = serde_json::json!({ "type": "deck_snapshot", "protocolVersion": 1, "config": config });
+                        if !state.independent_navigation.load(Ordering::Relaxed) {
+                            selected_profile_id = config.active_profile_id.clone();
+                            selected_page_id = config.profiles.iter().find(|profile| profile.id == selected_profile_id).map(|profile| profile.active_page_id.clone()).unwrap_or_default();
+                        }
+                        let message = device_deck_snapshot(&config, state.independent_navigation.load(Ordering::Relaxed), &mut selected_profile_id, &mut selected_page_id);
                         if socket.send(Message::Text(message.to_string().into())).await.is_err() { break; }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         if let Some(config) = get_deck_config(&state) {
-                            let message = serde_json::json!({ "type": "deck_snapshot", "protocolVersion": 1, "config": config });
+                            if !state.independent_navigation.load(Ordering::Relaxed) {
+                                selected_profile_id = config.active_profile_id.clone();
+                                selected_page_id = config.profiles.iter().find(|profile| profile.id == selected_profile_id).map(|profile| profile.active_page_id.clone()).unwrap_or_default();
+                            }
+                            let message = device_deck_snapshot(&config, state.independent_navigation.load(Ordering::Relaxed), &mut selected_profile_id, &mut selected_page_id);
+                            if socket.send(Message::Text(message.to_string().into())).await.is_err() { break; }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+                continue;
+            }
+            mode = navigation_updates.recv(), if authenticated => {
+                match mode {
+                    Ok(true) if !supports_independent_navigation => {
+                        let _ = socket.send(Message::Text(r#"{"type":"error","message":"update_required","protocolVersion":1}"#.into())).await;
+                        break;
+                    }
+                    Ok(enabled) => {
+                        if let Some(config) = get_deck_config(&state) {
+                            if !enabled || selected_profile_id.is_empty() {
+                                selected_profile_id = config.active_profile_id.clone();
+                                selected_page_id = config.profiles.iter().find(|profile| profile.id == selected_profile_id).map(|profile| profile.active_page_id.clone()).unwrap_or_default();
+                            }
+                            let message = device_deck_snapshot(&config, enabled, &mut selected_profile_id, &mut selected_page_id);
+                            if socket.send(Message::Text(message.to_string().into())).await.is_err() { break; }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if let Some(config) = get_deck_config(&state) {
+                            let enabled = state.independent_navigation.load(Ordering::Relaxed);
+                            let message = device_deck_snapshot(&config, enabled, &mut selected_profile_id, &mut selected_page_id);
+                            if socket.send(Message::Text(message.to_string().into())).await.is_err() { break; }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+                continue;
+            }
+            profile_id = auto_profile_updates.recv(), if authenticated && state.independent_navigation.load(Ordering::Relaxed) => {
+                match profile_id {
+                    Ok(profile_id) => {
+                        selected_profile_id = profile_id;
+                        if let Some(config) = get_deck_config(&state) {
+                            let message = device_deck_snapshot(&config, true, &mut selected_profile_id, &mut selected_page_id);
+                            if socket.send(Message::Text(message.to_string().into())).await.is_err() { break; }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if let Some(config) = get_deck_config(&state) {
+                            selected_profile_id = config.active_profile_id.clone();
+                            selected_page_id = config.profiles.iter().find(|profile| profile.id == selected_profile_id).map(|profile| profile.active_page_id.clone()).unwrap_or_default();
+                            let message = device_deck_snapshot(&config, true, &mut selected_profile_id, &mut selected_page_id);
                             if socket.send(Message::Text(message.to_string().into())).await.is_err() { break; }
                         }
                     }
@@ -1777,6 +1963,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 protocol_version,
                 legacy_source_id: requested_source_id,
                 legacy_deck_available,
+                supports_independent_navigation: supports_navigation,
+                selected_profile_id: requested_profile_id,
+                selected_page_id: requested_page_id,
             } if !authenticated => {
                 if protocol_version != Some(1) {
                     let _ = socket
@@ -1799,6 +1988,42 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                         ))
                         .await;
                     break;
+                }
+                let independent = state.independent_navigation.load(Ordering::Relaxed);
+                if independent && !supports_navigation {
+                    let _ = socket
+                        .send(Message::Text(
+                            r#"{"type":"error","message":"update_required","protocolVersion":1}"#
+                                .into(),
+                        ))
+                        .await;
+                    break;
+                }
+                supports_independent_navigation = supports_navigation;
+                if let Some(config) = get_deck_config(&state) {
+                    selected_profile_id = requested_profile_id
+                        .filter(|id| valid_id(id))
+                        .unwrap_or_else(|| config.active_profile_id.clone());
+                    selected_page_id =
+                        requested_page_id
+                            .filter(|id| valid_id(id))
+                            .unwrap_or_else(|| {
+                                config
+                                    .profiles
+                                    .iter()
+                                    .find(|profile| profile.id == selected_profile_id)
+                                    .map(|profile| profile.active_page_id.clone())
+                                    .unwrap_or_default()
+                            });
+                    if !independent {
+                        selected_profile_id = config.active_profile_id.clone();
+                        selected_page_id = config
+                            .profiles
+                            .iter()
+                            .find(|profile| profile.id == selected_profile_id)
+                            .map(|profile| profile.active_page_id.clone())
+                            .unwrap_or_default();
+                    }
                 }
                 authenticated = true;
                 session_epoch = state.session_epoch.load(Ordering::Relaxed);
@@ -1842,7 +2067,12 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     break;
                 }
                 if let Some(config) = get_deck_config(&state) {
-                    let message = serde_json::json!({ "type": "deck_snapshot", "protocolVersion": 1, "config": config });
+                    let message = device_deck_snapshot(
+                        &config,
+                        independent,
+                        &mut selected_profile_id,
+                        &mut selected_page_id,
+                    );
                     if socket
                         .send(Message::Text(message.to_string().into()))
                         .await
@@ -1870,11 +2100,19 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 let result = if !valid_id(&request_id) || !valid_id(&button_id) {
                     Err("invalid_request".to_owned())
                 } else {
-                    invoke_button(&state, revision, &button_id)
+                    invoke_button(
+                        &state,
+                        revision,
+                        &button_id,
+                        state.independent_navigation.load(Ordering::Relaxed),
+                        &mut selected_profile_id,
+                        &mut selected_page_id,
+                    )
                 };
                 let stale_revision = matches!(&result, Err(error) if error == "stale_revision");
+                let changed_selection = matches!(&result, Ok(true));
                 let reply = match result {
-                    Ok(()) => {
+                    Ok(_) => {
                         serde_json::json!({ "type": "action_result", "requestId": request_id, "ok": true })
                     }
                     Err(error) => {
@@ -1899,7 +2137,29 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 }
                 if stale_revision {
                     if let Some(config) = get_deck_config(&state) {
-                        let snapshot = serde_json::json!({ "type": "deck_snapshot", "protocolVersion": 1, "config": config });
+                        let snapshot = device_deck_snapshot(
+                            &config,
+                            state.independent_navigation.load(Ordering::Relaxed),
+                            &mut selected_profile_id,
+                            &mut selected_page_id,
+                        );
+                        if socket
+                            .send(Message::Text(snapshot.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                } else if changed_selection && state.independent_navigation.load(Ordering::Relaxed)
+                {
+                    if let Some(config) = get_deck_config(&state) {
+                        let snapshot = device_deck_snapshot(
+                            &config,
+                            true,
+                            &mut selected_profile_id,
+                            &mut selected_page_id,
+                        );
                         if socket
                             .send(Message::Text(snapshot.to_string().into()))
                             .await
@@ -1915,12 +2175,25 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 revision,
                 profile_id,
             } if authenticated => {
+                let independent = state.independent_navigation.load(Ordering::Relaxed);
                 let result = if valid_id(&request_id) {
-                    update_selection(&state, revision, Some(&profile_id), None)
+                    if independent {
+                        update_device_selection(
+                            &state,
+                            revision,
+                            Some(&profile_id),
+                            None,
+                            &mut selected_profile_id,
+                            &mut selected_page_id,
+                        )
+                    } else {
+                        update_selection(&state, revision, Some(&profile_id), None)
+                    }
                 } else {
                     Err("invalid_request".to_owned())
                 };
                 let stale_revision = matches!(&result, Err(error) if error == "stale_revision");
+                let succeeded = result.is_ok();
                 let reply = selection_reply(&request_id, result);
                 if socket
                     .send(Message::Text(reply.to_string().into()))
@@ -1929,9 +2202,31 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 {
                     break;
                 }
+                if independent && succeeded {
+                    if let Some(config) = get_deck_config(&state) {
+                        let snapshot = device_deck_snapshot(
+                            &config,
+                            true,
+                            &mut selected_profile_id,
+                            &mut selected_page_id,
+                        );
+                        if socket
+                            .send(Message::Text(snapshot.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
                 if stale_revision {
                     if let Some(config) = get_deck_config(&state) {
-                        let snapshot = serde_json::json!({ "type": "deck_snapshot", "protocolVersion": 1, "config": config });
+                        let snapshot = device_deck_snapshot(
+                            &config,
+                            independent,
+                            &mut selected_profile_id,
+                            &mut selected_page_id,
+                        );
                         if socket
                             .send(Message::Text(snapshot.to_string().into()))
                             .await
@@ -1947,12 +2242,25 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 revision,
                 page_id,
             } if authenticated => {
+                let independent = state.independent_navigation.load(Ordering::Relaxed);
                 let result = if valid_id(&request_id) {
-                    update_selection(&state, revision, None, Some(&page_id))
+                    if independent {
+                        update_device_selection(
+                            &state,
+                            revision,
+                            None,
+                            Some(&page_id),
+                            &mut selected_profile_id,
+                            &mut selected_page_id,
+                        )
+                    } else {
+                        update_selection(&state, revision, None, Some(&page_id))
+                    }
                 } else {
                     Err("invalid_request".to_owned())
                 };
                 let stale_revision = matches!(&result, Err(error) if error == "stale_revision");
+                let succeeded = result.is_ok();
                 let reply = selection_reply(&request_id, result);
                 if socket
                     .send(Message::Text(reply.to_string().into()))
@@ -1961,9 +2269,31 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 {
                     break;
                 }
+                if independent && succeeded {
+                    if let Some(config) = get_deck_config(&state) {
+                        let snapshot = device_deck_snapshot(
+                            &config,
+                            true,
+                            &mut selected_profile_id,
+                            &mut selected_page_id,
+                        );
+                        if socket
+                            .send(Message::Text(snapshot.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
                 if stale_revision {
                     if let Some(config) = get_deck_config(&state) {
-                        let snapshot = serde_json::json!({ "type": "deck_snapshot", "protocolVersion": 1, "config": config });
+                        let snapshot = device_deck_snapshot(
+                            &config,
+                            independent,
+                            &mut selected_profile_id,
+                            &mut selected_page_id,
+                        );
                         if socket
                             .send(Message::Text(snapshot.to_string().into()))
                             .await
@@ -2096,7 +2426,14 @@ fn selection_reply(request_id: &str, result: Result<(), String>) -> serde_json::
     }
 }
 
-fn invoke_button(state: &AppState, revision: u64, button_id: &str) -> Result<(), String> {
+fn invoke_button(
+    state: &AppState,
+    revision: u64,
+    button_id: &str,
+    independent: bool,
+    selected_profile_id: &mut String,
+    selected_page_id: &mut String,
+) -> Result<bool, String> {
     let config = state
         .deck_config
         .read()
@@ -2105,15 +2442,25 @@ fn invoke_button(state: &AppState, revision: u64, button_id: &str) -> Result<(),
     if config.revision != revision {
         return Err("stale_revision".into());
     }
+    let profile_id = if independent {
+        selected_profile_id.as_str()
+    } else {
+        config.active_profile_id.as_str()
+    };
     let profile = config
         .profiles
         .iter()
-        .find(|profile| profile.id == config.active_profile_id)
+        .find(|profile| profile.id == profile_id)
         .ok_or_else(|| "unknown_profile".to_owned())?;
+    let page_id = if independent {
+        selected_page_id.as_str()
+    } else {
+        profile.active_page_id.as_str()
+    };
     let page = profile
         .pages
         .iter()
-        .find(|page| page.id == profile.active_page_id)
+        .find(|page| page.id == page_id)
         .ok_or_else(|| "unknown_page".to_owned())?;
     let button = page
         .buttons
@@ -2128,16 +2475,39 @@ fn invoke_button(state: &AppState, revision: u64, button_id: &str) -> Result<(),
         )
         .find(|button| button.id == button_id)
         .ok_or_else(|| "unknown_button".to_owned())?;
-    run_deck_action(&button.action, state, revision)
+    let changed_selection = matches!(
+        &button.action,
+        DeckAction::SelectProfile { .. } | DeckAction::SelectPage { .. }
+    );
+    run_deck_action(
+        &button.action,
+        state,
+        revision,
+        independent,
+        selected_profile_id,
+        selected_page_id,
+    )?;
+    Ok(changed_selection)
 }
 
-fn run_deck_action(action: &DeckAction, state: &AppState, revision: u64) -> Result<(), String> {
+fn run_deck_action(
+    action: &DeckAction,
+    state: &AppState,
+    revision: u64,
+    independent: bool,
+    selected_profile_id: &mut String,
+    selected_page_id: &mut String,
+) -> Result<(), String> {
     match action {
         DeckAction::Media { command } => run_action(ClientAction::Media { command: *command }),
         DeckAction::Hotkey { keys } => run_action(ClientAction::Hotkey { keys: keys.clone() }),
         DeckAction::LaunchApp { app } => run_action(ClientAction::LaunchApp { app: app.clone() }),
-        DeckAction::LaunchFile { path } => run_action(ClientAction::LaunchFile { path: path.clone() }),
-        DeckAction::LaunchFolder { path } => run_action(ClientAction::LaunchFolder { path: path.clone() }),
+        DeckAction::LaunchFile { path } => {
+            run_action(ClientAction::LaunchFile { path: path.clone() })
+        }
+        DeckAction::LaunchFolder { path } => {
+            run_action(ClientAction::LaunchFolder { path: path.clone() })
+        }
         DeckAction::Sequence { steps } => {
             let mut actions = Vec::with_capacity(steps.len());
             for step in steps {
@@ -2145,17 +2515,43 @@ fn run_deck_action(action: &DeckAction, state: &AppState, revision: u64) -> Resu
                     DeckStep::Media { command } => SequenceAction::Media { command: *command },
                     DeckStep::Hotkey { keys } => SequenceAction::Hotkey { keys: keys.clone() },
                     DeckStep::LaunchApp { app } => SequenceAction::LaunchApp { app: app.clone() },
-                    DeckStep::LaunchFile { path } => SequenceAction::LaunchFile { path: path.clone() },
-                    DeckStep::LaunchFolder { path } => SequenceAction::LaunchFolder { path: path.clone() },
+                    DeckStep::LaunchFile { path } => {
+                        SequenceAction::LaunchFile { path: path.clone() }
+                    }
+                    DeckStep::LaunchFolder { path } => {
+                        SequenceAction::LaunchFolder { path: path.clone() }
+                    }
                 });
             }
             run_action(ClientAction::Sequence { actions })
         }
         DeckAction::SelectProfile { profile_id } => {
-            update_selection(state, revision, Some(profile_id), None)
+            if independent {
+                update_device_selection(
+                    state,
+                    revision,
+                    Some(profile_id),
+                    None,
+                    selected_profile_id,
+                    selected_page_id,
+                )
+            } else {
+                update_selection(state, revision, Some(profile_id), None)
+            }
         }
         DeckAction::SelectPage { page_id } => {
-            update_selection(state, revision, None, Some(page_id))
+            if independent {
+                update_device_selection(
+                    state,
+                    revision,
+                    None,
+                    Some(page_id),
+                    selected_profile_id,
+                    selected_page_id,
+                )
+            } else {
+                update_selection(state, revision, None, Some(page_id))
+            }
         }
     }
 }
@@ -2379,8 +2775,10 @@ $null = [FreezeShellThumbnail]::DeleteObject($hbitmap)
     }
     #[cfg(target_os = "macos")]
     {
-        let directory = std::env::temp_dir().join(format!("freeze-thumbnail-{}", rand::random::<u64>()));
-        fs::create_dir(&directory).map_err(|_| "Could not prepare a thumbnail location".to_owned())?;
+        let directory =
+            std::env::temp_dir().join(format!("freeze-thumbnail-{}", rand::random::<u64>()));
+        fs::create_dir(&directory)
+            .map_err(|_| "Could not prepare a thumbnail location".to_owned())?;
         let result = Command::new("/usr/bin/qlmanage")
             .args(["-t", "-s", "96", "-o"])
             .arg(&directory)
@@ -2393,11 +2791,16 @@ $null = [FreezeShellThumbnail]::DeleteObject($hbitmap)
                 return Err("Could not create a Quick Look thumbnail".into());
             }
         };
-        let thumbnail = fs::read_dir(&directory)
-            .ok()
-            .and_then(|entries| entries.flatten().map(|entry| entry.path()).find(|file| file.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("png"))));
+        let thumbnail = fs::read_dir(&directory).ok().and_then(|entries| {
+            entries.flatten().map(|entry| entry.path()).find(|file| {
+                file.extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+            })
+        });
         if !result.status.success() {
-            if let Some(file) = thumbnail { let _ = fs::remove_file(file); }
+            if let Some(file) = thumbnail {
+                let _ = fs::remove_file(file);
+            }
             let _ = fs::remove_dir(&directory);
             return Err("macOS could not create a thumbnail for that file or folder".into());
         }
@@ -2416,7 +2819,9 @@ $null = [FreezeShellThumbnail]::DeleteObject($hbitmap)
         if !encoded.status.success() || encoded.stdout.len() > 65_500 {
             return Err("The file thumbnail is too large to use".into());
         }
-        let data = String::from_utf8_lossy(&encoded.stdout).replace('\n', "").replace('\r', "");
+        let data = String::from_utf8_lossy(&encoded.stdout)
+            .replace('\n', "")
+            .replace('\r', "");
         return Ok(format!("data:image/png;base64,{data}"));
     }
     #[allow(unreachable_code)]
@@ -2486,6 +2891,8 @@ pub fn run() {
         .unwrap_or_else(|_| "127.0.0.1".to_owned());
     let (deck_updates, _) = broadcast::channel(16);
     let (legacy_requests, _) = broadcast::channel(16);
+    let (navigation_updates, _) = broadcast::channel(16);
+    let (auto_profile_updates, _) = broadcast::channel(16);
     let state = Arc::new(AppState {
         host,
         device_name: machine_name(),
@@ -2493,6 +2900,9 @@ pub fn run() {
         config_dir: RwLock::new(None),
         deck_config: RwLock::new(default_deck_config()),
         deck_updates,
+        independent_navigation: AtomicBool::new(false),
+        navigation_updates,
+        auto_profile_updates,
         pending_legacy: RwLock::new(HashMap::new()),
         legacy_offers: RwLock::new(HashMap::new()),
         legacy_requests,
@@ -2508,6 +2918,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             connection_info,
             deck_config,
+            get_independent_navigation,
+            set_independent_navigation,
             save_deck_config,
             get_playback_state,
             extract_app_icon,
@@ -2532,6 +2944,13 @@ pub fn run() {
                 .write()
                 .map_err(|_| std::io::Error::other("Freeze settings directory lock poisoned"))? =
                 Some(config_dir.clone());
+
+            let independent_navigation =
+                fs::read_to_string(config_dir.join("independent-navigation"))
+                    .is_ok_and(|value| value.trim() == "true");
+            state
+                .independent_navigation
+                .store(independent_navigation, Ordering::Relaxed);
 
             let deck_path = config_dir.join("deck-config.json");
             let deck_config = load_deck_config(&deck_path);

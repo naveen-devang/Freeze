@@ -28,6 +28,7 @@ import {
   Plus,
   Trash2,
   Save,
+  Settings,
   ShieldCheck,
   SkipBack,
   SkipForward,
@@ -182,8 +183,11 @@ function App() {
   const [usbBusy, setUsbBusy] = useState(false);
   const [usbError, setUsbError] = useState('');
   const [pairingError, setPairingError] = useState('');
-  const [screen, setScreen] = useState<'overview' | 'deck'>('overview');
+  const [screen, setScreen] = useState<'overview' | 'deck' | 'settings'>('overview');
   const [deckConfig, setDeckConfig] = useState<DeckConfig | null>(null);
+  const [independentNavigation, setIndependentNavigation] = useState(false);
+  const [navigationSettingBusy, setNavigationSettingBusy] = useState(false);
+  const [navigationSettingError, setNavigationSettingError] = useState('');
   const [playbackState, setPlaybackState] = useState<PlaybackState>('unavailable');
   const [legacyImports, setLegacyImports] = useState<LegacyImportSummary[]>([]);
   const [importError, setImportError] = useState('');
@@ -208,6 +212,7 @@ function App() {
     };
     void refresh();
     void invoke<DeckConfig>('deck_config').then((config) => { if (live) setDeckConfig(config); }).catch(() => {});
+    void invoke<boolean>('get_independent_navigation').then((enabled) => { if (live) setIndependentNavigation(enabled); }).catch(() => {});
     const timer = window.setInterval(refresh, 2000);
     return () => {
       live = false;
@@ -272,6 +277,19 @@ function App() {
     }
   }
 
+  async function saveIndependentNavigation(enabled: boolean) {
+    setNavigationSettingBusy(true);
+    setNavigationSettingError('');
+    try {
+      const saved = await invoke<boolean>('set_independent_navigation', { enabled });
+      setIndependentNavigation(saved);
+    } catch {
+      setNavigationSettingError('Could not save this setting. Try again.');
+    } finally {
+      setNavigationSettingBusy(false);
+    }
+  }
+
   async function importPhoneDeck(sourceId: string) {
     setImportError('');
     try {
@@ -322,6 +340,9 @@ function App() {
           <button className={`nav-item ${screen === 'deck' ? 'selected' : ''}`} aria-current={screen === 'deck' ? 'page' : undefined} onClick={() => setScreen('deck')}>
             <Layers size={16} strokeWidth={1.8} /><span>Deck</span>
           </button>
+          <button className={`nav-item ${screen === 'settings' ? 'selected' : ''}`} aria-current={screen === 'settings' ? 'page' : undefined} onClick={() => setScreen('settings')}>
+            <Settings size={16} strokeWidth={1.8} /><span>Settings</span>
+          </button>
         </nav>
 
         <div className="sidebar-bottom">
@@ -331,7 +352,7 @@ function App() {
 
       <section className="main-panel">
         <header className="topbar">
-          <span>{screen === 'overview' ? 'Overview' : 'Deck'}</span>
+          <span>{screen === 'overview' ? 'Overview' : screen === 'deck' ? 'Deck' : 'Settings'}</span>
           <div className="network-badge">
             <Wifi size={14} strokeWidth={1.8} />
             {transport === 'usb' ? 'Android USB' : 'Local network'}
@@ -344,7 +365,14 @@ function App() {
             <div className="legacy-import-actions">{legacyImports.map((item) => <button key={item.sourceId} className="secondary-button" onClick={() => void (item.ready ? importPhoneDeck(item.sourceId) : requestPhoneDeck(item.sourceId))}>{item.ready ? 'Import phone deck' : item.requested ? 'Request again' : 'Transfer phone deck'}</button>)}</div>
             {importError ? <p className="usb-error" role="alert">{importError}</p> : null}
           </section> : null}
-          {screen === 'deck' ? <DesktopDeckEditor config={deckConfig} onSaved={setDeckConfig} playbackState={playbackState} isMacos={connection?.isMacos ?? false} /> : <>
+          {screen === 'deck' ? <DesktopDeckEditor config={deckConfig} onSaved={setDeckConfig} playbackState={playbackState} isMacos={connection?.isMacos ?? false} /> : screen === 'settings' ? <>
+          <div className="page-heading"><div><h1>Settings</h1><p>Choose how connected devices navigate their decks.</p></div></div>
+          <section className="device-navigation-setting">
+            <div className="device-navigation-copy"><h2>Independent device navigation</h2><p>Let each connected phone use its own profile and page. Turn this off to mirror navigation across all phones.</p></div>
+            <button className={`setting-switch ${independentNavigation ? 'enabled' : ''}`} type="button" role="switch" aria-checked={independentNavigation} aria-label="Independent device navigation" disabled={navigationSettingBusy} onClick={() => void saveIndependentNavigation(!independentNavigation)}><span /></button>
+            {navigationSettingError ? <p className="setting-error" role="alert">{navigationSettingError}</p> : null}
+          </section>
+          </> : <>
           <div className="page-heading">
             <div>
               <h1>Overview</h1>
@@ -582,15 +610,16 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
   }
 
   function addButton(row?: number, column?: number) {
+    const targetPage = page.rows === 0 && page.columns === 0 ? { ...page, rows: 1, columns: 1 } : page;
     const placement = row === undefined || column === undefined
-      ? firstButtonPlacement(page)
-      : canPlaceButton(page, '', { row, column, rowSpan: 1, columnSpan: 1 })
+      ? firstButtonPlacement(targetPage)
+      : canPlaceButton(targetPage, '', { row, column, rowSpan: 1, columnSpan: 1 })
         ? { row, column, rowSpan: 1, columnSpan: 1 }
         : null;
     if (!placement) return setError('There is no free grid cell. Move or resize a button to make room.');
     const id = `button-${Date.now()}`;
     const nextButton: DeckButton = { id, label: 'New button', icon: 'auto', placement, action: { type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] } };
-    replacePage({ ...page, buttons: [...page.buttons, nextButton] });
+    replacePage({ ...targetPage, buttons: [...targetPage.buttons, nextButton] });
     setButtonId(id);
   }
 
@@ -665,8 +694,12 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
       setError('');
       replaceWidgetScreen({ ...widgetScreen, enabled: true, buttons: [...widgetScreen.buttons, { ...button, placement }] }, profile, true, { ...page, buttons: page.buttons.filter((entry) => entry.id !== itemId) });
     } else {
-      if (!canPlaceButton(page, '', placement)) return setError('That position is occupied or outside the button grid.');
-      const nextPage = { ...page, buttons: [...page.buttons, { ...button, placement }] };
+      const targetPage = page.rows === 0 && page.columns === 0
+        ? { ...page, rows: Math.max(1, placement.rowSpan), columns: Math.max(1, placement.columnSpan), buttons: [] }
+        : page;
+      const targetPlacement = targetPage === page ? placement : { row: 0, column: 0, rowSpan: placement.rowSpan, columnSpan: placement.columnSpan };
+      if (!canPlaceButton(targetPage, '', targetPlacement)) return setError('That position is occupied or outside the button grid.');
+      const nextPage = { ...targetPage, buttons: [...targetPage.buttons, { ...button, placement: targetPlacement }] };
       const nextScreen = { ...widgetScreen, buttons: widgetScreen.buttons.filter((item) => item.id !== itemId) };
       setError('');
       replaceWidgetScreen(nextScreen, profile, true, nextPage);
@@ -681,7 +714,9 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
     const placement = buttonPlacement(source === 'page' ? page : { ...widgetScreen, id: 'widgets', name: 'Widgets' }, selected);
     const target = source === 'page' ? 'widgets' : 'page';
     const destination = target === 'page'
-      ? firstButtonPlacement(page, placement.rowSpan, placement.columnSpan)
+      ? page.rows === 0 && page.columns === 0
+        ? placement.rowSpan <= 6 && placement.columnSpan <= 6 ? { row: 0, column: 0, rowSpan: placement.rowSpan, columnSpan: placement.columnSpan } : null
+        : firstButtonPlacement(page, placement.rowSpan, placement.columnSpan)
       : firstWidgetPlacement(widgetScreen, placement.rowSpan, placement.columnSpan);
     if (!destination) return setError(`There is no free ${target === 'page' ? 'button grid' : 'widget screen'} space large enough for this button.`);
     moveItemBetweenSurfaces(selected.id, source, target, destination.row, destination.column, 'button');
@@ -883,15 +918,32 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
 
   function resizePage(dimension: 'rows' | 'columns', value: string) {
     const nextValue = Number(value);
-    if (!Number.isInteger(nextValue) || nextValue < 1 || nextValue > 6) return;
-    const rows = dimension === 'rows' ? nextValue : page.rows;
-    const columns = dimension === 'columns' ? nextValue : page.columns;
+    if (!Number.isInteger(nextValue) || nextValue < 0 || nextValue > 6) return;
+    if (nextValue === 0) {
+      if (page.buttons.length) {
+        let nextScreen = { ...widgetScreen, enabled: true };
+        for (const button of page.buttons) {
+          const source = buttonPlacement(page, button);
+          const placement = firstWidgetPlacement(nextScreen, source.rowSpan, source.columnSpan);
+          if (!placement) return setError('The widget area does not have enough room for every button. Expand it or move some buttons there first.');
+          nextScreen = { ...nextScreen, buttons: [...nextScreen.buttons, { ...button, placement }] };
+        }
+        setError('');
+        replaceWidgetScreen(nextScreen, profile, true, { ...page, rows: 0, columns: 0, buttons: [] });
+        return;
+      }
+      setError('');
+      replacePage({ ...page, rows: 0, columns: 0 });
+      return;
+    }
+    const rows = dimension === 'rows' ? nextValue : page.rows || 1;
+    const columns = dimension === 'columns' ? nextValue : page.columns || 3;
     if (page.buttons.some((button) => {
       const placement = buttonPlacement(page, button);
       return placement.row + placement.rowSpan > rows || placement.column + placement.columnSpan > columns;
     })) return setError(`A button extends beyond the new grid. Move or resize it before reducing ${dimension}.`);
     setError('');
-    replacePage({ ...page, [dimension]: nextValue });
+    replacePage({ ...page, rows, columns });
   }
 
   function updateWidgetScreen(patch: Partial<WidgetScreen>) {
@@ -1025,8 +1077,8 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
     <section className="deck-editor-layout">
       <div className="deck-canvas-column">
       <div className="deck-canvas-wrap">
-        <div className="deck-canvas-heading"><div><h2>{profile.name} / {page.name}</h2><p>{page.buttons.length} buttons · {occupied.size} of {page.rows * page.columns} cells · Drag to move or resize</p></div><div className="heading-actions"><label className="grid-size-control">Rows<DeckSelect value={String(page.rows)} disabled={busy} options={Array.from({ length: 6 }, (_, index) => ({ value: String(index + 1), label: String(index + 1) }))} onChange={(value) => resizePage('rows', value)} /></label><label className="grid-size-control">Columns<DeckSelect value={String(page.columns)} disabled={busy} options={Array.from({ length: 6 }, (_, index) => ({ value: String(index + 1), label: String(index + 1) }))} onChange={(value) => resizePage('columns', value)} /></label>{selected && page.buttons.some((item) => item.id === selected.id) ? <button className="secondary-button" onClick={duplicateButton} disabled={busy || !firstButtonPlacement(page, buttonPlacement(page, selected).rowSpan, buttonPlacement(page, selected).columnSpan)}><Copy size={13} /> Duplicate</button> : null}<button className="secondary-button" onClick={() => addButton()} disabled={busy || !hasFreeCell}><Plus size={14} /> Add button</button></div></div>
-        <div ref={canvasRef} className="deck-canvas" style={{ gridTemplateColumns: `repeat(${page.columns}, minmax(0, 1fr))`, gridTemplateRows: `repeat(${page.rows}, minmax(100px, auto))` }}>{Array.from({ length: page.rows * page.columns }, (_, index) => {
+        <div className="deck-canvas-heading"><div><h2>{profile.name} / {page.name}</h2><p>{page.rows === 0 ? 'Widgets fill the phone deck area' : `${page.buttons.length} buttons · ${occupied.size} of ${page.rows * page.columns} cells · Drag to move or resize`}</p></div><div className="heading-actions"><label className="grid-size-control">Rows<DeckSelect value={String(page.rows)} disabled={busy} options={[{ value: '0', label: page.buttons.length ? '0 · Move to widgets' : '0 · Off' }, ...Array.from({ length: 6 }, (_, index) => ({ value: String(index + 1), label: String(index + 1) }))]} onChange={(value) => resizePage('rows', value)} /></label><label className="grid-size-control">Columns<DeckSelect value={String(page.columns)} disabled={busy} options={[{ value: '0', label: page.buttons.length ? '0 · Move to widgets' : '0 · Off' }, ...Array.from({ length: 6 }, (_, index) => ({ value: String(index + 1), label: String(index + 1) }))]} onChange={(value) => resizePage('columns', value)} /></label>{selected && page.buttons.some((item) => item.id === selected.id) ? <button className="secondary-button" onClick={duplicateButton} disabled={busy || !firstButtonPlacement(page, buttonPlacement(page, selected).rowSpan, buttonPlacement(page, selected).columnSpan)}><Copy size={13} /> Duplicate</button> : null}<button className="secondary-button" onClick={() => addButton()} disabled={busy || (page.rows > 0 && !hasFreeCell)}><Plus size={14} /> Add button</button></div></div>
+        {page.rows === 0 ? <div className="deck-grid-disabled"><PanelsTopLeft size={20} /><p>Button grid is off</p><span>The widget area will fill the available deck space on your phone.</span></div> : <div ref={canvasRef} className="deck-canvas" style={{ gridTemplateColumns: `repeat(${page.columns}, minmax(0, 1fr))`, gridTemplateRows: `repeat(${page.rows}, minmax(100px, auto))` }}>{Array.from({ length: page.rows * page.columns }, (_, index) => {
           const row = Math.floor(index / page.columns);
           const column = index % page.columns;
           const button = occupied.get(index);
@@ -1073,7 +1125,7 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
           }
           return <button key={`empty-${index}`} type="button" data-deck-cell="true" data-surface="page" data-row={row} data-column={column} className={`deck-button deck-slot ${dragOverCellKey === `${row}:${column}` ? 'drop-target' : ''}`} onClick={() => addButton(row, column)} disabled={busy || !hasFreeCell} aria-label={`Add button in row ${row + 1}, column ${column + 1}`}><Plus size={17} /><span>Add button</span></button>;
         })}
-        </div>
+        </div>}
       </div>
       <section className="deck-canvas-wrap widget-screen-editor">
         <div className="deck-canvas-heading">

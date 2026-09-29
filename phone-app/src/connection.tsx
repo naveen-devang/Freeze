@@ -27,6 +27,9 @@ type ConnectionContextValue = {
   protocolError: string | null;
   playbackState: PlaybackState;
   deckConfig: DeckConfig | null;
+  independentNavigation: boolean;
+  selectedProfileId: string | null;
+  selectedPageId: string | null;
   actionError: ActionError | null;
   connect: (connection: PcConnection) => Promise<void>;
   disconnect: () => Promise<void>;
@@ -41,6 +44,7 @@ const PAIRED_KEY = 'freeze.pc-connections';
 const LEGACY_STORAGE_KEY = 'decklink.pc-connection';
 const MAX_RECONNECT_ATTEMPTS = 3;
 const DECK_CACHE_KEY = 'freeze.deck-snapshot';
+const DEVICE_SELECTION_KEY = 'freeze.device-navigation';
 const LEGACY_SOURCE_KEY = 'freeze.legacy-import-source';
 const LEGACY_IMPORTED_KEY = 'freeze.legacy-imported';
 const ConnectionContext = createContext<ConnectionContextValue | null>(null);
@@ -95,8 +99,8 @@ function validDeckPage(value: unknown): value is DeckPage {
   if (!value || typeof value !== 'object') return false;
   const page = value as Partial<DeckPage>;
   return typeof page.id === 'string' && typeof page.name === 'string' &&
-    (page.rows === undefined || (Number.isInteger(page.rows) && page.rows >= 1 && page.rows <= 6)) &&
-    (page.columns === undefined || (Number.isInteger(page.columns) && page.columns >= 1 && page.columns <= 6)) &&
+    (page.rows === undefined || (Number.isInteger(page.rows) && page.rows >= 0 && page.rows <= 6)) &&
+    (page.columns === undefined || (Number.isInteger(page.columns) && page.columns >= 0 && page.columns <= 6)) &&
     Array.isArray(page.buttons) && page.buttons.length <= 36 && page.buttons.every(validDeckButton) &&
     (page.widgetArea === undefined || validWidgetArea(page.widgetArea)) &&
     validDeckPageLayout(page as DeckPage);
@@ -125,6 +129,9 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
   const [protocolError, setProtocolError] = useState<string | null>(null);
   const [playbackState, setPlaybackState] = useState<PlaybackState>('unavailable');
   const [deckConfig, setDeckConfig] = useState<DeckConfig | null>(null);
+  const [independentNavigation, setIndependentNavigation] = useState(false);
+  const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
+  const [selectedPageId, setSelectedPageId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<ConnectionContextValue['actionError']>(null);
 
   const persistPairedDevices = useCallback((devices: PcConnection[]) => {
@@ -149,6 +156,9 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
     setStatus('connecting');
     if (!retrying) {
       setDeckConfig(null);
+      setIndependentNavigation(false);
+      setSelectedProfileId(null);
+      setSelectedPageId(null);
       setProtocolError(null);
       setPlaybackState('unavailable');
       setActionError(null);
@@ -183,11 +193,16 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
         }
       });
       socket.onopen = () => {
-        void legacyDeckForPairing(next).then((legacyDeck) => {
-          if (socketRef.current === socket) socket.send(JSON.stringify({ type: 'authenticate', token: next.token, protocolVersion: 1, legacyDeckAvailable: Boolean(legacyDeck), ...(legacyDeck ? { legacySourceId: legacyDeck.sourceId } : {}) }));
+        void Promise.all([legacyDeckForPairing(next), Storage.getItem(`${DEVICE_SELECTION_KEY}.${connectionId(next)}`)]).then(([legacyDeck, savedSelection]) => {
+          let selection: { profileId: string; pageId: string } | null = null;
+          try {
+            const parsed = savedSelection ? JSON.parse(savedSelection) as Partial<{ profileId: string; pageId: string }> : null;
+            if (typeof parsed?.profileId === 'string' && typeof parsed.pageId === 'string') selection = { profileId: parsed.profileId, pageId: parsed.pageId };
+          } catch { void Storage.removeItem(`${DEVICE_SELECTION_KEY}.${connectionId(next)}`); }
+          if (socketRef.current === socket) socket.send(JSON.stringify({ type: 'authenticate', token: next.token, protocolVersion: 1, legacyDeckAvailable: Boolean(legacyDeck), supportsIndependentNavigation: true, ...(selection ? { selectedProfileId: selection.profileId, selectedPageId: selection.pageId } : {}), ...(legacyDeck ? { legacySourceId: legacyDeck.sourceId } : {}) }));
           else socket.close();
         }).catch(() => {
-          if (socketRef.current === socket) socket.send(JSON.stringify({ type: 'authenticate', token: next.token, protocolVersion: 1 }));
+          if (socketRef.current === socket) socket.send(JSON.stringify({ type: 'authenticate', token: next.token, protocolVersion: 1, supportsIndependentNavigation: true }));
         });
       };
       socket.onmessage = async (event) => {
@@ -204,10 +219,18 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
             setActionError(message.ok ? null : reason === 'accessibility_permission_required' || reason === 'app_launch_failed' || reason === 'stale_revision' || reason === 'unknown_button' ? reason : 'control_failed');
           }
           if (message.type === 'deck_snapshot') {
-            const snapshot = JSON.parse(event.data) as { protocolVersion?: number; config?: unknown };
+            const snapshot = JSON.parse(event.data) as { protocolVersion?: number; config?: unknown; independentNavigation?: boolean; selection?: { profileId?: string; pageId?: string } };
             const config = snapshot.config;
             if (snapshot.protocolVersion === 1 && validDeckConfig(config)) {
               setDeckConfig(config);
+              const selectedProfile = config.profiles.find((profile) => profile.id === snapshot.selection?.profileId) ?? config.profiles.find((profile) => profile.id === config.activeProfileId);
+              const selectedPage = selectedProfile?.pages.find((page) => page.id === snapshot.selection?.pageId) ?? selectedProfile?.pages.find((page) => page.id === selectedProfile.activePageId);
+              setIndependentNavigation(snapshot.independentNavigation === true);
+              setSelectedProfileId(selectedProfile?.id ?? null);
+              setSelectedPageId(selectedPage?.id ?? null);
+              if (snapshot.independentNavigation === true && selectedProfile && selectedPage) {
+                void Storage.setItem(`${DEVICE_SELECTION_KEY}.${connectionId(next)}`, JSON.stringify({ profileId: selectedProfile.id, pageId: selectedPage.id }));
+              }
               void Storage.setItem(`${DECK_CACHE_KEY}.${connectionId(next)}`, JSON.stringify(config));
               void SecureStore.getItemAsync(LEGACY_SOURCE_KEY).then((sourceId) => {
                 if (sourceId && config.profiles.some((profile) => profile.id === `import-${sourceId}`)) {
@@ -334,6 +357,9 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
     setConnection(null);
     setStatus('disconnected');
     setPlaybackState('unavailable');
+    setIndependentNavigation(false);
+    setSelectedProfileId(null);
+    setSelectedPageId(null);
     setActionError(null);
     await SecureStore.deleteItemAsync(STORAGE_KEY);
   }, []);
@@ -363,7 +389,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
   const selectPage = useCallback((pageId: string) => sendRequest('select_page', 'pageId', pageId), [sendRequest]);
 
   return (
-    <ConnectionContext.Provider value={{ connection, pairedDevices, status, protocolError, playbackState, deckConfig, actionError, connect, disconnect, removePairedDevice, sendButton, selectProfile, selectPage }}>
+    <ConnectionContext.Provider value={{ connection, pairedDevices, status, protocolError, playbackState, deckConfig, independentNavigation, selectedProfileId, selectedPageId, actionError, connect, disconnect, removePairedDevice, sendButton, selectProfile, selectPage }}>
       {children}
     </ConnectionContext.Provider>
   );
