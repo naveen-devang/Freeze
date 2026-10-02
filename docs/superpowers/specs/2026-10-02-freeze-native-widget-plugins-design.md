@@ -37,7 +37,7 @@ Let a Freeze plugin contribute configurable widgets to the existing widget area 
 - The saved plugin widget shape is `{ id, type: "plugin", pluginId, widgetId, renderType: "text", values, placement }`; `values` maps manifest input IDs to configured strings. The phone uses the included renderer identifier and values, not plugin code or installed manifest metadata.
 - Plugin widget IDs and input IDs use the existing Freeze plugin ID validation. Inputs reuse the existing `text`, `number`, and `select` contract and the same size limits.
 - A plugin may declare up to 32 widget definitions, and each widget may declare up to 16 inputs.
-- Unknown plugin-widget input fields, oversized values, invalid select choices, missing definitions, or grid collisions are rejected or normalized by the same deck validation paths used for other widget instances.
+- On the desktop, reject unknown input fields, oversized values, invalid select choices, and grid collisions through the existing validation paths. On the phone, accept the self-contained renderer and values without requiring plugin metadata; an unavailable plugin ID does not prevent rendering the saved text.
 - Plugin widget definitions are metadata only. The first version does not run a provider process, fetch remote data, or execute code while rendering a widget.
 
 ## Installation and editor flow
@@ -50,7 +50,7 @@ Let a Freeze plugin contribute configurable widgets to the existing widget area 
 ## Phone behavior
 
 - The widget area uses the existing page layout and swipe model. Plugin widgets take the configured grid placement and do not alter button rows or columns.
-- Text widgets use responsive typography, clipping/wrapping rules, and the existing widget card style. Missing definitions render a recoverable placeholder without invalidating the complete deck snapshot.
+- Text widgets use responsive typography, clipping/wrapping rules, and the existing widget card style. Unknown renderers use a recoverable placeholder without invalidating the complete deck snapshot.
 - Widget values and plugin metadata are not treated as executable input by the phone.
 
 ## Security and privacy
