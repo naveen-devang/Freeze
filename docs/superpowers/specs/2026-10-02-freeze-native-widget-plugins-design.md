@@ -11,7 +11,7 @@ Let a Freeze plugin contribute configurable widgets to the existing widget area 
 - The desktop editor lists widgets from installed plugins, lets the user add one to a widget page, configure its declared text inputs, move it, and resize it using the existing grid controls.
 - A saved widget instance contains its ID, plugin ID, widget definition ID, configured input values, and the existing grid placement.
 - The phone receives widget instances through the existing deck snapshot and renders them with Freeze-owned React Native components. It does not evaluate plugin JavaScript, HTML, or native code.
-- If a plugin or widget definition is unavailable, the phone shows a neutral unavailable state and continues rendering the rest of the page.
+- Each saved instance carries its Freeze renderer identifier, so the phone does not need installed plugin metadata to render it. If a renderer identifier is unknown to that phone version, it shows a neutral unavailable state and continues rendering the rest of the page.
 
 ## Data and manifest contract
 
@@ -34,7 +34,7 @@ Let a Freeze plugin contribute configurable widgets to the existing widget area 
     ]
   }
   ```
-- The saved plugin widget shape is `{ id, type: "plugin", pluginId, widgetId, values, placement }`; `values` maps manifest input IDs to configured strings.
+- The saved plugin widget shape is `{ id, type: "plugin", pluginId, widgetId, renderType: "text", values, placement }`; `values` maps manifest input IDs to configured strings. The phone uses the included renderer identifier and values, not plugin code or installed manifest metadata.
 - Plugin widget IDs and input IDs use the existing Freeze plugin ID validation. Inputs reuse the existing `text`, `number`, and `select` contract and the same size limits.
 - A plugin may declare up to 32 widget definitions, and each widget may declare up to 16 inputs.
 - Unknown plugin-widget input fields, oversized values, invalid select choices, missing definitions, or grid collisions are rejected or normalized by the same deck validation paths used for other widget instances.
@@ -63,10 +63,10 @@ Let a Freeze plugin contribute configurable widgets to the existing widget area 
 
 1. An installed Freeze plugin can declare a text widget with labeled configurable fields.
 2. The desktop editor can add/configure/remove that widget and place/resize it with the current widget-grid editor.
-3. The saved deck syncs the instance to a phone; Android and iOS render it using the same native Freeze widget layout.
+3. The saved deck syncs the instance to a phone; Android and iOS render it using the same native Freeze widget layout without requiring plugin installation on the phone.
 4. Legacy clock widgets and plugins without widget declarations still load and sync.
 5. Removing a referenced plugin is blocked; uninstalling an unreferenced plugin still works.
-6. Malformed or oversized widget definitions/values are rejected without breaking other installed plugins or the deck editor.
+6. Malformed or oversized widget definitions/values are rejected without breaking other installed plugins or the deck editor; unsupported renderer identifiers show a placeholder.
 
 ## Deferred
 
