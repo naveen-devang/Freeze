@@ -54,6 +54,32 @@ struct AppState {
     server_online: AtomicBool,
     android_usb_enabled: AtomicBool,
     session_epoch: AtomicUsize,
+    widget_surface: RwLock<Option<WidgetSurface>>,
+}
+
+/// The phone's widget area in px, reported so the desktop Now Playing preview sizes blocks like the phone.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WidgetSurface {
+    width: f64,
+    height: f64,
+    gap: f64,
+    inset: f64,
+    fixed_row_height: Option<f64>,
+}
+
+impl WidgetSurface {
+    fn is_valid(&self) -> bool {
+        let in_range = |value: f64, max: f64| value.is_finite() && (0.0..=max).contains(&value);
+        in_range(self.width, 10_000.0)
+            && self.width > 0.0
+            && in_range(self.height, 10_000.0)
+            && in_range(self.gap, 200.0)
+            && in_range(self.inset, 200.0)
+            && self
+                .fixed_row_height
+                .is_none_or(|height| in_range(height, 2_000.0) && height > 0.0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -76,6 +102,7 @@ struct ConnectionInfo {
     server_online: bool,
     is_macos: bool,
     android_usb_enabled: bool,
+    widget_surface: Option<WidgetSurface>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1531,6 +1558,9 @@ enum ClientMessage {
         #[serde(rename = "legacyDeck")]
         deck: LegacyPhonePageSet,
     },
+    WidgetSurface {
+        surface: WidgetSurface,
+    },
 }
 
 enum ClientAction {
@@ -1565,6 +1595,7 @@ fn connection_info(state: tauri::State<'_, Arc<AppState>>) -> ConnectionInfo {
         server_online: state.server_online.load(Ordering::Relaxed),
         is_macos: IS_MACOS,
         android_usb_enabled: state.android_usb_enabled.load(Ordering::Relaxed),
+        widget_surface: state.widget_surface.read().ok().and_then(|surface| *surface),
     }
 }
 
@@ -2961,6 +2992,13 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     }
                 }
             }
+            ClientMessage::WidgetSurface { surface } if authenticated => {
+                if surface.is_valid() {
+                    if let Ok(mut current) = state.widget_surface.write() {
+                        *current = Some(surface);
+                    }
+                }
+            }
             ClientMessage::LegacyDeck { deck } if authenticated => {
                 let requested = state
                     .legacy_offers
@@ -3706,6 +3744,7 @@ pub fn run() {
         server_online: AtomicBool::new(false),
         android_usb_enabled: AtomicBool::new(false),
         session_epoch: AtomicUsize::new(0),
+        widget_surface: RwLock::new(None),
     });
 
     tauri::Builder::default()

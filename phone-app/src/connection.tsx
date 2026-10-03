@@ -3,6 +3,7 @@ import Storage from 'expo-sqlite/kv-store';
 import { loadDeckPages } from './deck';
 import { validDeckPageLayout, validDeckWidgetAreaLayout } from './deck-layout';
 import { createContext, PropsWithChildren, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import type { WidgetSurface } from './now-playing-layout';
 
 export type PcConnection = { host: string; port: number; token: string; deviceName?: string; transport?: 'wifi' | 'usb' };
 export type DeckMediaCommand = 'play_pause' | 'next_track' | 'previous_track' | 'volume_up' | 'volume_down' | 'mute';
@@ -41,6 +42,7 @@ type ConnectionContextValue = {
   sendSystemVolume: (volumePercent: number) => boolean;
   selectProfile: (profileId: string) => boolean;
   selectPage: (pageId: string) => boolean;
+  reportWidgetSurface: (surface: WidgetSurface) => void;
 };
 
 const STORAGE_KEY = 'freeze.pc-connection';
@@ -144,6 +146,7 @@ function validDeckConfig(value: unknown): value is DeckConfig {
 
 export function ConnectionProvider({ children }: PropsWithChildren) {
   const socketRef = useRef<WebSocket | null>(null);
+  const widgetSurfaceRef = useRef<WidgetSurface | null>(null);
   const pendingRequestsRef = useRef(new Set<string>());
   const openConnectionRef = useRef<((next: PcConnection, retrying: boolean) => void) | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -242,6 +245,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
           if (message.type === 'ready') {
             reconnectAttemptRef.current = 0;
             setStatus('connected');
+            if (widgetSurfaceRef.current) socket.send(JSON.stringify({ type: 'widget_surface', surface: widgetSurfaceRef.current }));
           }
           if (message.type === 'playback_state' && typeof message.state === 'string' && ['playing', 'paused', 'stopped', 'unavailable'].includes(message.state)) setPlaybackState(message.state as PlaybackState);
           if (message.type === 'media_state') {
@@ -454,9 +458,18 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
   const sendSystemVolume = useCallback((volumePercent: number) => sendRequest('set_system_volume', 'volumePercent', Math.round(Math.max(0, Math.min(100, volumePercent)))), [sendRequest]);
   const selectProfile = useCallback((profileId: string) => sendRequest('select_profile', 'profileId', profileId), [sendRequest]);
   const selectPage = useCallback((pageId: string) => sendRequest('select_page', 'pageId', pageId), [sendRequest]);
+  // Tells the desktop how big the phone's widget area is, so its Now Playing preview matches.
+  // The latest value is resent after every reconnect.
+  const reportWidgetSurface = useCallback((surface: WidgetSurface) => {
+    const previous = widgetSurfaceRef.current;
+    if (previous && (Object.keys(surface) as (keyof WidgetSurface)[]).every((key) => previous[key] === surface[key])) return;
+    widgetSurfaceRef.current = surface;
+    const socket = socketRef.current;
+    if (status === 'connected' && socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'widget_surface', surface }));
+  }, [status]);
 
   return (
-    <ConnectionContext.Provider value={{ connection, pairedDevices, status, protocolError, playbackState, mediaState, deckConfig, independentNavigation, selectedProfileId, selectedPageId, actionError, connect, disconnect, removePairedDevice, sendButton, sendMediaCommand, sendSystemVolume, selectProfile, selectPage }}>
+    <ConnectionContext.Provider value={{ connection, pairedDevices, status, protocolError, playbackState, mediaState, deckConfig, independentNavigation, selectedProfileId, selectedPageId, actionError, connect, disconnect, removePairedDevice, sendButton, sendMediaCommand, sendSystemVolume, selectProfile, selectPage, reportWidgetSurface }}>
       {children}
     </ConnectionContext.Provider>
   );

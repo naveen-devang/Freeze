@@ -45,6 +45,8 @@ import {
 import { QRCodeSVG } from "qrcode.react";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import "./App.css";
+import { NowPlayingPreview, REFERENCE_WIDGET_SURFACE } from "./NowPlayingPreview";
+import type { WidgetSurface } from "./now-playing-layout";
 
 type ConnectionInfo = {
   host: string;
@@ -55,6 +57,7 @@ type ConnectionInfo = {
   serverOnline: boolean;
   isMacos: boolean;
   androidUsbEnabled: boolean;
+  widgetSurface: WidgetSurface | null;
 };
 
 type MediaCommand = 'play_pause' | 'next_track' | 'previous_track' | 'volume_up' | 'volume_down' | 'mute';
@@ -162,6 +165,24 @@ function firstWidgetPlacement(screen: WidgetScreen, rowSpan = 1, columnSpan = 1)
     }
   }
   return null;
+}
+
+// Mirrors the phone: a page with no buttons stretches the bounding box of its widget items
+// across the whole widget area, so cells get bigger. `override` is a placement being resized.
+function phoneWidgetGrid(pageHasButtons: boolean, screen: WidgetScreen, overrideId: string, override: DeckPlacement) {
+  if (pageHasButtons) return { columns: screen.columns, rows: screen.rows };
+  const page = { id: '', name: '', rows: screen.rows, columns: screen.columns, buttons: screen.buttons };
+  const placements = [
+    ...screen.buttons.map((button) => button.id === overrideId ? override : buttonPlacement(page, button)),
+    ...screen.widgets.map((widget) => widget.id === overrideId ? override : widget.placement),
+  ];
+  if (!placements.length) return { columns: screen.columns, rows: screen.rows };
+  const top = Math.min(...placements.map((item) => item.row));
+  const left = Math.min(...placements.map((item) => item.column));
+  return {
+    columns: Math.max(...placements.map((item) => Math.min(screen.columns, item.column + item.columnSpan))) - left,
+    rows: Math.max(...placements.map((item) => Math.min(screen.rows, item.row + item.rowSpan))) - top,
+  };
 }
 
 function occupiedWidgetCells(screen: WidgetScreen): Map<number, WidgetCanvasItem> {
@@ -412,7 +433,7 @@ function App() {
             <div className="legacy-import-actions">{legacyImports.map((item) => <button key={item.sourceId} className="secondary-button" onClick={() => void (item.ready ? importPhoneDeck(item.sourceId) : requestPhoneDeck(item.sourceId))}>{item.ready ? 'Import phone deck' : item.requested ? 'Request again' : 'Transfer phone deck'}</button>)}</div>
             {importError ? <p className="usb-error" role="alert">{importError}</p> : null}
           </section> : null}
-          {screen === 'deck' ? <DesktopDeckEditor config={deckConfig} onSaved={setDeckConfig} playbackState={playbackState} mediaState={mediaState} isMacos={connection?.isMacos ?? false} plugins={freezePlugins} /> : screen === 'settings' ? <>
+          {screen === 'deck' ? <DesktopDeckEditor config={deckConfig} onSaved={setDeckConfig} playbackState={playbackState} mediaState={mediaState} isMacos={connection?.isMacos ?? false} plugins={freezePlugins} widgetSurface={connection?.widgetSurface ?? null} /> : screen === 'settings' ? <>
           <div className="page-heading"><div><h1>Settings</h1><p>Manage device navigation and Freeze plugins.</p></div></div>
           <section className="device-navigation-setting">
             <div className="device-navigation-copy"><h2>Independent device navigation</h2><p>Let each connected phone use its own profile and page. Turn this off to mirror navigation across all phones.</p></div>
@@ -595,7 +616,7 @@ function FreezePluginSettings({ plugins, warnings, onChange }: { plugins: Freeze
   </section>;
 }
 
-function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaState, isMacos, plugins }: { config: DeckConfig | null; onSaved: (config: DeckConfig) => void; playbackState: PlaybackState; mediaState: SystemMediaState; isMacos: boolean; plugins: FreezePlugin[] }) {
+function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaState, isMacos, plugins, widgetSurface }: { config: DeckConfig | null; onSaved: (config: DeckConfig) => void; playbackState: PlaybackState; mediaState: SystemMediaState; isMacos: boolean; plugins: FreezePlugin[]; widgetSurface: WidgetSurface | null }) {
   const [workingConfig, setWorkingConfig] = useState<DeckConfig | null>(savedConfig);
   const [profileId, setProfileId] = useState('');
   const [pageId, setPageId] = useState('');
@@ -1321,22 +1342,9 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
               const shown = preview?.placement ?? placement;
               const previewRows = Math.min(shown.rowSpan, widgetScreen.rows - placement.row);
               const previewColumns = Math.min(shown.columnSpan, widgetScreen.columns - placement.column);
-              const previewCells = previewRows * previewColumns;
-              const mediaLayout = previewCells >= 6 ? 'expanded' : previewCells >= 4 ? 'standard' : previewCells >= 2 ? 'wide' : 'compact';
-              const mediaDuration = mediaState.durationMs && mediaState.durationMs > 0 ? mediaState.durationMs : 0;
-              const mediaPosition = Math.max(0, Math.min(mediaDuration, mediaState.positionMs ?? 0));
-              const mediaTime = (milliseconds: number) => `${Math.floor(milliseconds / 60_000)}:${String(Math.floor(milliseconds / 1000) % 60).padStart(2, '0')}`;
+              const phoneGrid = phoneWidgetGrid(page.buttons.length > 0, widgetScreen, itemId, shown);
               return <button key={itemId} type="button" data-deck-item={itemId} data-deck-cell="true" data-surface="widgets" data-row={placement.row} data-column={placement.column} className={`deck-button ${item.type === 'widget' ? 'clock-widget' : ''} ${item.type === 'widget' && item.widget.type === 'now_playing' ? 'now-playing-widget-preview' : ''} ${item.type === 'button' && selected?.id === itemId ? 'selected' : ''} ${item.type === 'widget' && selectedWidget?.id === itemId ? 'selected' : ''} ${dragOverButtonId === itemId ? 'drop-target' : ''} ${draggingButtonId === itemId ? 'dragging' : ''} ${preview && !preview.valid ? 'resize-invalid' : ''}`} style={{ gridColumn: `${placement.column + 1} / span ${Math.min(shown.columnSpan, widgetScreen.columns - placement.column)}`, gridRow: `${placement.row + 1} / span ${Math.min(shown.rowSpan, widgetScreen.rows - placement.row)}` }} onClick={() => item.type === 'button' ? (setWidgetId(''), setButtonId(item.button.id)) : (setButtonId(''), setWidgetId(item.widget.id))} onPointerDown={(event) => item.type === 'button' ? startButtonDrag(event, item.button.id, 'widgets') : startWidgetDrag(event, item.widget.id)} onPointerMove={moveButtonDrag} onPointerUp={finishButtonDrag} onPointerCancel={cancelButtonDrag} onLostPointerCapture={cancelButtonDrag}>
-                {item.type === 'button' ? <><span>{iconForButton(item.button, playbackState)}</span><strong>{buttonLabel(item.button, playbackState)}</strong></> : item.widget.type === 'clock' ? <><span className="clock-widget-icon"><Clock size={18} /></span><strong>{clock.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</strong><small>{clock.toLocaleDateString()}</small></> : item.widget.type === 'now_playing' ? <div className={`now-playing-preview now-playing-preview--${mediaLayout}${previewRows / Math.max(1, previewColumns) >= 0.75 ? ' now-playing-preview--stacked' : ''}`}>
-                  {mediaLayout === 'expanded' && mediaState.artworkDataUrl ? <><span className="now-playing-preview-backdrop"><img src={mediaState.artworkDataUrl} alt="" /></span><span className="now-playing-preview-tint" /></> : null}
-                  <span className="now-playing-preview-art">{mediaState.artworkDataUrl ? <img src={mediaState.artworkDataUrl} alt="" /> : <Music size={19} />}</span>
-                  <div className="now-playing-preview-copy"><strong>{mediaState.title || mediaState.artist || 'No media'}</strong><small>{mediaState.artist || mediaState.album || (mediaState.playbackState === 'unavailable' ? 'Waiting for media' : mediaState.playbackState === 'paused' ? 'Paused' : 'System media')}</small>{mediaLayout === 'expanded' && mediaState.album ? <small className="now-playing-preview-album">{mediaState.album}</small> : null}
-                    <span className="now-playing-preview-progress"><i style={{ width: `${mediaDuration ? Math.min(100, Math.max(0, mediaPosition / mediaDuration * 100)) : 0}%` }} /></span>
-                    {mediaDuration ? <span className="now-playing-preview-times"><small>{mediaTime(mediaPosition)}</small><small>{mediaTime(mediaDuration)}</small></span> : null}
-                    {mediaLayout === 'standard' || mediaLayout === 'expanded' ? <span className="now-playing-preview-controls"><i><SkipBack size={mediaLayout === 'expanded' ? 18 : 15} /></i><i className="primary">{mediaState.playbackState === 'playing' ? <Pause size={mediaLayout === 'expanded' ? 24 : 19} /> : <Play size={mediaLayout === 'expanded' ? 24 : 19} />}</i><i><SkipForward size={mediaLayout === 'expanded' ? 18 : 15} /></i></span> : null}
-                    {mediaLayout === 'expanded' ? <span className="now-playing-preview-volume"><Volume1 size={17} /><i><i style={{ width: `${mediaState.volumePercent ?? 0}%` }} /></i><Volume2 size={17} /><small>{mediaState.volumePercent == null ? '—' : `${mediaState.volumePercent}%`}</small></span> : null}
-                  </div>
-                </div> : item.widget.renderType === 'text' ? <><span className="clock-widget-icon"><Package size={18} /></span><strong>{item.widget.values.title || item.widget.widgetId}</strong><small>{item.widget.values.body || 'Text widget'}</small></> : <><span className="clock-widget-icon"><Package size={18} /></span><strong>Unavailable widget</strong><small>{item.widget.renderType}</small></>}
+                {item.type === 'button' ? <><span>{iconForButton(item.button, playbackState)}</span><strong>{buttonLabel(item.button, playbackState)}</strong></> : item.widget.type === 'clock' ? <><span className="clock-widget-icon"><Clock size={18} /></span><strong>{clock.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</strong><small>{clock.toLocaleDateString()}</small></> : item.widget.type === 'now_playing' ? <NowPlayingPreview media={mediaState} surface={widgetSurface ?? REFERENCE_WIDGET_SURFACE} columns={phoneGrid.columns} rows={phoneGrid.rows} columnSpan={previewColumns} rowSpan={previewRows} /> : item.widget.renderType === 'text' ? <><span className="clock-widget-icon"><Package size={18} /></span><strong>{item.widget.values.title || item.widget.widgetId}</strong><small>{item.widget.values.body || 'Text widget'}</small></> : <><span className="clock-widget-icon"><Package size={18} /></span><strong>Unavailable widget</strong><small>{item.widget.renderType}</small></>}
                 <span className="deck-button-size">{preview ? `${shown.columnSpan}×${shown.rowSpan}` : placement.rowSpan > 1 || placement.columnSpan > 1 ? `${placement.columnSpan}×${placement.rowSpan}` : null}</span>
                 <span className="deck-resize-handle" aria-hidden="true" onPointerDown={(event) => item.type === 'button' ? startResize(event, item.button, 'widgets', 'button') : startResize(event, item.widget, 'widgets', 'widget')} onPointerMove={moveResize} onPointerUp={finishResize} onPointerCancel={cancelResize} onLostPointerCapture={cancelResize} />
               </button>;

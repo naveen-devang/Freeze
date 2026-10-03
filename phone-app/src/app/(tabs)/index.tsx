@@ -9,6 +9,7 @@ import { NavigationBar } from 'expo-navigation-bar';
 import { useCalendars } from 'expo-localization';
 import { SvgXml } from 'react-native-svg';
 import { DeckButton, DeckMediaCommand, DeckWidget, PlaybackState, SystemMediaState, usePcConnection } from '../../connection';
+import { nowPlayingLayout, NowPlayingRow } from '../../now-playing-layout';
 import { buttonPlacement, deckOccupancy, widgetPageOccupancy, WidgetScreenItem } from '../../deck-layout';
 import { colors } from '../../theme';
 import { TabBarHiddenContext } from '../../navigation/tab-bar-context';
@@ -101,11 +102,12 @@ function mediaTimeLabel(milliseconds: number | undefined) {
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
 }
 
-function SystemVolumeSlider({ value, disabled, onChange }: { value?: number; disabled: boolean; onChange: (value: number) => boolean }) {
+function SystemVolumeSlider({ value, disabled, height, controlSize, labelSize, onChange, onInteract, onClose }: { value?: number; disabled: boolean; height: number; controlSize: number; labelSize: number; onChange: (value: number) => boolean; onInteract: () => void; onClose: () => void }) {
   const [width, setWidth] = useState(1);
   const [dragValue, setDragValue] = useState<number | null>(null);
   const dragValueRef = useRef<number | null>(null);
   const currentValue = dragValue ?? value ?? 0;
+  const knob = Math.max(12, height * 0.36);
   useEffect(() => {
     if (dragValue === null) return;
     const timeout = setTimeout(() => setDragValue((current) => current === dragValue ? null : current), value === dragValue ? 0 : 1500);
@@ -115,7 +117,8 @@ function SystemVolumeSlider({ value, disabled, onChange }: { value?: number; dis
     const next = Math.round(Math.max(0, Math.min(1, locationX / width)) * 100);
     dragValueRef.current = next;
     setDragValue(next);
-  }, [width]);
+    onInteract();
+  }, [onInteract, width]);
   // PanResponder runs these callbacks for native gestures, after render; the ref
   // preserves the latest touch value until its release callback commits it.
   // eslint-disable-next-line react-hooks/refs
@@ -127,6 +130,7 @@ function SystemVolumeSlider({ value, disabled, onChange }: { value?: number; dis
     onPanResponderRelease: () => {
       const next = dragValueRef.current;
       dragValueRef.current = null;
+      onInteract();
       if (next !== null) {
         setDragValue(next);
         if (!onChange(next)) setDragValue(null);
@@ -136,44 +140,52 @@ function SystemVolumeSlider({ value, disabled, onChange }: { value?: number; dis
       dragValueRef.current = null;
       setDragValue(null);
     },
-  }), [disabled, onChange, updateFromEvent]);
-  return <View style={[styles.nowPlayingVolume, disabled && styles.nowPlayingVolumeDisabled]}>
-    <Volume1 size={17} color={colors.muted} strokeWidth={1.8} />
+  }), [disabled, onChange, onInteract, updateFromEvent]);
+  return <View style={[styles.nowPlayingVolume, { height, gap: controlSize * 0.3 }, disabled && styles.nowPlayingVolumeDisabled]}>
+    <Pressable onPress={onClose} accessibilityRole="button" accessibilityLabel="Hide volume" style={[styles.nowPlayingControl, styles.nowPlayingVolumeClose, { width: controlSize, height: controlSize }]}>
+      <Volume2 size={controlSize * 0.5} color="#93c5fd" strokeWidth={1.8} />
+    </Pressable>
     <View accessibilityRole="adjustable" accessibilityLabel="System volume" accessibilityValue={{ min: 0, max: 100, now: currentValue }} onAccessibilityAction={(event) => {
       const next = Math.max(0, Math.min(100, currentValue + (event.nativeEvent.actionName === 'increment' ? 5 : -5)));
       setDragValue(null);
+      onInteract();
       onChange(next);
-    }} accessibilityActions={[{ name: 'increment' }, { name: 'decrement' }]} onLayout={(event) => setWidth(Math.max(1, event.nativeEvent.layout.width))} {...responder.panHandlers} style={styles.nowPlayingVolumeTrack}>
+    }} accessibilityActions={[{ name: 'increment' }, { name: 'decrement' }]} onLayout={(event) => setWidth(Math.max(1, event.nativeEvent.layout.width))} {...responder.panHandlers} style={[styles.nowPlayingVolumeTrack, { height }]}>
       <View pointerEvents="none" style={styles.nowPlayingVolumeRail}><View style={[styles.nowPlayingVolumeFill, { width: `${currentValue}%` }]} /></View>
-      <View pointerEvents="none" style={[styles.nowPlayingVolumeThumb, { left: `${currentValue}%` }]} />
+      <View pointerEvents="none" style={[styles.nowPlayingVolumeThumb, { left: `${currentValue}%`, width: knob, height: knob, marginLeft: -knob / 2, borderRadius: knob / 2 }]} />
     </View>
-    <Volume2 size={17} color={colors.muted} strokeWidth={1.8} />
-    <Text style={styles.nowPlayingVolumeLabel}>{value === undefined ? '—' : `${currentValue}%`}</Text>
+    <Text allowFontScaling={false} style={[styles.nowPlayingVolumeLabel, { fontSize: labelSize, minWidth: labelSize * 3.4 }]}>{value === undefined ? '—' : `${currentValue}%`}</Text>
   </View>;
 }
 
-function NowPlayingWidget({ media, immersive = false, connected, sendCommand, sendVolume }: { media: SystemMediaState; immersive?: boolean; rowSpan: number; columnSpan: number; connected: boolean; sendCommand: (command: DeckMediaCommand) => boolean; sendVolume: (volumePercent: number) => boolean }) {
+function NowPlayingWidget({ media, connected, sendCommand, sendVolume }: { media: SystemMediaState; connected: boolean; sendCommand: (command: DeckMediaCommand) => boolean; sendVolume: (volumePercent: number) => boolean }) {
   const [size, setSize] = useState({ width: 0, height: 0 });
-  const width = size.width || 92;
-  const height = size.height || 92;
-  // Choose the presentation from the space the native view actually receives.
-  // Grid spans alone are not reliable: a 2x2 block on a phone can be smaller
-  // than a 1x2 block on a tablet, and immersive mode has a different cell size.
-  const compact = width < 116 || height < 88;
-  const stacked = !compact && height > width * 1.2;
-  const horizontal = !compact && !stacked;
-  const standard = !compact && width >= 190 && height >= (stacked ? 205 : 128);
-  const expanded = standard && width >= (stacked ? 185 : 310) && height >= (stacked ? 310 : 190);
-  const showTimeline = height >= 100 && width >= 112;
+  const [volumeOpen, setVolumeOpen] = useState(false);
+  const volumeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Every size decision comes from the shared layout, which the desktop preview also uses.
+  const layout = nowPlayingLayout(size.width || 92, size.height || 92);
+  const hideVolume = useCallback(() => {
+    if (volumeTimer.current) clearTimeout(volumeTimer.current);
+    volumeTimer.current = null;
+    setVolumeOpen(false);
+  }, []);
+  // The slider hides after 5 seconds without a touch; each interaction restarts the countdown.
+  const keepVolumeOpen = useCallback(() => {
+    if (volumeTimer.current) clearTimeout(volumeTimer.current);
+    volumeTimer.current = setTimeout(hideVolume, 5000);
+  }, [hideVolume]);
+  useEffect(() => () => {
+    if (volumeTimer.current) clearTimeout(volumeTimer.current);
+  }, []);
+  const on = (row: NowPlayingRow) => layout.show.includes(row);
+  const stacked = layout.mode !== 'row';
+  const textAlign = stacked ? 'center' : 'left';
   const hasTrack = Boolean(media.title || media.artist || media.album);
   const supportingText = media.artist || media.album || (media.playbackState === 'unavailable' ? 'Waiting for media' : media.playbackState === 'paused' ? 'Paused' : 'System media');
-  const artCap = compact ? 34 : expanded ? (horizontal ? 420 : 280) : standard ? (horizontal ? 58 : 46) : (horizontal ? 42 : 36);
-  const artSize = Math.max(compact ? 20 : 24, Math.min(artCap, height * (expanded ? (horizontal ? 0.58 : 0.3) : horizontal ? 0.42 : 0.22), width * (expanded ? (horizontal ? 0.32 : 0.5) : horizontal ? 0.24 : 0.42)));
-  const titleSize = Math.max(10, Math.min(expanded ? 34 : 17, width * (compact ? 0.105 : 0.055), height * (compact ? 0.16 : 0.11)));
-  const detailSize = Math.max(8, Math.min(expanded ? 16 : 11, width * 0.032, height * 0.075));
   const duration = media.durationMs && media.durationMs > 0 ? media.durationMs : 0;
   const currentPosition = duration ? Math.max(0, Math.min(duration, media.positionMs ?? 0)) : Math.max(0, media.positionMs ?? 0);
   const progress = duration ? currentPosition / duration : 0;
+  const artRadius = Math.max(5, layout.artSize * 0.13);
   const controlItems: { command: DeckMediaCommand; icon: typeof SkipBack; label: string; prominent?: boolean }[] = [
     { command: 'previous_track', icon: SkipBack, label: 'Previous track' },
     { command: 'play_pause', icon: media.playbackState === 'playing' ? Pause : Play, label: media.playbackState === 'playing' ? 'Pause' : 'Play', prominent: true },
@@ -182,43 +194,44 @@ function NowPlayingWidget({ media, immersive = false, connected, sendCommand, se
   return <View onLayout={(event) => {
     const { width: nextWidth, height: nextHeight } = event.nativeEvent.layout;
     setSize((current) => Math.abs(current.width - nextWidth) < 1 && Math.abs(current.height - nextHeight) < 1 ? current : { width: nextWidth, height: nextHeight });
-  }} style={[styles.nowPlayingWidget, immersive && styles.immersiveNowPlayingWidget, horizontal && styles.nowPlayingHorizontal, stacked && styles.nowPlayingStacked, expanded && styles.nowPlayingExpanded]}>
-    {expanded && media.artworkDataUrl ? <>
+  }} style={styles.nowPlayingWidget}>
+    {media.artworkDataUrl ? <>
       <View pointerEvents="none" style={styles.nowPlayingBackdropFrame}><Image source={{ uri: media.artworkDataUrl }} style={styles.nowPlayingBackdrop} blurRadius={24} resizeMode="cover" /></View>
       <View pointerEvents="none" style={styles.nowPlayingBackdropTint} />
     </> : null}
-    {media.artworkDataUrl ? <Image source={{ uri: media.artworkDataUrl }} style={[styles.nowPlayingArtwork, { width: artSize, height: artSize, borderRadius: Math.max(5, artSize * 0.13) }]} resizeMode="cover" /> : <View style={[styles.nowPlayingFallback, { width: artSize, height: artSize, borderRadius: Math.max(5, artSize * 0.13) }]}><Music size={Math.max(12, artSize * 0.43)} color="#93c5fd" strokeWidth={1.7} /></View>}
-    {compact ? <View style={styles.nowPlayingCompactCopy}>
-      <Text allowFontScaling={false} numberOfLines={1} adjustsFontSizeToFit style={[styles.nowPlayingTitle, { fontSize: titleSize, lineHeight: titleSize * 1.15 }]}>{hasTrack ? media.title || media.artist || media.album : 'No media'}</Text>
-      <Text allowFontScaling={false} numberOfLines={1} style={[styles.nowPlayingDetail, horizontal && styles.nowPlayingHorizontalText, { fontSize: detailSize }]}>{supportingText}</Text>
-      {duration > 0 && showTimeline ? <View style={styles.nowPlayingTimeline}>
-        <View style={[styles.nowPlayingProgressTrack, expanded && styles.nowPlayingExpandedProgressTrack]}><View style={[styles.nowPlayingProgress, { width: `${progress * 100}%` }]} /></View>
-        <View style={styles.nowPlayingTimeLabels}><Text allowFontScaling={false} style={[styles.nowPlayingAlbum, styles.nowPlayingTimeLabel, { fontSize: detailSize * 0.72 }]}>{mediaTimeLabel(currentPosition)}</Text><Text allowFontScaling={false} style={[styles.nowPlayingAlbum, styles.nowPlayingTimeLabel, { fontSize: detailSize * 0.72 }]}>{mediaTimeLabel(duration)}</Text></View>
-      </View> : null}
-    </View> : <View style={[styles.nowPlayingPanel, horizontal && styles.nowPlayingHorizontalCopy]}>
-      <View style={[styles.nowPlayingCopy, horizontal && styles.nowPlayingHorizontalCopy]}>
-        <Text allowFontScaling={false} numberOfLines={expanded ? 2 : 1} adjustsFontSizeToFit style={[styles.nowPlayingTitle, horizontal && styles.nowPlayingHorizontalText, { fontSize: titleSize, lineHeight: titleSize * 1.15 }]}>{hasTrack ? media.title || media.artist || media.album : 'No media'}</Text>
-        <Text allowFontScaling={false} numberOfLines={1} style={[styles.nowPlayingDetail, horizontal && styles.nowPlayingHorizontalText, { fontSize: detailSize }]}>{supportingText}</Text>
-        {expanded && media.album ? <Text allowFontScaling={false} numberOfLines={1} style={[styles.nowPlayingAlbum, horizontal && styles.nowPlayingHorizontalText, { fontSize: detailSize * 0.92 }]}>{media.album}</Text> : null}
+    <View style={[styles.nowPlayingContent, { flexDirection: stacked ? 'column' : 'row', padding: layout.padding, gap: layout.gap }]}>
+      {media.artworkDataUrl ? <Image source={{ uri: media.artworkDataUrl }} style={[styles.nowPlayingArtwork, { width: layout.artSize, height: layout.artSize, borderRadius: artRadius }]} resizeMode="cover" /> : <View style={[styles.nowPlayingFallback, { width: layout.artSize, height: layout.artSize, borderRadius: artRadius }]}><Music size={Math.max(12, layout.artSize * 0.43)} color="#93c5fd" strokeWidth={1.7} /></View>}
+      <View style={[styles.nowPlayingColumn, stacked ? styles.nowPlayingColumnStacked : styles.nowPlayingColumnRow, { gap: layout.gap }]}>
+        <Text allowFontScaling={false} numberOfLines={1} style={[styles.nowPlayingTitle, { fontSize: layout.titleSize, lineHeight: layout.titleSize * 1.25, textAlign }]}>{hasTrack ? media.title || media.artist || media.album : 'No media'}</Text>
+        {on('detail') ? <Text allowFontScaling={false} numberOfLines={1} style={[styles.nowPlayingDetail, { fontSize: layout.detailSize, lineHeight: layout.detailSize * 1.3, textAlign }]}>{supportingText}</Text> : null}
+        {on('album') && media.album && media.album !== supportingText ? <Text allowFontScaling={false} numberOfLines={1} style={[styles.nowPlayingAlbum, { fontSize: layout.detailSize, lineHeight: layout.detailSize * 1.3, textAlign }]}>{media.album}</Text> : null}
+        {on('progress') ? <View style={[styles.nowPlayingProgressRow, { height: layout.barHeight + 2 }]}><View style={[styles.nowPlayingProgressTrack, { height: layout.barHeight }]}><View style={[styles.nowPlayingProgress, { width: `${progress * 100}%` }]} /></View></View> : null}
+        {on('times') && duration > 0 ? <View style={styles.nowPlayingTimeLabels}>
+          <Text allowFontScaling={false} style={[styles.nowPlayingTimeLabel, { fontSize: layout.timeSize, lineHeight: layout.timeSize * 1.3 }]}>{mediaTimeLabel(currentPosition)}</Text>
+          <Text allowFontScaling={false} style={[styles.nowPlayingTimeLabel, { fontSize: layout.timeSize, lineHeight: layout.timeSize * 1.3 }]}>{mediaTimeLabel(duration)}</Text>
+        </View> : null}
+        {on('controls') ? volumeOpen && layout.volumeButton
+          ? <SystemVolumeSlider value={media.volumePercent} disabled={!connected || media.volumePercent === undefined} height={layout.primaryControlSize} controlSize={layout.controlSize} labelSize={layout.timeSize * 1.1} onChange={sendVolume} onInteract={keepVolumeOpen} onClose={hideVolume} />
+          : <View style={[styles.nowPlayingControls, { height: layout.primaryControlSize, gap: layout.gap * 1.3 }]}>
+            {controlItems.map(({ command, icon: Icon, label, prominent }) => {
+              const box = prominent ? layout.primaryControlSize : layout.controlSize;
+              return <Pressable key={command} onPress={() => sendCommand(command)} disabled={!connected} accessibilityRole="button" accessibilityLabel={label} style={({ pressed }) => [styles.nowPlayingControl, prominent && styles.nowPlayingPrimaryControl, { width: box, height: box }, pressed && connected && styles.nowPlayingControlPressed, !connected && styles.nowPlayingControlDisabled]}>
+                <Icon size={box * (prominent ? 0.55 : 0.5)} color={prominent ? colors.text : colors.muted} strokeWidth={1.8} />
+              </Pressable>;
+            })}
+            {layout.volumeButton ? <Pressable onPress={() => { setVolumeOpen(true); keepVolumeOpen(); }} disabled={!connected} accessibilityRole="button" accessibilityLabel="Volume" style={({ pressed }) => [styles.nowPlayingControl, { width: layout.controlSize, height: layout.controlSize }, pressed && connected && styles.nowPlayingControlPressed, !connected && styles.nowPlayingControlDisabled]}>
+              <Volume2 size={layout.controlSize * 0.5} color={colors.muted} strokeWidth={1.8} />
+            </Pressable> : null}
+          </View> : null}
       </View>
-      {duration > 0 && showTimeline ? <View style={styles.nowPlayingTimeline}>
-        <View style={[styles.nowPlayingProgressTrack, expanded && styles.nowPlayingExpandedProgressTrack]}><View style={[styles.nowPlayingProgress, { width: `${progress * 100}%` }]} /></View>
-        <View style={styles.nowPlayingTimeLabels}><Text allowFontScaling={false} style={[styles.nowPlayingAlbum, styles.nowPlayingTimeLabel, { fontSize: detailSize * 0.78 }]}>{mediaTimeLabel(currentPosition)}</Text><Text allowFontScaling={false} style={[styles.nowPlayingAlbum, styles.nowPlayingTimeLabel, { fontSize: detailSize * 0.78 }]}>{mediaTimeLabel(duration)}</Text></View>
-      </View> : null}
-      {standard ? <View style={[styles.nowPlayingControls, expanded && styles.nowPlayingExpandedControls, stacked && styles.nowPlayingStackedControls]}>
-        {controlItems.map(({ command, icon: Icon, label, prominent }) => <Pressable key={command} onPress={() => sendCommand(command)} disabled={!connected} accessibilityRole="button" accessibilityLabel={label} style={({ pressed }) => [styles.nowPlayingControl, prominent && styles.nowPlayingPrimaryControl, pressed && connected && styles.nowPlayingControlPressed, !connected && styles.nowPlayingControlDisabled]}>
-          <Icon size={prominent ? (expanded ? 24 : 19) : (expanded ? 18 : 15)} color={prominent ? colors.text : colors.muted} strokeWidth={1.8} />
-        </Pressable>)}
-      </View> : null}
-      {expanded ? <SystemVolumeSlider value={media.volumePercent} disabled={!connected || media.volumePercent === undefined} onChange={sendVolume} /> : null}
-    </View>}
+    </View>
   </View>;
 }
 
 export default function DeckScreen() {
   const router = useRouter();
   const setTabBarHidden = useContext(TabBarHiddenContext);
-  const { connection, status, playbackState, mediaState, actionError, deckConfig, independentNavigation, selectedProfileId, selectedPageId, sendButton, sendMediaCommand, sendSystemVolume, selectPage } = usePcConnection();
+  const { connection, status, playbackState, mediaState, actionError, deckConfig, independentNavigation, selectedProfileId, selectedPageId, sendButton, sendMediaCommand, sendSystemVolume, selectPage, reportWidgetSurface } = usePcConnection();
   const [feedback, setFeedback] = useState('');
   const [immersive, setImmersive] = useState(false);
   const [showImmersiveTools, setShowImmersiveTools] = useState(false);
@@ -355,6 +368,18 @@ export default function DeckScreen() {
   const immersiveWidgetCellHeight = Math.max(1, (widgetImmersiveHeight - 24 - immersiveGap * (displayWidgetRows - 1)) / displayWidgetRows);
   const immersiveIconSize = Math.min(52, Math.max(26, Math.min(immersiveCellHeight, immersiveCellWidth) * 0.34));
   const immersiveWidgetIconSize = Math.min(52, Math.max(20, Math.min(immersiveWidgetCellHeight, immersiveWidgetCellWidth) * 0.34));
+  // Widget keys inset their content by a 1 px border plus clockWidgetKey's 4 px padding.
+  const widgetKeyInset = 5;
+  const immersiveSurfaceWidth = immersiveSize.width - 24;
+  const immersiveSurfaceHeight = widgetImmersiveHeight - 24;
+  useEffect(() => {
+    if (!showWidgetArea) return;
+    if (immersive) {
+      if (immersiveSurfaceWidth > 0 && immersiveSurfaceHeight > 0) reportWidgetSurface({ width: immersiveSurfaceWidth, height: immersiveSurfaceHeight, gap: immersiveGap, inset: widgetKeyInset, fixedRowHeight: null });
+    } else if (widgetGridWidth > 0) {
+      reportWidgetSurface({ width: widgetGridWidth, height: 0, gap: regularGap, inset: widgetKeyInset, fixedRowHeight: 100 });
+    }
+  }, [immersive, immersiveSurfaceHeight, immersiveSurfaceWidth, reportWidgetSurface, showWidgetArea, widgetGridWidth]);
   const actionErrorText = actionError === 'accessibility_permission_required' ? 'Allow Freeze in Mac Accessibility settings'
     : actionError === 'app_launch_failed' ? 'PC could not launch this app. Check its target path'
     : actionError === 'stale_revision' ? 'Deck changed. Wait for sync, then try again'
@@ -438,7 +463,7 @@ export default function DeckScreen() {
               if (item.type === 'widget') {
                 const placement = item.widget.placement;
                 if (placement.row !== sourceRow || placement.column !== sourceColumn) return null;
-                return <View key={item.widget.id} style={[styles.immersiveKey, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12, 0)]}>{item.widget.type === 'clock' ? <ClockWidget immersive /> : item.widget.type === 'now_playing' ? <NowPlayingWidget media={mediaState} immersive rowSpan={placement.rowSpan} columnSpan={placement.columnSpan} connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} /> : <PluginTextWidget widget={item.widget} immersive />}</View>;
+                return <View key={item.widget.id} style={[styles.immersiveKey, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12, 0)]}>{item.widget.type === 'clock' ? <ClockWidget immersive /> : item.widget.type === 'now_playing' ? <NowPlayingWidget media={mediaState} connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} /> : <PluginTextWidget widget={item.widget} immersive />}</View>;
               }
               const button = item.button;
               const placement = buttonPlacement({ id: widgetScreen.id, name: widgetScreen.name, rows: widgetRows, columns: widgetColumns, buttons: widgetScreen.buttons }, button);
@@ -542,7 +567,7 @@ export default function DeckScreen() {
               if (item.type === 'widget') {
                 const placement = item.widget.placement;
                 if (placement.row !== sourceRow || placement.column !== sourceColumn) return null;
-                return <View key={item.widget.id} style={[styles.key, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, widgetCellWidth, widgetCellHeight)]}>{item.widget.type === 'clock' ? <ClockWidget /> : item.widget.type === 'now_playing' ? <NowPlayingWidget media={mediaState} rowSpan={placement.rowSpan} columnSpan={placement.columnSpan} connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} /> : <PluginTextWidget widget={item.widget} />}</View>;
+                return <View key={item.widget.id} style={[styles.key, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, widgetCellWidth, widgetCellHeight)]}>{item.widget.type === 'clock' ? <ClockWidget /> : item.widget.type === 'now_playing' ? <NowPlayingWidget media={mediaState} connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} /> : <PluginTextWidget widget={item.widget} />}</View>;
               }
               const button = item.button;
               const placement = buttonPlacement({ id: widgetScreen.id, name: widgetScreen.name, rows: widgetRows, columns: widgetColumns, buttons: widgetScreen.buttons }, button);
@@ -584,44 +609,37 @@ const styles = StyleSheet.create({
   pluginWidgetTitle: { width: '100%', flexShrink: 1, color: colors.text, fontWeight: '600', textAlign: 'center', includeFontPadding: false },
   pluginWidgetBody: { width: '100%', flexShrink: 1, color: colors.muted, textAlign: 'center', includeFontPadding: false },
   pluginWidgetUnavailable: { color: colors.muted, fontSize: 10, textAlign: 'center' },
-  nowPlayingWidget: { flex: 1, width: '100%', minWidth: 0, minHeight: 0, flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 5, padding: 4, overflow: 'hidden' },
-  immersiveNowPlayingWidget: { padding: 7, gap: 8 },
-  nowPlayingExpanded: { gap: 10 },
+  nowPlayingWidget: { flex: 1, width: '100%', minWidth: 0, minHeight: 0, overflow: 'hidden', borderRadius: 6 },
+  nowPlayingContent: { flex: 1, minWidth: 0, minHeight: 0, alignItems: 'center', justifyContent: 'center' },
   nowPlayingBackdropFrame: { ...StyleSheet.absoluteFill, overflow: 'hidden' },
   nowPlayingBackdrop: { ...StyleSheet.absoluteFill, opacity: 0.3 },
   nowPlayingBackdropTint: { ...StyleSheet.absoluteFill, backgroundColor: 'rgba(9, 9, 11, 0.78)' },
-  nowPlayingHorizontal: { flexDirection: 'row', alignItems: 'center', justifyContent: 'flex-start', gap: 8, padding: 6 },
-  nowPlayingStacked: { justifyContent: 'center', gap: 7, paddingHorizontal: 8, paddingVertical: 8 },
   nowPlayingArtwork: { flexShrink: 0, backgroundColor: colors.panelRaised },
-  nowPlayingFallback: { alignItems: 'center', justifyContent: 'center', backgroundColor: colors.panelRaised, borderWidth: 1, borderColor: colors.border },
-  nowPlayingCompactCopy: { flex: 1, width: '100%', minWidth: 0, alignItems: 'center', justifyContent: 'center', gap: 2, overflow: 'hidden' },
-  nowPlayingPanel: { flex: 1, width: '100%', minWidth: 0, minHeight: 0, alignItems: 'center', justifyContent: 'center', gap: 4, overflow: 'hidden' },
-  nowPlayingCopy: { width: '100%', minWidth: 0, minHeight: 0, alignItems: 'center', justifyContent: 'center', gap: 2, overflow: 'hidden' },
-  nowPlayingHorizontalCopy: { alignItems: 'flex-start' },
-  nowPlayingHorizontalText: { textAlign: 'left' },
-  nowPlayingTitle: { width: '100%', flexShrink: 1, color: colors.text, fontWeight: '600', textAlign: 'center', includeFontPadding: false },
-  nowPlayingDetail: { width: '100%', color: colors.muted, textAlign: 'center', includeFontPadding: false },
-  nowPlayingAlbum: { width: '100%', color: colors.faint, textAlign: 'center', includeFontPadding: false },
-  nowPlayingTimeline: { width: '100%', gap: 2 },
+  nowPlayingFallback: { flexShrink: 0, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.panelRaised, borderWidth: 1, borderColor: colors.border },
+  nowPlayingColumn: { minWidth: 0, justifyContent: 'center' },
+  nowPlayingColumnStacked: { width: '100%' },
+  nowPlayingColumnRow: { flex: 1 },
+  nowPlayingTitle: { width: '100%', color: colors.text, fontWeight: '600', includeFontPadding: false },
+  nowPlayingDetail: { width: '100%', color: colors.muted, includeFontPadding: false },
+  nowPlayingAlbum: { width: '100%', color: colors.faint, includeFontPadding: false },
+  nowPlayingProgressRow: { width: '100%', justifyContent: 'center' },
+  nowPlayingProgressTrack: { width: '100%', overflow: 'hidden', borderRadius: 3, backgroundColor: colors.border },
+  nowPlayingProgress: { height: '100%', borderRadius: 3, backgroundColor: '#93c5fd' },
   nowPlayingTimeLabels: { width: '100%', flexDirection: 'row', justifyContent: 'space-between' },
-  nowPlayingTimeLabel: { width: 'auto', flexShrink: 0 },
-  nowPlayingControls: { width: '100%', maxWidth: '100%', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8 },
-  nowPlayingExpandedControls: { width: '100%', justifyContent: 'center', gap: 8 },
-  nowPlayingStackedControls: { gap: 8 },
-  nowPlayingVolume: { width: '100%', flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5, paddingHorizontal: 2, marginTop: 0 },
-  nowPlayingVolumeDisabled: { opacity: 0.45 },
-  nowPlayingVolumeTrack: { height: 28, flex: 1, justifyContent: 'center' },
-  nowPlayingVolumeRail: { height: 5, overflow: 'hidden', borderRadius: 4, backgroundColor: colors.border },
-  nowPlayingVolumeFill: { height: '100%', borderRadius: 4, backgroundColor: '#93c5fd' },
-  nowPlayingVolumeThumb: { position: 'absolute', width: 13, height: 13, marginLeft: -6.5, borderRadius: 7, borderWidth: 2, borderColor: colors.text, backgroundColor: '#93c5fd' },
-  nowPlayingVolumeLabel: { minWidth: 28, color: colors.muted, fontSize: 9, fontVariant: ['tabular-nums'], textAlign: 'right' },
-  nowPlayingControl: { width: 30, height: 30, alignItems: 'center', justifyContent: 'center', borderRadius: 9 },
-  nowPlayingPrimaryControl: { width: 36, height: 36, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panelRaised },
+  nowPlayingTimeLabel: { color: colors.faint, fontVariant: ['tabular-nums'], includeFontPadding: false },
+  nowPlayingControls: { width: '100%', flexDirection: 'row', alignItems: 'center', justifyContent: 'center' },
+  nowPlayingControl: { alignItems: 'center', justifyContent: 'center', borderRadius: 9 },
+  nowPlayingPrimaryControl: { borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panelRaised },
   nowPlayingControlPressed: { backgroundColor: colors.border },
   nowPlayingControlDisabled: { opacity: 0.4 },
-  nowPlayingProgressTrack: { width: '100%', height: 3, marginTop: 3, overflow: 'hidden', borderRadius: 3, backgroundColor: colors.border },
-  nowPlayingExpandedProgressTrack: { height: 5 },
-  nowPlayingProgress: { height: '100%', borderRadius: 3, backgroundColor: '#93c5fd' },
+  nowPlayingVolume: { width: '100%', flexDirection: 'row', alignItems: 'center' },
+  nowPlayingVolumeDisabled: { opacity: 0.45 },
+  nowPlayingVolumeClose: { borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panelRaised },
+  nowPlayingVolumeTrack: { flex: 1, justifyContent: 'center' },
+  nowPlayingVolumeRail: { height: 5, overflow: 'hidden', borderRadius: 4, backgroundColor: colors.border },
+  nowPlayingVolumeFill: { height: '100%', borderRadius: 4, backgroundColor: '#93c5fd' },
+  nowPlayingVolumeThumb: { position: 'absolute', borderWidth: 2, borderColor: colors.text, backgroundColor: '#93c5fd' },
+  nowPlayingVolumeLabel: { color: colors.muted, fontVariant: ['tabular-nums'], textAlign: 'right', includeFontPadding: false },
   immersiveEmptyKey: { borderRadius: 10, backgroundColor: 'transparent' },
   immersiveEmptyDeck: { ...StyleSheet.absoluteFill, alignItems: 'center', justifyContent: 'center' },
   immersiveTools: { position: 'absolute', top: 8, left: 20, right: 20, minHeight: 42, flexDirection: 'row', alignItems: 'center', gap: 8, padding: 5, borderRadius: 8, borderWidth: 1, borderColor: colors.border, backgroundColor: 'rgba(24, 24, 27, 0.94)' },
