@@ -627,7 +627,6 @@ async function lookup(track: LyricsTrack, steps: string[], typedTitle?: string):
   const durationMs = track.durationMs;
   const title = normalizeText(track.title ?? '');
   const artist = normalizeText(track.artist ?? '');
-  const album = normalizeText(track.album ?? '');
   // Fallbacks, best first: plain lyrics from a close match, then unsynced text from a looser one.
   let plain: Lyrics | null = null;
   let loosePlain: Lyrics | null = null;
@@ -657,14 +656,10 @@ async function lookup(track: LyricsTrack, steps: string[], typedTitle?: string):
   };
 
   if (!typedTitle) {
+    // Title + artist + length first (LRCLIB allows the length to be off by 2 s), then title + artist alone.
     const exactAttempts: Record<string, string>[] = [];
-    if (artist && durationMs) {
-      const duration = String(Math.round(durationMs / 1000));
-      exactAttempts.push({ track_name: title, artist_name: artist, album_name: album, duration });
-      if (album) exactAttempts.push({ track_name: title, artist_name: artist, duration });
-    } else if (artist) {
-      exactAttempts.push({ track_name: title, artist_name: artist });
-    }
+    if (artist && durationMs) exactAttempts.push({ track_name: title, artist_name: artist, duration: String(Math.round(durationMs / 1000)) });
+    if (artist) exactAttempts.push({ track_name: title, artist_name: artist });
     // An exact match is one entry, and can be the odd one out (a video's timing filed under the song),
     // so it joins the first search's entries and is weighed with them rather than taken on its own.
     let exact: LrclibRecord | null = null;

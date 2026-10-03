@@ -197,7 +197,7 @@ function GapDots({ size, active, rate, startMs, endMs, now, clock, reduceMotion 
   return <Dots size={size} opacities={opacities} scale={active ? Animated.multiply(breath, exit) : 1} />;
 }
 
-function SyncedLyrics({ lines, media, width, height, canSeek, seekMedia, onLongPress, offsetMs, onNudge }: { lines: LyricLine[]; media: SystemMediaState; width: number; height: number; canSeek: boolean; seekMedia: (positionMs: number) => boolean; onLongPress: () => void; offsetMs: number; onNudge: (deltaMs: number) => void }) {
+function SyncedLyrics({ lines, media, width, height, canSeek, seekMedia, onLongPress, offsetMs, onNudge, onResetOffset }: { lines: LyricLine[]; media: SystemMediaState; width: number; height: number; canSeek: boolean; seekMedia: (positionMs: number) => boolean; onLongPress: () => void; offsetMs: number; onNudge: (deltaMs: number) => void; onResetOffset: () => void }) {
   const reduceMotion = useReduceMotion();
   const { compact, fontSize, padding, lineGap, anchorY } = lyricsLayout(width, height);
 
@@ -406,13 +406,15 @@ function SyncedLyrics({ lines, media, width, height, canSeek, seekMedia, onLongP
     resume();
     setTick((value) => value + 1);
   }, [seekMedia, resume]);
-  // Back to exactly what the PC last reported, jumping straight to that line.
+  // A full reset: back to exactly what the PC last reported, with any nudge offset cleared (it is saved
+  // per track, so it would otherwise stay), jumping straight to that line.
   const resync = useCallback(() => {
     anchor.current = { positionMs: reported.current.positionMs ?? 0, at: reported.current.at, rate: reported.current.rate ?? 0 };
     snap.current = true;
     resume();
+    onResetOffset();
     setTick((value) => value + 1);
-  }, [resume]);
+  }, [resume, onResetOffset]);
   const measure = useCallback((index: number, y: number) => {
     if (offsets.current[index] === y) return;
     offsets.current[index] = y;
@@ -441,7 +443,7 @@ function SyncedLyrics({ lines, media, width, height, canSeek, seekMedia, onLongP
         <RepeatButton onStep={() => onNudge(-NUDGE_MS)} label="Show lyrics half a second later" size={icon}>
           <Minus size={icon} color={colors.text} strokeWidth={2} />
         </RepeatButton>
-        <Pressable onPress={resync} onLongPress={onLongPress} hitSlop={6} accessibilityRole="button" accessibilityLabel="Resync lyrics with the PC" style={({ pressed }) => [styles.syncButton, { width: icon + 8, height: icon + 8, opacity: pressed ? 0.9 : 0.45 }]}>
+        <Pressable onPress={resync} onLongPress={onLongPress} hitSlop={6} accessibilityRole="button" accessibilityLabel="Resync lyrics with the PC and clear the offset" style={({ pressed }) => [styles.syncButton, { width: icon + 8, height: icon + 8, opacity: pressed ? 0.9 : 0.45 }]}>
           <RefreshCw size={icon} color={colors.text} strokeWidth={2} />
         </Pressable>
         <RepeatButton onStep={() => onNudge(NUDGE_MS)} label="Show lyrics half a second earlier" size={icon}>
@@ -521,7 +523,7 @@ export function LyricsWidget({ media, connected, seekMedia }: { media: SystemMed
   if (!hasMedia) content = <Message title="Nothing playing" size={messageSize} />;
   else if (lyrics === 'loading') content = <BreathingDots size={messageSize * 0.5} labelSize={messageSize} />;
   // Keyed by track and timing version, so a new song or timing mounts fresh: no scroll from the old position.
-  else if (lines) content = <SyncedLyrics key={`${key}:${picked?.firstMs ?? 'auto'}`} lines={lines} media={media} width={width} height={height} canSeek={canSeek} seekMedia={seekMedia} onLongPress={showDebug} offsetMs={choice.offsetMs} onNudge={nudge} />;
+  else if (lines) content = <SyncedLyrics key={`${key}:${picked?.firstMs ?? 'auto'}`} lines={lines} media={media} width={width} height={height} canSeek={canSeek} seekMedia={seekMedia} onLongPress={showDebug} offsetMs={choice.offsetMs} onNudge={nudge} onResetOffset={resetOffset} />;
   else if (lyrics.kind === 'plain') content = <ScrollView nestedScrollEnabled showsVerticalScrollIndicator={false} contentContainerStyle={{ padding: messageSize }}>
     {versions.length > 0 ? <Text allowFontScaling={false} style={[styles.plainHint, { fontSize: messageSize * 0.8 }]}>Not synced to this video · long-press to pick a timing</Text> : null}
     <Text allowFontScaling={false} onLongPress={showDebug} style={[styles.plain, { fontSize: messageSize * 1.05, lineHeight: messageSize * 1.55 }]}>{lyrics.text}</Text>
