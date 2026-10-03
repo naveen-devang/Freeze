@@ -1,7 +1,7 @@
 // Run: node scripts/check-lyrics.ts
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { activeLineAt, artistMatches, cleanArtist, cleanTitle, isGapLine, lyricsTrackKey, matchContext, normalizeText, parseLrc, pickLooseResult, pickSearchResult, quotedSong, searchQueries, timingVersions, titleMatches, withIntroGap } from '../phone-app/src/lyrics.ts';
+import { activeLineAt, artistMatches, cleanArtist, cleanTitle, isGapLine, latinArtist, latinPart, lyricsTrackKey, matchAlias, matchContext, nativePart, nativeSongTitle, normalizeText, parseLrc, pickLooseResult, pickSearchResult, quotedSong, romanize, searchQueries, soundKey, timingVersions, titleMatches, withIntroGap } from '../phone-app/src/lyrics.ts';
 
 assert.equal(
   readFileSync(new URL('../phone-app/src/lyrics.ts', import.meta.url), 'utf8'),
@@ -210,5 +210,54 @@ assert.equal(firstLine(pick(kissEntries, { title: 'KISS N TELL', artist: 'aespa'
 assert.equal(firstLine(pick(kissEntries.slice(0, 11), { title: "aespa 'KISS N TELL' MV", artist: 'SMTOWN', durationMs: 190_000 })), 8000);
 // A timing starting over a minute late is someone's mistake, not an intro.
 assert.equal(firstLine(pick([...kissEntries.slice(0, 11), kissNTell(166, 75, 100)], { title: "aespa 'KISS N TELL' MV", artist: 'SMTOWN', durationMs: 190_000 })), 8000);
+
+// Song names in another script. Loanword titles are compared by sound: Hangul, kana and Devanagari are
+// spelled out in Latin letters, then reduced to a consonant key both sides share.
+assert.equal(romanize('캐치 캐치'), 'kaechi kaechi');
+assert.equal(romanize('アイドル'), 'aidoru');
+assert.equal(romanize('केसरिया'), 'kasraya');
+assert.equal(romanize('夜に駆ける'), null);
+for (const [native, english] of [['캐치 캐치', 'Catch Catch'], ['하입보이', 'Hype Boy'], ['해야', 'HEYA'], ['뚜두뚜두', 'DDU-DU DDU-DU'], ['넥스트 레벨', 'Next Level'], ['러브 다이브', 'LOVE DIVE'], ['アイドル', 'Idol'], ['केसरिया', 'Kesariya']]) {
+  assert.equal(soundKey(romanize(native) ?? ''), soundKey(english), `${native} ~ ${english}`);
+}
+for (const [native, other] of [['좋은 날', 'Good Day'], ['캐치 캐치', 'SMILEY'], ['넥스트 레벨', 'Lucid Dream']]) {
+  assert.notEqual(soundKey(romanize(native) ?? ''), soundKey(other), `${native} !~ ${other}`);
+}
+// Titles in two scripts split into halves.
+assert.equal(latinPart('좋은 날(Good Day)'), 'Good Day');
+assert.equal(latinPart('해야 (HEYA)'), 'HEYA');
+assert.equal(latinPart('뚜두뚜두_DDU-DU DDU-DU'), 'DDU-DU DDU-DU');
+assert.equal(latinPart('YENA(최예나)'), 'YENA');
+assert.equal(latinPart('캐치 캐치'), '');
+assert.equal(nativePart('해야 (HEYA)'), '해야');
+// The song name and the artist's Latin name, from the video title before the channel.
+assert.equal(nativeSongTitle({ title: "YENA(최예나) - '캐치 캐치' M/V" }), '캐치 캐치');
+assert.equal(nativeSongTitle({ title: '[MV] IU(아이유) _ 좋은 날(Good Day)' }), '좋은 날(Good Day)');
+assert.equal(nativeSongTitle({ title: 'Blinding Lights' }), null);
+assert.equal(latinArtist({ title: "YENA(최예나) - '캐치 캐치' M/V", artist: 'YENA(최예나)' }), 'YENA');
+assert.equal(latinArtist({ title: '[MV] IU(아이유) _ 좋은 날(Good Day)', artist: '1theK (원더케이)' }), 'IU');
+assert.equal(latinArtist({ title: '좋은 날', artist: 'IU' }), 'IU');
+
+// Finding the Latin title among the artist's songs, only when exactly one fits.
+const yenaSongs = [{ title: 'SMILEY (feat. BIBI)', durationS: 174 }, { title: 'Catch Catch', durationS: 180 }, { title: 'Catch Catch', durationS: 189 }, { title: 'NEMONEMO', durationS: 178 }];
+assert.deepEqual(matchAlias('캐치 캐치', yenaSongs, 205_000), { title: 'Catch Catch', how: 'sounds the same (kaechi kaechi)' });
+assert.deepEqual(matchAlias('해야', [{ title: '해야 (HEYA)', durationS: 189 }, { title: 'LOVE DIVE', durationS: 177 }]), { title: 'HEYA', how: 'title in both scripts' });
+// A short sound key ("해야" has none) needs a fitting length too, and a unique one.
+assert.equal(matchAlias('해야', [{ title: 'HEYA', durationS: 189 }, { title: 'After LIKE', durationS: 177 }]), null);
+assert.equal(matchAlias('해야', [{ title: 'HEYA', durationS: 189 }, { title: 'After LIKE', durationS: 177 }], 190_000)?.title, 'HEYA');
+assert.equal(matchAlias('해야', [{ title: 'HEYA', durationS: 189 }, { title: 'Aye', durationS: 190 }], 190_000), null);
+// A real translation only by a unique catalogued length.
+const iuSongs = [{ title: 'Good Day', durationS: 234 }, { title: 'BBIBBI', durationS: 208 }, { title: 'Love wins all', durationS: 271 }];
+assert.equal(matchAlias('좋은 날', iuSongs, 236_000), null);
+assert.deepEqual(matchAlias('좋은 날', iuSongs, 236_000, [233.52]), { title: 'Good Day', how: 'same length as the recording under its native title' });
+assert.equal(matchAlias('좋은 날', [...iuSongs, { title: 'Ending Scene', durationS: 233 }], 236_000, [233.52]), null);
+
+// "A - B" where A is the artist in another script: a song named like A must not stand in, unsynced, for B.
+const iuWrong = { trackName: '아이유', artistName: 'IU', duration: 200, syncedLyrics: '[00:01.00] Woogie on and on\n[00:02.00] Two\n[00:03.00] Three', plainLyrics: 'Woogie on and on\nTwo\nThree' };
+assert.equal(loosePick([iuWrong], { title: '아이유 - 좋은 날', artist: 'IU', durationMs: 234_000 }), null);
+assert.equal(pick([iuWrong], { title: '아이유 - 좋은 날', artist: 'IU' }), null);
+// The found Latin title counts as the song's title when checking results.
+assert.ok(titleMatches({ trackName: 'Catch Catch' }, matchContext({ title: "YENA(최예나) - '캐치 캐치' M/V" }, { title: 'Catch Catch', artist: 'YENA' }), true));
+assert.equal(cleanTitle('[MV] IU(아이유) _ 좋은 날(Good Day)'), 'IU(아이유) - 좋은 날(Good Day)');
 
 console.log('lyrics checks passed');

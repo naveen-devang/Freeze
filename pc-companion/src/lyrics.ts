@@ -134,7 +134,8 @@ const BRACKETED = /\s*[([][^)\]]*[)\]]/g;
 // Strips video-style decoration: 'Full Video: Song (From "Film") | Actor | #tag [4K] ft. X' -> "Song".
 export function cleanTitle(title: string): string {
   const firstSegment = normalizeText(title).replace(EMOJI, '').replace(HASHTAGS, ' ').split('|').map((part) => part.trim()).find(Boolean) ?? '';
-  return firstSegment.replace(VIDEO_PREFIX, '').replace(TITLE_NOISE, '').replace(FROM_FILM, '').replace(FEATURING, '').replace(/\s+/g, ' ').trim().replace(TRAILING_NOISE, '').trim();
+  // " _ " separates artist and song like " - " does ("[MV] IU(아이유) _ 좋은 날").
+  return firstSegment.replace(/\s+_\s+/g, ' - ').replace(VIDEO_PREFIX, '').replace(TITLE_NOISE, '').replace(FROM_FILM, '').replace(FEATURING, '').replace(/\s+/g, ' ').trim().replace(TRAILING_NOISE, '').trim();
 }
 
 // "ArtistVEVO", "Artist - Topic" and "Artist Official" are channel names, not artists.
@@ -211,32 +212,159 @@ const comparable = (text: string) => normalizeText(text).toLowerCase().replace(/
 const squash = (text: string) => comparable(text).replace(/ /g, '');
 const ARTIST_SEPARATOR = /\s*(?:,|&|;|\/|×|、|및|\sx\s|\sand\s|\swith\s|\svs\.?\s|\sfeat\.?\s|\sft\.?\s|\sfeaturing\s)\s*/i;
 
+// Letters of the scripts a song name can arrive in instead of its Latin title: Hangul (and its jamo),
+// kana, CJK ideographs and Devanagari.
+const NATIVE_LETTER = /[가-힣ㄱ-ㆎぁ-ヿ㐀-鿿ऄ-ॿ]/;
+const NATIVE_LETTERS = /[가-힣ㄱ-ㆎぁ-ヿ㐀-鿿ऄ-ॿ]+/g;
+
+export const hasNativeScript = (text: string) => NATIVE_LETTER.test(text);
+
+// The Latin half of a title written in two scripts: "해야 (HEYA)" -> "HEYA", "YENA(최예나)" -> "YENA".
+export function latinPart(text: string): string {
+  const latin = normalizeText(text).replace(NATIVE_LETTERS, ' ').replace(/[_|]/g, ' ').replace(/[([]\s*[)\]]/g, ' ')
+    .replace(/\s+/g, ' ').replace(/^[\s\-–—:.,/]+|[\s\-–—:.,/]+$/g, '').trim()
+    // "좋은 날(Good Day)" leaves "(Good Day)": brackets around the whole half go too.
+    .replace(/^[([]\s*([^()[\]]*?)\s*[)\]]$/, '$1');
+  return /[a-z]{2}/i.test(latin) ? latin : '';
+}
+
+// The native-script half: "해야 (HEYA)" -> "해야".
+export function nativePart(text: string): string {
+  return (normalizeText(text).match(NATIVE_LETTERS) ?? []).join(' ');
+}
+
+// Hangul syllables are an initial, a vowel and a final consonant, encoded arithmetically from U+AC00.
+const HANGUL_INITIALS = ['g', 'kk', 'n', 'd', 'tt', 'r', 'm', 'b', 'pp', 's', 'ss', '', 'j', 'jj', 'ch', 'k', 't', 'p', 'h'];
+const HANGUL_VOWELS = ['a', 'ae', 'ya', 'yae', 'eo', 'e', 'yeo', 'ye', 'o', 'wa', 'wae', 'oe', 'yo', 'u', 'wo', 'we', 'wi', 'yu', 'eu', 'ui', 'i'];
+const HANGUL_FINALS = ['', 'k', 'k', 'k', 'n', 'n', 'n', 't', 'l', 'k', 'm', 'l', 'l', 'l', 'p', 'l', 'm', 'p', 'p', 't', 't', 'ng', 't', 't', 'k', 't', 'p', 't'];
+// Hiragana; katakana is mapped onto it first. Small っ doubles the next consonant, which the sound key ignores anyway.
+const KANA: Record<string, string> = Object.fromEntries(('あa いi うu えe おo かka きki くku けke こko がga ぎgi ぐgu げge ごgo ' +
+  'さsa しshi すsu せse そso ざza じji ずzu ぜze ぞzo たta ちchi つtsu てte とto だda ぢji づzu でde どdo ' +
+  'なna にni ぬnu ねne のno はha ひhi ふfu へhe ほho ばba びbi ぶbu べbe ぼbo ぱpa ぴpi ぷpu ぺpe ぽpo ' +
+  'まma みmi むmu めme もmo やya ゆyu よyo らra りri るru れre ろro わwa ゐi ゑe をo んn ゔvu ' +
+  'ぁa ぃi ぅu ぇe ぉo ゃya ゅyu ょyo ゎwa っ').split(' ').map((pair) => [pair[0], pair.slice(1)]));
+const DEVANAGARI: Record<string, string> = {
+  'क': 'k', 'ख': 'kh', 'ग': 'g', 'घ': 'gh', 'ङ': 'n', 'च': 'ch', 'छ': 'chh', 'ज': 'j', 'झ': 'jh', 'ञ': 'n',
+  'ट': 't', 'ठ': 'th', 'ड': 'd', 'ढ': 'dh', 'ण': 'n', 'त': 't', 'थ': 'th', 'द': 'd', 'ध': 'dh', 'न': 'n',
+  'प': 'p', 'फ': 'ph', 'ब': 'b', 'भ': 'bh', 'म': 'm', 'य': 'y', 'र': 'r', 'ल': 'l', 'व': 'v', 'श': 'sh',
+  'ष': 'sh', 'स': 's', 'ह': 'h', 'ळ': 'l',
+};
+
+// Spells Hangul, kana and Devanagari out in Latin letters by sound, so loanword titles can be compared
+// with their English names ("캐치 캐치" -> "kaechi kaechi"). Null when the text holds ideographs, whose
+// readings need a dictionary.
+export function romanize(text: string): string | null {
+  let out = '';
+  for (const ch of normalizeText(text)) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (code >= 0xac00 && code <= 0xd7a3) {
+      const index = code - 0xac00;
+      out += HANGUL_INITIALS[Math.floor(index / 588)] + HANGUL_VOWELS[Math.floor((index % 588) / 28)] + HANGUL_FINALS[index % 28];
+    } else if (code >= 0x3041 && code <= 0x30ff) {
+      // Katakana sits 0x60 above hiragana; the long-vowel mark adds no consonant.
+      const hiragana = code >= 0x30a1 && code <= 0x30f6 ? String.fromCodePoint(code - 0x60) : ch;
+      out += KANA[hiragana] ?? '';
+    } else if (code >= 0x0900 && code <= 0x097f) {
+      // Vowel letters and signs carry no consonant; anusvara and chandrabindu are nasal.
+      out += DEVANAGARI[ch] ?? (code === 0x0901 || code === 0x0902 ? 'n' : (code >= 0x0904 && code <= 0x0914) || (code >= 0x093e && code <= 0x094c) ? 'a' : '');
+    } else if ((code >= 0x3400 && code <= 0x9fff) || (code >= 0x1100 && code <= 0x11ff) || (code >= 0x3131 && code <= 0x318e)) {
+      return null;
+    } else out += ch;
+  }
+  return out;
+}
+
+// A loose sound key: consonants only, with the ones scripts swap for each other merged (c/k/g/q, b/p/f/v,
+// d/t/th, l/r, ch/j/sh/z), vowels and h/w/y dropped, repeats collapsed. "Catch Catch" and "kaechi kaechi"
+// both give KCKC; "Good Day" (KT) and "joteun nal" (CTnR) do not meet.
+export function soundKey(text: string): string {
+  return text.toLowerCase().replace(/[^a-z]/g, '')
+    .replace(/tch|ch|sh|zh|j|z/g, 'C')
+    .replace(/ck|q|g|k|c(?![eiy])/g, 'K').replace(/c/g, 's')
+    .replace(/ph|f|v|b|p/g, 'P')
+    .replace(/th|d|t/g, 'T')
+    .replace(/l|r/g, 'R')
+    .replace(/x/g, 'Ks')
+    .replace(/[aeiouyhw]/g, '')
+    .replace(/(.)\1+/g, '$1');
+}
+
+export type AliasCandidate = { title: string; durationS?: number };
+export type Alias = { title: string; how: string };
+
+// Keys this short ("해야" -> "", "하입보이" -> "P") are too common to trust on sound alone.
+const MIN_SOUND_KEY = 3;
+const SAME_LENGTH_S = 2;
+
+// Whether a song this long can be the track playing: the same length, or a video up to 90 s longer.
+function fitsTrack(durationS: number | undefined, durationMs: number | undefined) {
+  if (durationS === undefined || !durationMs) return false;
+  const gap = durationMs / 1000 - durationS;
+  return Math.abs(gap) <= DURATION_TOLERANCE_S || (gap > 0 && gap <= LOOSE_DURATION_TOLERANCE_S);
+}
+
+// Finds the Latin title a native-script song name stands for among the artist's songs, strongest evidence
+// first, and only when exactly one song fits:
+// 1. a title written in both scripts ("해야 (HEYA)");
+// 2. the same sound ("캐치 캐치" ~ "Catch Catch"), with short sound keys also needing a fitting length;
+// 3. the same length as a recording catalogued under the native title, for real translations ("좋은 날" = "Good Day").
+export function matchAlias(native: string, candidates: AliasCandidate[], durationMs?: number, nativeLengthsS: number[] = []): Alias | null {
+  const wanted = comparable(native);
+  const latinOf = (candidate: AliasCandidate) => cleanTitle(latinPart(candidate.title));
+  const only = (list: AliasCandidate[]) => {
+    const titles = [...new Map(list.map((candidate) => [comparable(latinOf(candidate)), latinOf(candidate)])).values()].filter(Boolean);
+    return titles.length === 1 ? titles[0] : null;
+  };
+  const bilingual = only(candidates.filter((candidate) => latinOf(candidate) && comparable(nativePart(candidate.title)) === wanted));
+  if (bilingual) return { title: bilingual, how: 'title in both scripts' };
+  const spelled = romanize(native);
+  if (spelled) {
+    const key = soundKey(spelled);
+    const sounding = candidates.filter((candidate) => latinOf(candidate) && !hasNativeScript(candidate.title) && soundKey(latinOf(candidate)) === key);
+    const title = only(key.length >= MIN_SOUND_KEY ? sounding : sounding.filter((candidate) => fitsTrack(candidate.durationS, durationMs)));
+    if (title) return { title, how: `sounds the same (${spelled.trim()})` };
+  }
+  const sameLength = candidates.filter((candidate) => latinOf(candidate) && candidate.durationS !== undefined &&
+    nativeLengthsS.some((length) => Math.abs(length - (candidate.durationS ?? 0)) <= SAME_LENGTH_S));
+  const title = only(sameLength);
+  return title ? { title, how: 'same length as the recording under its native title' } : null;
+}
+
 // What a result is checked against: everything the PC reported about the track.
-export type MatchContext = { durationMs?: number; titles: string[]; text: string; artists: string[]; videoTitle: boolean };
+// `titles` are every reading of the song name; `strongTitles` leave out the left half of "A - B", which is
+// as often the artist ("아이유 - 좋은 날") as the song ("Kesariya - Brahmāstra").
+export type MatchContext = { durationMs?: number; titles: string[]; strongTitles: string[]; text: string; artists: string[]; videoTitle: boolean };
 
 // Words that mark a music video upload rather than the song itself.
 const VIDEO_MARKERS = /(?:^|[\s([\-–—:|])(?:m\/v|mv|music video|official video|performance video|special video|lyrics? video|visuali[sz]er|dance practice)(?=$|[\s)\].,:|!\-–—])/i;
 
-export function matchContext(track: LyricsTrack): MatchContext {
+// `alias` is the song's Latin title and artist when the PC reported them in another script.
+export function matchContext(track: LyricsTrack, alias?: { title: string; artist?: string }): MatchContext {
   const quoted = quotedSong(track.title ?? '');
   const title = cleanTitle(track.title ?? '');
   const dash = title.match(/^(.+?)\s+[-–—]\s+(.+)$/);
   const artist = cleanArtist(track.artist ?? '');
   return {
     durationMs: track.durationMs,
-    titles: [title, quoted?.title, dash?.[1], dash?.[2]].filter((value): value is string => Boolean(value)).map((value) => comparable(cleanTitle(value))),
+    titles: [title, quoted?.title, dash?.[1], dash?.[2], alias?.title].filter((value): value is string => Boolean(value)).map((value) => comparable(cleanTitle(value))),
+    strongTitles: [title, quoted?.title, dash?.[2], alias?.title].filter((value): value is string => Boolean(value)).map((value) => comparable(cleanTitle(value))),
     // Title, channel and album together: an artist named anywhere in them counts ("Song | Arijit Singh" on a label's channel).
-    text: ` ${comparable([track.title, track.artist, track.album].filter(Boolean).join(' '))} `,
-    artists: [artist, quoted?.artist, dash?.[1]].filter((value): value is string => Boolean(value)).map(squash).filter((value) => value.length >= 2),
+    text: ` ${comparable([track.title, track.artist, track.album, alias?.title, alias?.artist].filter(Boolean).join(' '))} `,
+    artists: [artist, quoted?.artist, dash?.[1], alias?.artist].filter((value): value is string => Boolean(value)).map(squash).filter((value) => value.length >= 2),
     videoTitle: VIDEO_MARKERS.test(normalizeText(track.title ?? '')),
   };
 }
 
 // The result's title once both are cleaned up: 'Song (From "Film")' is "Song", but "Song (Dance Mix)" is
 // another version. A title of 3+ characters found whole inside a video title counts too.
-export function titleMatches(record: LrclibRecord, context: MatchContext) {
-  const found = typeof record.trackName === 'string' ? comparable(cleanTitle(record.trackName)) : '';
-  return Boolean(found) && (context.titles.includes(found) || (found.length >= 3 && context.text.includes(` ${found} `)));
+// A title in both scripts ("해야 (HEYA)") matches either half. `strong` accepts only the song name's
+// firm readings, for matches no length backs up.
+export function titleMatches(record: LrclibRecord, context: MatchContext, strong = false) {
+  const raw = typeof record.trackName === 'string' ? record.trackName : '';
+  const found = comparable(cleanTitle(raw));
+  const titles = strong ? context.strongTitles : context.titles;
+  const halves = [comparable(cleanTitle(latinPart(raw))), comparable(nativePart(raw))].filter((half) => half && half !== found);
+  return Boolean(found) && (titles.includes(found) || halves.some((half) => titles.includes(half)) || (!strong && found.length >= 3 && context.text.includes(` ${found} `)));
 }
 
 // Any of the result's artists is named in what the PC reported. Latin names must match whole words;
@@ -254,7 +382,7 @@ export function artistMatches(record: LrclibRecord, context: MatchContext) {
 const durationGap = (record: LrclibRecord, durationMs?: number) => !durationMs ? 0 : typeof record.duration === 'number' ? Math.abs(record.duration - durationMs / 1000) : Infinity;
 const KIND_RANK: Record<Lyrics['kind'], number> = { synced: 0, instrumental: 1, plain: 2, none: 3, error: 3 };
 
-type Rated = { lyrics: Lyrics; gap: number; listedS?: number; title: boolean; artist: boolean };
+type Rated = { lyrics: Lyrics; gap: number; listedS?: number; title: boolean; strongTitle: boolean; artist: boolean };
 
 function rate(results: LrclibRecord[], context: MatchContext): Rated[] {
   return results.flatMap((record) => {
@@ -262,7 +390,7 @@ function rate(results: LrclibRecord[], context: MatchContext): Rated[] {
     // Synced lines running past the end of the track belong to a longer version.
     if (!lyrics || (lyrics.kind === 'synced' && context.durationMs && lyrics.lines[lyrics.lines.length - 1].timeMs > context.durationMs + 5000)) return [];
     const listedS = typeof record.duration === 'number' ? record.duration : undefined;
-    return [{ lyrics, gap: durationGap(record, context.durationMs), listedS, title: titleMatches(record, context), artist: artistMatches(record, context) }];
+    return [{ lyrics, gap: durationGap(record, context.durationMs), listedS, title: titleMatches(record, context), strongTitle: titleMatches(record, context, true), artist: artistMatches(record, context) }];
   }).sort((a, b) => Number(b.artist) - Number(a.artist) || Number(b.title) - Number(a.title) || KIND_RANK[a.lyrics.kind] - KIND_RANK[b.lyrics.kind] || a.gap - b.gap);
 }
 
@@ -312,8 +440,8 @@ export function pickSearchResult(results: LrclibRecord[], context: MatchContext)
   const rated = rate(results, context);
   const strict = rated.filter((entry) => context.durationMs
     ? entry.gap <= DURATION_TOLERANCE_S && (entry.title || entry.artist)
-    : entry.title && entry.artist);
-  const strong = rated.filter((entry) => entry.title && entry.artist);
+    : entry.strongTitle && entry.artist);
+  const strong = rated.filter((entry) => entry.strongTitle && entry.artist);
   const versions = timingVersions(syncedLines([...new Set([...strict, ...strong])]));
   if (versions.length > 1 && isVideo(context, strong)) {
     const usual = versions[0];
@@ -337,7 +465,7 @@ export function pickSearchResult(results: LrclibRecord[], context: MatchContext)
 // match within 90 s, shown unsynced because its timing would be off. Its timing versions come along,
 // so the widget can still offer them.
 export function pickLooseResult(results: LrclibRecord[], context: MatchContext): Lyrics | null {
-  const matching = rate(results, context).filter((entry) => entry.title && entry.artist);
+  const matching = rate(results, context).filter((entry) => entry.strongTitle && entry.artist);
   const versions = timingVersions(syncedLines(matching));
   const near = matching.filter((entry) => entry.gap <= LOOSE_DURATION_TOLERANCE_S).sort((a, b) => a.gap - b.gap);
   for (const entry of near) {
@@ -355,11 +483,20 @@ class RetriableError extends Error {
   }
 }
 
-// LRCLIB answers 503 now and then: up to three attempts, waiting 1 s then 3 s, or as long as it asks.
-async function getJson(path: string, params: Record<string, string>, steps: string[]): Promise<unknown> {
+const DEEZER = 'https://api.deezer.com';
+const MUSICBRAINZ = 'https://musicbrainz.org/ws/2';
+// MusicBrainz asks for an identifying User-Agent. Browsers (the desktop preview) don't allow setting one.
+const IS_REACT_NATIVE = typeof navigator !== 'undefined' && navigator.product === 'ReactNative';
+const MUSICBRAINZ_HEADERS: Record<string, string> = IS_REACT_NATIVE ? { 'User-Agent': 'Freeze/1.0 (https://github.com/naveen-devang/Freeze)', Accept: 'application/json' } : { Accept: 'application/json' };
+
+// Built by hand: React Native's URLSearchParams has been incomplete across versions.
+const queryString = (params: Record<string, string>) => Object.entries(params).map(([key, value]) => `${key}=${encodeURIComponent(value)}`).join('&');
+
+// These services answer an error now and then: up to three attempts, waiting 1 s then 3 s, or as long as asked.
+async function getJson(url: string, steps: string[], headers: Record<string, string> = HEADERS): Promise<unknown> {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      return await getJsonOnce(path, params);
+      return await getJsonOnce(url, headers);
     } catch (error) {
       const delay = RETRY_DELAYS_MS[attempt];
       if (delay === undefined || !(error instanceof RetriableError)) throw error;
@@ -370,23 +507,22 @@ async function getJson(path: string, params: Record<string, string>, steps: stri
   }
 }
 
-async function getJsonOnce(path: string, params: Record<string, string>): Promise<unknown> {
+async function getJsonOnce(url: string, headers: Record<string, string>): Promise<unknown> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const host = url.split('/')[2];
   try {
-    // Built by hand: React Native's URLSearchParams has been incomplete across versions.
-    const query = Object.entries(params).map(([key, value]) => `${key}=${encodeURIComponent(value)}`).join('&');
     let response: Response;
     try {
-      response = await fetch(`${API}${path}?${query}`, { headers: HEADERS, signal: controller.signal });
+      response = await fetch(url, { headers, signal: controller.signal });
     } catch {
-      throw new RetriableError(controller.signal.aborted ? 'timed out' : 'network error');
+      throw new RetriableError(`${host} ${controller.signal.aborted ? 'timed out' : 'could not be reached'}`);
     }
     if (response.status === 429 || response.status >= 500) {
       const retryAfter = Number(response.headers.get('retry-after'));
-      throw new RetriableError(`LRCLIB responded ${response.status}`, Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : undefined);
+      throw new RetriableError(`${host} responded ${response.status}`, Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : undefined);
     }
-    // 404 is "no match"; any other 4xx means LRCLIB can't answer this request, which counts the same.
+    // 404 is "no match"; any other 4xx means the service can't answer this request, which counts the same.
     if (!response.ok) return null;
     return await response.json();
   } finally {
@@ -394,9 +530,100 @@ async function getJsonOnce(path: string, params: Record<string, string>): Promis
   }
 }
 
+const lrclib = (path: string, params: Record<string, string>, steps: string[]) => getJson(`${API}${path}?${queryString(params)}`, steps);
 const describe = (params: Record<string, string>) => Object.entries(params).map(([key, value]) => `${key}="${value}"`).join(' ');
+const records = (value: unknown) => Array.isArray(value) ? value as LrclibRecord[] : [];
+// Deezer reports errors (quota, unknown query) inside a 200 response, so anything without `data` is empty.
+const deezerItems = (value: unknown) => value && typeof value === 'object' && Array.isArray((value as { data?: unknown }).data) ? (value as { data: Record<string, unknown>[] }).data : [];
 
-async function lookup(track: LyricsTrack, steps: string[]): Promise<Lyrics> {
+// The song name as the PC reported it, when it is in another script: the quoted name of a video title,
+// else whichever half of "A - B" carries the script, else the whole cleaned title.
+export function nativeSongTitle(track: LyricsTrack): string | null {
+  const title = cleanTitle(track.title ?? '');
+  const dash = title.match(/^(.+?)\s+[-–—]\s+(.+)$/);
+  const options = [quotedSong(track.title ?? '')?.title, dash?.[2], dash?.[1], title];
+  return options.find((option): option is string => Boolean(option) && hasNativeScript(option ?? '') && nativePart(option ?? '') !== '') ?? null;
+}
+
+// The artist's Latin name, from the video title before the channel (a label's channel names no artist):
+// "YENA(최예나)" -> "YENA", "[MV] IU(아이유) _ 좋은 날" on 1theK -> "IU".
+export function latinArtist(track: LyricsTrack): string | null {
+  const title = cleanTitle(track.title ?? '');
+  const options = [quotedSong(track.title ?? '')?.artist, title.match(/^(.+?)\s+[-–—]\s+/)?.[1], track.artist];
+  for (const option of options) {
+    const latin = option ? cleanArtist(latinPart(option)) : '';
+    if (latin) return latin;
+  }
+  return null;
+}
+
+// Finds the Latin title of a song the PC reported in another script, from the artist's songs on LRCLIB
+// and Deezer, and lengths catalogued on MusicBrainz. Each source that fails is skipped.
+async function findAlias(track: LyricsTrack, native: string, artist: string, steps: string[]): Promise<Alias | null> {
+  const artistContext = matchContext({ artist });
+  const candidates: AliasCandidate[] = [];
+  const add = (title: unknown, durationS: unknown) => {
+    if (typeof title === 'string' && title) candidates.push({ title, durationS: typeof durationS === 'number' ? durationS : undefined });
+  };
+  const sources: [string, () => Promise<void>][] = [
+    ['LRCLIB', async () => {
+      for (const record of records(await lrclib('/search', { q: artist }, steps))) if (artistMatches(record, artistContext)) add(record.trackName, record.duration);
+    }],
+    ['Deezer', async () => {
+      // Titles stored in both scripts turn up when searching with the native one.
+      for (const item of deezerItems(await getJson(`${DEEZER}/search?${queryString({ q: `${artist} ${native}` })}`, steps, {}))) {
+        const name = (item.artist as { name?: unknown } | undefined)?.name;
+        if (typeof name === 'string' && artistMatches({ artistName: name }, artistContext)) add(item.title, item.duration);
+      }
+      const found = deezerItems(await getJson(`${DEEZER}/search/artist?${queryString({ q: artist })}`, steps, {}))
+        .find((item) => typeof item.name === 'string' && comparable(item.name) === comparable(artist));
+      if (found && (typeof found.id === 'number' || typeof found.id === 'string')) {
+        for (const item of deezerItems(await getJson(`${DEEZER}/artist/${found.id}/top?limit=100`, steps, {}))) add(item.title, item.duration);
+      }
+    }],
+  ];
+  for (const [name, load] of sources) {
+    try {
+      await load();
+    } catch (error) {
+      steps.push(`  ${name} skipped: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  let alias = matchAlias(native, candidates, track.durationMs);
+  if (!alias) {
+    // MusicBrainz sometimes lists a song's other names on its work: 밤편지 is "Through the Night".
+    try {
+      const result = await getJson(`${MUSICBRAINZ}/work?${queryString({ query: `work:"${native.replace(/"/g, '')}"`, fmt: 'json', limit: '5' })}`, steps, MUSICBRAINZ_HEADERS);
+      const works = result && typeof result === 'object' && Array.isArray((result as { works?: unknown }).works) ? (result as { works: { title?: unknown; aliases?: { name?: unknown }[] }[] }).works : [];
+      const names = works.filter((work) => typeof work.title === 'string' && comparable(work.title) === comparable(native))
+        .flatMap((work) => (work.aliases ?? []).flatMap((entry) => typeof entry.name === 'string' && latinPart(entry.name) ? [cleanTitle(latinPart(entry.name))] : []));
+      // Only a name the artist actually has a song under: works are shared by every cover and namesake.
+      const known = candidates.filter((candidate) => names.some((name) => comparable(name) === comparable(cleanTitle(latinPart(candidate.title)))));
+      const distinct = [...new Set(known.map((candidate) => cleanTitle(latinPart(candidate.title))))];
+      if (distinct.length === 1) alias = { title: distinct[0], how: 'another name for it on MusicBrainz' };
+    } catch (error) {
+      steps.push(`  MusicBrainz names skipped: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (!alias) {
+    // Translated titles share no sound with their English names; the song's catalogued length can still tie them.
+    // MusicBrainz allows one request a second.
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    try {
+      const search = `recording:"${native.replace(/"/g, '')}" AND artist:"${artist.replace(/"/g, '')}"`;
+      const result = await getJson(`${MUSICBRAINZ}/recording?${queryString({ query: search, fmt: 'json', limit: '10' })}`, steps, MUSICBRAINZ_HEADERS);
+      const recordings = result && typeof result === 'object' && Array.isArray((result as { recordings?: unknown }).recordings) ? (result as { recordings: { title?: unknown; length?: unknown }[] }).recordings : [];
+      const lengths = recordings.flatMap((recording) => typeof recording.title === 'string' && comparable(recording.title) === comparable(native) && typeof recording.length === 'number' ? [recording.length / 1000] : []);
+      alias = matchAlias(native, candidates, track.durationMs, lengths);
+    } catch (error) {
+      steps.push(`  MusicBrainz skipped: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  steps.push(`title in another script: ${candidates.length} songs by ${artist} -> ${alias ? `"${native}" is "${alias.title}" (${alias.how})` : `no Latin title found for "${native}"`}`);
+  return alias;
+}
+
+async function lookup(track: LyricsTrack, steps: string[], typedTitle?: string): Promise<Lyrics> {
   const durationMs = track.durationMs;
   const title = normalizeText(track.title ?? '');
   const artist = normalizeText(track.artist ?? '');
@@ -415,47 +642,76 @@ async function lookup(track: LyricsTrack, steps: string[]): Promise<Lyrics> {
     plain ??= lyrics;
     return null;
   };
-
-  const exactAttempts: Record<string, string>[] = [];
-  if (artist && durationMs) {
-    const duration = String(Math.round(durationMs / 1000));
-    exactAttempts.push({ track_name: title, artist_name: artist, album_name: album, duration });
-    if (album) exactAttempts.push({ track_name: title, artist_name: artist, duration });
-  } else if (artist) {
-    exactAttempts.push({ track_name: title, artist_name: artist });
-  }
-  // An exact match is one entry, and can be the odd one out (a video's timing filed under the song),
-  // so it joins the first search's entries and is weighed with them rather than taken on its own.
-  let exact: LrclibRecord | null = null;
-  for (const params of exactAttempts) {
-    const record = await getJson('/get', params, steps);
-    const lyrics = record && typeof record === 'object' && !Array.isArray(record) ? fromRecord(record as LrclibRecord) : null;
-    steps.push(`get ${describe(params)} -> ${lyrics?.kind ?? 'no match'}`);
-    if (lyrics) {
-      exact = record as LrclibRecord;
-      break;
+  // Runs the searches, the first of them together with an exact match when there is one.
+  const searchAll = async (queries: SearchQuery[], context: MatchContext, exact: LrclibRecord | null) => {
+    for (const [index, query] of queries.entries()) {
+      const found = records(await lrclib('/search', query.params, steps));
+      const list = exact && index === 0 ? [exact, ...found.filter((record) => record.id === undefined || record.id !== exact.id)] : found;
+      const lyrics = pickSearchResult(list, context);
+      steps.push(`search ${query.label}: ${describe(query.params)} -> ${found.length} results${list === found ? '' : ' + the exact match'}, ${lyrics?.kind ?? 'none usable'}`);
+      const accepted = accept(query.label, lyrics);
+      if (accepted) return accepted;
+      loosePlain ??= pickLooseResult(list, context);
     }
+    return null;
+  };
+
+  if (!typedTitle) {
+    const exactAttempts: Record<string, string>[] = [];
+    if (artist && durationMs) {
+      const duration = String(Math.round(durationMs / 1000));
+      exactAttempts.push({ track_name: title, artist_name: artist, album_name: album, duration });
+      if (album) exactAttempts.push({ track_name: title, artist_name: artist, duration });
+    } else if (artist) {
+      exactAttempts.push({ track_name: title, artist_name: artist });
+    }
+    // An exact match is one entry, and can be the odd one out (a video's timing filed under the song),
+    // so it joins the first search's entries and is weighed with them rather than taken on its own.
+    let exact: LrclibRecord | null = null;
+    for (const params of exactAttempts) {
+      const record = await lrclib('/get', params, steps);
+      const lyrics = record && typeof record === 'object' && !Array.isArray(record) ? fromRecord(record as LrclibRecord) : null;
+      steps.push(`get ${describe(params)} -> ${lyrics?.kind ?? 'no match'}`);
+      if (lyrics) {
+        exact = record as LrclibRecord;
+        break;
+      }
+    }
+    const found = await searchAll(searchQueries(track), matchContext(track), exact);
+    if (found) return found;
   }
 
-  const context = matchContext(track);
-  for (const [index, query] of searchQueries(track).entries()) {
-    const results = await getJson('/search', query.params, steps);
-    const found = Array.isArray(results) ? results as LrclibRecord[] : [];
-    const list = exact && index === 0 ? [exact, ...found.filter((record) => record.id === undefined || record.id !== exact?.id)] : found;
-    const lyrics = pickSearchResult(list, context);
-    steps.push(`search ${query.label}: ${describe(query.params)} -> ${found.length} results${list === found ? '' : ' + the exact match'}, ${lyrics?.kind ?? 'none usable'}`);
-    const accepted = accept(query.label, lyrics);
-    if (accepted) return accepted;
-    loosePlain ??= pickLooseResult(list, context);
+  // A song name in another script ("캐치 캐치") is often filed under its Latin title ("Catch Catch"):
+  // find that title (or take the one typed in the widget) and search again with it.
+  const latinName = latinArtist(track) ?? cleanArtist(artist);
+  const native = typedTitle ? null : nativeSongTitle(track);
+  // A song name already written in both scripts ("좋은 날(Good Day)") carries its own Latin title.
+  const inline = native ? cleanTitle(latinPart(native)) : '';
+  const alias: Alias | null = typedTitle ? { title: typedTitle, how: 'typed in the widget' }
+    : inline ? { title: inline, how: 'given in the video title' }
+    : native && latinName ? await findAlias(track, native, latinName, steps) : null;
+  if (inline && !typedTitle) steps.push(`title in another script: "${native}" is "${inline}" (given in the video title)`);
+  if (alias) {
+    if (typedTitle) steps.push(`searching with the typed title "${typedTitle}"`);
+    const aliasTrack = { title: alias.title, artist: latinName, album: track.album, durationMs };
+    const found = await searchAll(searchQueries(aliasTrack), matchContext(track, { title: alias.title, artist: latinName }), null);
+    if (found) return found;
   }
   const fallback: Lyrics = plain ?? loosePlain ?? { kind: 'none' };
   steps.push(`result: ${fallback.kind}${fallback === loosePlain ? ' (unsynced: length or version uncertain)' : ''}`);
   return fallback;
 }
 
-// Looks a track up on LRCLIB. Results stay in memory for the last few tracks; failures are retried next time.
-export function fetchLyrics(track: LyricsTrack): Promise<Lyrics> {
+// Cache and trace key: the track, plus the title typed for it when there is one.
+const lookupKey = (track: LyricsTrack, typedTitle?: string) => {
   const key = lyricsTrackKey(track);
+  return key && typedTitle ? `${key}|typed:${normalizeText(typedTitle)}` : key;
+};
+
+// Looks a track up on LRCLIB, or with a title typed in the widget. Results stay in memory for the last
+// few tracks; failures are retried next time.
+export function fetchLyrics(track: LyricsTrack, typedTitle?: string): Promise<Lyrics> {
+  const key = lookupKey(track, typedTitle);
   if (!key) return Promise.resolve({ kind: 'none' });
   const cached = cache.get(key);
   if (cached) {
@@ -465,7 +721,7 @@ export function fetchLyrics(track: LyricsTrack): Promise<Lyrics> {
   }
   const steps: string[] = [];
   traces.set(key, steps);
-  const pending = lookup(track, steps).catch((error: unknown): Lyrics => {
+  const pending = lookup(track, steps, typedTitle ? normalizeText(typedTitle) : undefined).catch((error: unknown): Lyrics => {
     steps.push(`failed: ${error instanceof Error ? error.message : String(error)}`);
     cache.delete(key);
     return { kind: 'error' };
@@ -480,7 +736,7 @@ export function fetchLyrics(track: LyricsTrack): Promise<Lyrics> {
 }
 
 // The steps the latest lookup for this track took, for the widget's debug readout.
-export function lyricsTrace(track: LyricsTrack): LyricsTrace {
-  const key = lyricsTrackKey(track);
+export function lyricsTrace(track: LyricsTrack, typedTitle?: string): LyricsTrace {
+  const key = lookupKey(track, typedTitle);
   return { key, steps: key ? [...(traces.get(key) ?? [])] : [] };
 }
