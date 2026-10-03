@@ -161,6 +161,43 @@ async fn read_system_media_state(
         .ok()
         .and_then(|value| bounded_text(value.to_string(), 512));
 
+    // Artwork first: reading it can take a moment, and the position read below should be as fresh
+    // as possible when it goes out, so the phone's clock starts from the right place.
+    let track_key = format!(
+        "{}\0{}\0{}\0{}",
+        source_app_id.as_deref().unwrap_or_default(),
+        title.as_deref().unwrap_or_default(),
+        artist.as_deref().unwrap_or_default(),
+        album.as_deref().unwrap_or_default()
+    );
+    let track_changed = artwork_track_key.as_ref().map(|(key, _)| key.as_str()) != Some(track_key.as_str());
+    if track_changed {
+        *artwork_track_key = Some((track_key, std::time::Instant::now()));
+    }
+    // Browsers often publish their own app icon first and swap in the real artwork later without
+    // changing the title, so the thumbnail is re-read for the same track too: every poll for the
+    // first 15 s, then every 3 s while there is none, else every 10 s.
+    let track_age = artwork_track_key
+        .as_ref()
+        .map(|(_, started)| started.elapsed())
+        .unwrap_or_default();
+    let refresh_every = if track_age < std::time::Duration::from_secs(15) {
+        std::time::Duration::ZERO
+    } else if artwork_cache.is_none() {
+        std::time::Duration::from_secs(3)
+    } else {
+        std::time::Duration::from_secs(10)
+    };
+    let refresh_due = last_artwork_attempt
+        .is_none_or(|last_attempt| last_attempt.elapsed() >= refresh_every);
+    if track_changed || refresh_due {
+        let artwork = read_artwork(&properties);
+        // A failed re-read keeps the artwork already shown; a new track never keeps the old one.
+        if track_changed || artwork.is_some() {
+            *artwork_cache = artwork;
+        }
+        *last_artwork_attempt = Some(std::time::Instant::now());
+    }
     let playback_state = session
         .GetPlaybackInfo()
         .and_then(|info| info.PlaybackStatus())
@@ -216,41 +253,6 @@ async fn read_system_media_state(
         })
         .unwrap_or((None, None));
 
-    let track_key = format!(
-        "{}\0{}\0{}\0{}",
-        source_app_id.as_deref().unwrap_or_default(),
-        title.as_deref().unwrap_or_default(),
-        artist.as_deref().unwrap_or_default(),
-        album.as_deref().unwrap_or_default()
-    );
-    let track_changed = artwork_track_key.as_ref().map(|(key, _)| key.as_str()) != Some(track_key.as_str());
-    if track_changed {
-        *artwork_track_key = Some((track_key, std::time::Instant::now()));
-    }
-    // Browsers often publish their own app icon first and swap in the real artwork later without
-    // changing the title, so the thumbnail is re-read for the same track too: every poll for the
-    // first 15 s, then every 3 s while there is none, else every 10 s.
-    let track_age = artwork_track_key
-        .as_ref()
-        .map(|(_, started)| started.elapsed())
-        .unwrap_or_default();
-    let refresh_every = if track_age < std::time::Duration::from_secs(15) {
-        std::time::Duration::ZERO
-    } else if artwork_cache.is_none() {
-        std::time::Duration::from_secs(3)
-    } else {
-        std::time::Duration::from_secs(10)
-    };
-    let refresh_due = last_artwork_attempt
-        .is_none_or(|last_attempt| last_attempt.elapsed() >= refresh_every);
-    if track_changed || refresh_due {
-        let artwork = read_artwork(&properties);
-        // A failed re-read keeps the artwork already shown; a new track never keeps the old one.
-        if track_changed || artwork.is_some() {
-            *artwork_cache = artwork;
-        }
-        *last_artwork_attempt = Some(std::time::Instant::now());
-    }
     SystemMediaState {
         source_app_id,
         title,

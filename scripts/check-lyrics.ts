@@ -1,7 +1,7 @@
 // Run: node scripts/check-lyrics.ts
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { activeLineAt, artistMatches, cleanArtist, cleanTitle, isGapLine, lyricsTrackKey, matchContext, normalizeText, parseLrc, pickLooseResult, pickSearchResult, quotedSong, searchQueries, titleMatches, withIntroGap } from '../phone-app/src/lyrics.ts';
+import { activeLineAt, artistMatches, cleanArtist, cleanTitle, isGapLine, lyricsTrackKey, matchContext, normalizeText, parseLrc, pickLooseResult, pickSearchResult, quotedSong, searchQueries, timingVersions, titleMatches, withIntroGap } from '../phone-app/src/lyrics.ts';
 
 assert.equal(
   readFileSync(new URL('../phone-app/src/lyrics.ts', import.meta.url), 'utf8'),
@@ -129,7 +129,7 @@ const loosePick = (results: object[], track: Parameters<typeof matchContext>[0])
 const song = { title: 'Song', artist: 'Artist', durationMs: 200_400 };
 
 // Nearest duration within 3 s wins, synced before plain.
-assert.deepEqual(pick([record('Song', 'Artist', 248, 'far'), record('Song', 'Artist', 202, 'near'), record('Song', 'Artist', 200, 'exact')], song), { kind: 'synced', lines: [{ timeMs: 1000, text: 'exact' }, { timeMs: 2000, text: 'Two' }, { timeMs: 3000, text: 'Three' }] });
+assert.deepEqual(asLines(pick([record('Song', 'Artist', 248, 'far'), record('Song', 'Artist', 202, 'near'), record('Song', 'Artist', 200, 'exact')], song)), ['exact', 'Two', 'Three']);
 assert.equal(pick([record('Song', 'Artist', 210)], song), null);
 assert.equal(pick([record('Song', 'Artist', null)], song), null);
 assert.equal(pick([{ trackName: 'Song', artistName: 'Artist', duration: 200, plainLyrics: 'A\nB\nC' }, record('Song', 'Artist', 201, 'sync')], song)?.kind, 'synced');
@@ -164,10 +164,14 @@ const switchbladeVideo = { title: "aespa 에스파 'Switchblade (Feat. Ty Dolla 
 const otherSwitchblade = record('Switchblade', 'Some Rock Band', 214, 'You are no victim');
 const aespaSwitchblade = record('Switchblade (feat. Ty Dolla $ign)', 'aespa & Ty Dolla $ign', 182, 'Take it back');
 assert.equal(pick([otherSwitchblade, aespaSwitchblade], switchbladeVideo), null);
-assert.deepEqual(loosePick([otherSwitchblade, aespaSwitchblade], switchbladeVideo), { kind: 'plain', text: 'Take it back\nTwo\nThree' });
+const switchbladePlain = loosePick([otherSwitchblade, aespaSwitchblade], switchbladeVideo);
+assert.equal(switchbladePlain?.kind === 'plain' && switchbladePlain.text, 'Take it back\nTwo\nThree');
+// Its synced timing still comes along, for the widget to offer.
+assert.equal(switchbladePlain?.kind === 'plain' && switchbladePlain.versions?.length, 1);
 assert.equal(loosePick([otherSwitchblade], switchbladeVideo), null);
 assert.equal(loosePick([record('Song', 'Artist', 300)], { title: 'Song', artist: 'Artist', durationMs: 200_000 }), null);
-assert.deepEqual(loosePick([record('Song', 'Artist', 280, 'far'), record('Song', 'Artist', 230, 'near')], { title: 'Song', artist: 'Artist', durationMs: 200_000 }), { kind: 'plain', text: 'near\nTwo\nThree' });
+const nearest = loosePick([record('Song', 'Artist', 280, 'far'), record('Song', 'Artist', 230, 'near')], { title: 'Song', artist: 'Artist', durationMs: 200_000 });
+assert.equal(nearest?.kind === 'plain' && nearest.text, 'near\nTwo\nThree');
 
 // Artist names: whole words for Latin names, anywhere for other scripts, any of several artists.
 const artistOf = (artistName: string, track: Parameters<typeof matchContext>[0]) => artistMatches({ artistName }, matchContext(track));
@@ -178,5 +182,33 @@ assert.ok(!artistOf('Rain', { title: 'Brainstorm', artist: 'Someone' }));
 assert.ok(!artistOf('A', { title: 'A Song', artist: 'B' }));
 assert.ok(titleMatches({ trackName: 'In My Hands' }, matchContext({ title: "MEOVV(미야오) - 'In my hands' M/V" })));
 assert.ok(!titleMatches({ trackName: 'Me' }, matchContext({ title: "ILLIT 'It's Me' MV" })));
+
+// Timing versions, from aespa 'KISS N TELL' as LRCLIB holds it: eleven entries with the album's timing
+// (first line 8.0 s) under all sorts of listed lengths, two of them the music video's 190 s, and one
+// entry timed to the video (first line 17.1 s) listed at the album's 166 s.
+const stamp = (totalS: number) => `[${String(Math.floor(totalS / 60)).padStart(2, '0')}:${(totalS % 60).toFixed(2).padStart(5, '0')}]`;
+// Four lines spread evenly from the first to the last sung line.
+const timed = (firstS: number, lastS: number) => [0, 1, 2, 3].map((step) => `${stamp(firstS + (lastS - firstS) * step / 3)} line ${step}`).join('\n');
+assert.equal(stamp(160.28), '[02:40.28]');
+const kissNTell = (duration: number | null, firstS: number, lastS: number) => ({ trackName: 'KISS N TELL', artistName: 'aespa', duration, syncedLyrics: timed(firstS, lastS), plainLyrics: 'line 0\nline 1\nline 2\nline 3' });
+const kissEntries = [
+  ...[166, 166, 166, 190, 190, 218, 75, 230, 160, 154, null].map((duration) => kissNTell(duration, 8, 160.28)),
+  kissNTell(166, 17.1, 161.16),
+];
+const firstLine = (lyrics: ReturnType<typeof pickSearchResult>) => lyrics?.kind === 'synced' ? lyrics.lines[0].timeMs : null;
+assert.deepEqual(timingVersions(kissEntries.map((entry) => parseLrc(entry.syncedLyrics))).map((version) => [version.firstMs, version.entries]), [[8000, 11], [17100, 1]]);
+// The music video (its title says MV) takes the timing that starts later, by its intro.
+const kissVideo = pick(kissEntries, { title: "aespa エスパ 'KISS N TELL' MV", artist: 'SMTOWN', durationMs: 190_000 });
+assert.equal(firstLine(kissVideo), 17100);
+assert.match(kissVideo?.kind === 'synced' ? kissVideo.reason ?? '' : '', /music video/);
+assert.equal(kissVideo?.kind === 'synced' && kissVideo.versions?.length, 2);
+// The song itself (Spotify, 166 s) takes the timing most matching entries share.
+assert.equal(firstLine(pick(kissEntries, { title: 'KISS N TELL', artist: 'aespa', durationMs: 166_000 })), 8000);
+// No video words in the title, but 24 s longer than the length the entries list: still a video.
+assert.equal(firstLine(pick(kissEntries, { title: 'KISS N TELL', artist: 'aespa', durationMs: 190_000 })), 17100);
+// A video whose extras are only at the end has one timing, and keeps it.
+assert.equal(firstLine(pick(kissEntries.slice(0, 11), { title: "aespa 'KISS N TELL' MV", artist: 'SMTOWN', durationMs: 190_000 })), 8000);
+// A timing starting over a minute late is someone's mistake, not an intro.
+assert.equal(firstLine(pick([...kissEntries.slice(0, 11), kissNTell(166, 75, 100)], { title: "aespa 'KISS N TELL' MV", artist: 'SMTOWN', durationMs: 190_000 })), 8000);
 
 console.log('lyrics checks passed');

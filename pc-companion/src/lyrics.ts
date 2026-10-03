@@ -2,9 +2,14 @@
 // scripts/check-lyrics.ts fails when they differ.
 
 export type LyricLine = { timeMs: number; text: string };
+// Entries that share one timing: when their first and last sung lines fall. LRCLIB often holds several,
+// e.g. the album's timing and a music video's, which starts later by the video's intro.
+export type TimingVersion = { lines: LyricLine[]; firstMs: number; lastMs: number; entries: number };
+// Synced and plain results carry the timing versions found, so the widget can offer the others;
+// `reason` says why these lines were chosen.
 export type Lyrics =
-  | { kind: 'synced'; lines: LyricLine[] }
-  | { kind: 'plain'; text: string }
+  | { kind: 'synced'; lines: LyricLine[]; versions?: TimingVersion[]; reason?: string }
+  | { kind: 'plain'; text: string; versions?: TimingVersion[] }
   | { kind: 'instrumental' }
   | { kind: 'none' }
   | { kind: 'error' };
@@ -12,7 +17,7 @@ export type LyricsTrack = { title?: string; artist?: string; album?: string; dur
 // What a lookup tried, step by step, for the widget's debug readout.
 export type LyricsTrace = { key: string | null; steps: string[] };
 
-type LrclibRecord = { trackName?: unknown; artistName?: unknown; duration?: unknown; instrumental?: unknown; plainLyrics?: unknown; syncedLyrics?: unknown };
+type LrclibRecord = { id?: unknown; trackName?: unknown; artistName?: unknown; duration?: unknown; instrumental?: unknown; plainLyrics?: unknown; syncedLyrics?: unknown };
 
 const API = 'https://lrclib.net/api';
 // LRCLIB asks clients to identify themselves. Browsers can't set User-Agent, so use its alternative header.
@@ -195,7 +200,7 @@ function fromRecord(record: LrclibRecord): Lyrics | null {
 }
 
 // Lyrics shown without timing, for matches that can't be trusted to sync.
-function asPlain(lyrics: Lyrics | null): Lyrics | null {
+function asPlain(lyrics: Lyrics | null): Extract<Lyrics, { kind: 'plain' }> | null {
   if (lyrics?.kind === 'synced') return { kind: 'plain', text: lyrics.lines.filter((line) => !isGapLine(line)).map((line) => line.text).join('\n') };
   return lyrics?.kind === 'plain' ? lyrics : null;
 }
@@ -207,7 +212,10 @@ const squash = (text: string) => comparable(text).replace(/ /g, '');
 const ARTIST_SEPARATOR = /\s*(?:,|&|;|\/|×|、|및|\sx\s|\sand\s|\swith\s|\svs\.?\s|\sfeat\.?\s|\sft\.?\s|\sfeaturing\s)\s*/i;
 
 // What a result is checked against: everything the PC reported about the track.
-export type MatchContext = { durationMs?: number; titles: string[]; text: string; artists: string[] };
+export type MatchContext = { durationMs?: number; titles: string[]; text: string; artists: string[]; videoTitle: boolean };
+
+// Words that mark a music video upload rather than the song itself.
+const VIDEO_MARKERS = /(?:^|[\s([\-–—:|])(?:m\/v|mv|music video|official video|performance video|special video|lyrics? video|visuali[sz]er|dance practice)(?=$|[\s)\].,:|!\-–—])/i;
 
 export function matchContext(track: LyricsTrack): MatchContext {
   const quoted = quotedSong(track.title ?? '');
@@ -220,6 +228,7 @@ export function matchContext(track: LyricsTrack): MatchContext {
     // Title, channel and album together: an artist named anywhere in them counts ("Song | Arijit Singh" on a label's channel).
     text: ` ${comparable([track.title, track.artist, track.album].filter(Boolean).join(' '))} `,
     artists: [artist, quoted?.artist, dash?.[1]].filter((value): value is string => Boolean(value)).map(squash).filter((value) => value.length >= 2),
+    videoTitle: VIDEO_MARKERS.test(normalizeText(track.title ?? '')),
   };
 }
 
@@ -245,33 +254,95 @@ export function artistMatches(record: LrclibRecord, context: MatchContext) {
 const durationGap = (record: LrclibRecord, durationMs?: number) => !durationMs ? 0 : typeof record.duration === 'number' ? Math.abs(record.duration - durationMs / 1000) : Infinity;
 const KIND_RANK: Record<Lyrics['kind'], number> = { synced: 0, instrumental: 1, plain: 2, none: 3, error: 3 };
 
-type Rated = { lyrics: Lyrics; gap: number; title: boolean; artist: boolean };
+type Rated = { lyrics: Lyrics; gap: number; listedS?: number; title: boolean; artist: boolean };
 
 function rate(results: LrclibRecord[], context: MatchContext): Rated[] {
   return results.flatMap((record) => {
     const lyrics = fromRecord(record);
     // Synced lines running past the end of the track belong to a longer version.
     if (!lyrics || (lyrics.kind === 'synced' && context.durationMs && lyrics.lines[lyrics.lines.length - 1].timeMs > context.durationMs + 5000)) return [];
-    return [{ lyrics, gap: durationGap(record, context.durationMs), title: titleMatches(record, context), artist: artistMatches(record, context) }];
+    const listedS = typeof record.duration === 'number' ? record.duration : undefined;
+    return [{ lyrics, gap: durationGap(record, context.durationMs), listedS, title: titleMatches(record, context), artist: artistMatches(record, context) }];
   }).sort((a, b) => Number(b.artist) - Number(a.artist) || Number(b.title) - Number(a.title) || KIND_RANK[a.lyrics.kind] - KIND_RANK[b.lyrics.kind] || a.gap - b.gap);
 }
 
-// A result to show in sync. With a duration: within 3 s and the right title or artist, the right artist
-// ranking first. Without one, nothing confirms the recording, so title and artist must both match.
+// Two entries share a timing when their first and last sung lines are this close.
+const VERSION_TOLERANCE_MS = 400;
+// Video intros only ever push lyrics later, and not by more than this; a later start is someone's mistake.
+const MAX_INTRO_MS = 60_000;
+// A track this much longer than the song's usual length is a video with extras.
+const VIDEO_EXTRA_S = 8;
+
+const seconds = (milliseconds: number) => `${(milliseconds / 1000).toFixed(1)} s`;
+
+function sungSpan(lines: LyricLine[]) {
+  const sung = lines.filter((line) => !isGapLine(line));
+  return { firstMs: sung[0]?.timeMs ?? 0, lastMs: sung[sung.length - 1]?.timeMs ?? 0 };
+}
+
+// Groups synced lyrics by timing, most entries first: copies of the same timing count once with their tally.
+export function timingVersions(all: LyricLine[][]): TimingVersion[] {
+  const versions: TimingVersion[] = [];
+  for (const lines of all) {
+    const { firstMs, lastMs } = sungSpan(lines);
+    const same = versions.find((version) => Math.abs(version.firstMs - firstMs) <= VERSION_TOLERANCE_MS && Math.abs(version.lastMs - lastMs) <= VERSION_TOLERANCE_MS);
+    if (same) same.entries += 1;
+    else versions.push({ lines, firstMs, lastMs, entries: 1 });
+  }
+  return versions.sort((a, b) => b.entries - a.entries || a.firstMs - b.firstMs);
+}
+
+const syncedLines = (rated: Rated[]) => rated.flatMap((entry) => entry.lyrics.kind === 'synced' ? [entry.lyrics.lines] : []);
+
+// A music video: its title says so, or it runs well past the length the song's entries list.
+function isVideo(context: MatchContext, matching: Rated[]) {
+  if (context.videoTitle) return true;
+  const listed = matching.flatMap((entry) => entry.listedS === undefined ? [] : [entry.listedS]).sort((a, b) => a - b);
+  const duration = context.durationMs;
+  return Boolean(duration && listed.length > 0) && listed[Math.floor(listed.length / 2)] <= (duration ?? 0) / 1000 - VIDEO_EXTRA_S;
+}
+
+// A result to show in sync.
+// - Accepted entries: with a duration, within 3 s and the right title or artist (the right artist ranking
+//   first); without one, title and artist must both match.
+// - A music video with several timings takes the latest-starting one: its intro delays the singing, and
+//   listed lengths can't tell (people upload the album's timing under the video's length).
+// - Otherwise the timing most accepted entries share wins, so one odd entry can't outvote the rest.
 export function pickSearchResult(results: LrclibRecord[], context: MatchContext): Lyrics | null {
-  const accepted = rate(results, context).filter((rated) => context.durationMs
-    ? rated.gap <= DURATION_TOLERANCE_S && (rated.title || rated.artist)
-    : rated.title && rated.artist);
-  return accepted[0]?.lyrics ?? null;
+  const rated = rate(results, context);
+  const strict = rated.filter((entry) => context.durationMs
+    ? entry.gap <= DURATION_TOLERANCE_S && (entry.title || entry.artist)
+    : entry.title && entry.artist);
+  const strong = rated.filter((entry) => entry.title && entry.artist);
+  const versions = timingVersions(syncedLines([...new Set([...strict, ...strong])]));
+  if (versions.length > 1 && isVideo(context, strong)) {
+    const usual = versions[0];
+    const later = versions
+      .filter((version) => version.firstMs > usual.firstMs + VERSION_TOLERANCE_MS && version.firstMs - usual.firstMs <= MAX_INTRO_MS)
+      .sort((a, b) => b.firstMs - a.firstMs)[0];
+    if (later) return { kind: 'synced', lines: later.lines, versions, reason: `music video: starts ${seconds(later.firstMs - usual.firstMs)} after the usual timing` };
+  }
+  const strictVersions = timingVersions(syncedLines(strict));
+  if (strictVersions.length > 0) {
+    const chosen = strictVersions[0];
+    const reason = strictVersions.length > 1 ? `most matching entries (${chosen.entries} of ${strictVersions.reduce((total, version) => total + version.entries, 0)})` : 'length and name match';
+    return { kind: 'synced', lines: chosen.lines, versions, reason };
+  }
+  const best = strict[0]?.lyrics;
+  if (!best) return null;
+  return best.kind === 'plain' && versions.length > 0 ? { ...best, versions } : best;
 }
 
 // The same song at another length (a music video with an intro, a radio edit): title and artist both
-// match within 90 s, shown unsynced because its timing would be off.
+// match within 90 s, shown unsynced because its timing would be off. Its timing versions come along,
+// so the widget can still offer them.
 export function pickLooseResult(results: LrclibRecord[], context: MatchContext): Lyrics | null {
-  const accepted = rate(results, context).filter((rated) => rated.title && rated.artist && rated.gap <= LOOSE_DURATION_TOLERANCE_S).sort((a, b) => a.gap - b.gap);
-  for (const rated of accepted) {
-    const plain = asPlain(rated.lyrics);
-    if (plain) return plain;
+  const matching = rate(results, context).filter((entry) => entry.title && entry.artist);
+  const versions = timingVersions(syncedLines(matching));
+  const near = matching.filter((entry) => entry.gap <= LOOSE_DURATION_TOLERANCE_S).sort((a, b) => a.gap - b.gap);
+  for (const entry of near) {
+    const plain = asPlain(entry.lyrics);
+    if (plain) return versions.length > 0 ? { ...plain, versions } : plain;
   }
   return null;
 }
@@ -336,6 +407,9 @@ async function lookup(track: LyricsTrack, steps: string[]): Promise<Lyrics> {
   const accept = (label: string, lyrics: Lyrics | null): Lyrics | null => {
     if (lyrics && lyrics.kind !== 'plain') {
       steps.push(`matched: ${label} (${lyrics.kind})`);
+      if (lyrics.kind === 'synced' && lyrics.versions && lyrics.versions.length > 0) {
+        steps.push(`timings: ${lyrics.versions.map((version) => `starts ${seconds(version.firstMs)} x${version.entries}`).join(', ')} -> ${lyrics.reason ?? ''}`);
+      }
       return lyrics;
     }
     plain ??= lyrics;
@@ -350,22 +424,28 @@ async function lookup(track: LyricsTrack, steps: string[]): Promise<Lyrics> {
   } else if (artist) {
     exactAttempts.push({ track_name: title, artist_name: artist });
   }
+  // An exact match is one entry, and can be the odd one out (a video's timing filed under the song),
+  // so it joins the first search's entries and is weighed with them rather than taken on its own.
+  let exact: LrclibRecord | null = null;
   for (const params of exactAttempts) {
     const record = await getJson('/get', params, steps);
     const lyrics = record && typeof record === 'object' && !Array.isArray(record) ? fromRecord(record as LrclibRecord) : null;
     steps.push(`get ${describe(params)} -> ${lyrics?.kind ?? 'no match'}`);
-    const found = accept('exact', lyrics);
-    if (found) return found;
+    if (lyrics) {
+      exact = record as LrclibRecord;
+      break;
+    }
   }
 
   const context = matchContext(track);
-  for (const query of searchQueries(track)) {
+  for (const [index, query] of searchQueries(track).entries()) {
     const results = await getJson('/search', query.params, steps);
-    const list = Array.isArray(results) ? results as LrclibRecord[] : [];
+    const found = Array.isArray(results) ? results as LrclibRecord[] : [];
+    const list = exact && index === 0 ? [exact, ...found.filter((record) => record.id === undefined || record.id !== exact?.id)] : found;
     const lyrics = pickSearchResult(list, context);
-    steps.push(`search ${query.label}: ${describe(query.params)} -> ${list.length} results, ${lyrics?.kind ?? 'none usable'}`);
-    const found = accept(query.label, lyrics);
-    if (found) return found;
+    steps.push(`search ${query.label}: ${describe(query.params)} -> ${found.length} results${list === found ? '' : ' + the exact match'}, ${lyrics?.kind ?? 'none usable'}`);
+    const accepted = accept(query.label, lyrics);
+    if (accepted) return accepted;
     loosePlain ??= pickLooseResult(list, context);
   }
   const fallback: Lyrics = plain ?? loosePlain ?? { kind: 'none' };
