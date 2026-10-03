@@ -2,14 +2,14 @@ import { useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'expo-router';
 import { BackHandler, Image, PanResponder, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { AppWindow, ChevronRight, Clock, Command, File, FolderOpen, Headphones, Keyboard, Layers2, ListOrdered, Maximize2, Mic, Minimize2, Monitor, Music, Package, PanelsTopLeft, Pause, Play, SkipBack, SkipForward, Snowflake, Volume1, Volume2, VolumeX, Wifi } from 'lucide-react-native';
+import { AppWindow, ChevronRight, Command, File, FolderOpen, Headphones, Keyboard, Layers2, ListOrdered, Maximize2, Mic, Minimize2, Monitor, Music, Package, PanelsTopLeft, Pause, Play, SkipBack, SkipForward, Snowflake, Volume1, Volume2, VolumeX, Wifi } from 'lucide-react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as ScreenOrientation from 'expo-screen-orientation';
 import { NavigationBar } from 'expo-navigation-bar';
-import { useCalendars } from 'expo-localization';
 import { SvgXml } from 'react-native-svg';
 import { DeckButton, DeckMediaCommand, DeckWidget, PlaybackState, SystemMediaState, usePcConnection } from '../../connection';
 import { nowPlayingLayout, NowPlayingRow } from '../../now-playing-layout';
+import { ClockFaceWidget } from '../../clock-face-widget';
 import { buttonPlacement, deckOccupancy, widgetPageOccupancy, WidgetScreenItem } from '../../deck-layout';
 import { colors } from '../../theme';
 import { TabBarHiddenContext } from '../../navigation/tab-bar-context';
@@ -46,32 +46,6 @@ function controlIcon(button: DeckButton, playback: PlaybackState) {
   if (action.type === 'select_profile') return Layers2;
   if (action.type === 'select_page') return PanelsTopLeft;
   return Keyboard;
-}
-
-function ClockWidget({ immersive = false }: { immersive?: boolean }) {
-  const [now, setNow] = useState(() => new Date());
-  const [contentSize, setContentSize] = useState({ width: 0, height: 0 });
-  const [{ uses24hourClock }] = useCalendars();
-  useEffect(() => {
-    const timer = setInterval(() => setNow(new Date()), 15_000);
-    return () => clearInterval(timer);
-  }, []);
-  const contentWidth = contentSize.width || 92;
-  const contentHeight = contentSize.height || 92;
-  const compact = contentSize.width > 0 && contentWidth < 90;
-  const time = now.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: uses24hourClock == null ? undefined : !uses24hourClock });
-  const timeSize = Math.max(8, Math.min(31, contentWidth * 0.92 / (time.length * 0.66), contentHeight * (immersive ? 0.46 : 0.34)));
-  const dateSize = Math.max(7, Math.min(10, contentHeight * (immersive ? 0.2 : 0.15)));
-  const iconSize = Math.max(8, Math.min(18, contentHeight * 0.17));
-  const gap = Math.min(immersive ? 6 : 4, contentHeight * (immersive ? 0.07 : 0.04));
-  return <View onLayout={(event) => {
-    const { width: nextWidth, height: nextHeight } = event.nativeEvent.layout;
-    setContentSize((size) => Math.abs(size.width - nextWidth) < 1 && Math.abs(size.height - nextHeight) < 1 ? size : { width: nextWidth, height: nextHeight });
-  }} style={[styles.clockWidgetContent, immersive && styles.immersiveClockContent, { gap }]}>
-    {immersive ? null : <Clock size={iconSize} color={colors.muted} strokeWidth={1.7} />}
-    <Text allowFontScaling={false} numberOfLines={1} style={[styles.clockWidgetTime, { fontSize: timeSize, lineHeight: timeSize * 1.08 }]}>{time}</Text>
-    <Text allowFontScaling={false} numberOfLines={1} style={[styles.clockWidgetDate, { fontSize: dateSize, lineHeight: dateSize * 1.15 }]}>{now.toLocaleDateString([], compact ? { month: 'numeric', day: 'numeric' } : { weekday: 'short', month: 'short', day: 'numeric' })}</Text>
-  </View>;
 }
 
 function PluginTextWidget({ widget, immersive = false }: { widget: Extract<DeckWidget, { type: 'plugin' }>; immersive?: boolean }) {
@@ -524,7 +498,7 @@ export default function DeckScreen() {
               if (item.type === 'widget') {
                 const placement = item.widget.placement;
                 if (placement.row !== sourceRow || placement.column !== sourceColumn) return null;
-                return <View key={item.widget.id} style={[styles.immersiveKey, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12, 0)]}>{item.widget.type === 'clock' ? <ClockWidget immersive /> : item.widget.type === 'now_playing' ? <NowPlayingWidget media={mediaState} connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} seekMedia={seekMedia} /> : <PluginTextWidget widget={item.widget} immersive />}</View>;
+                return <View key={item.widget.id} style={[styles.immersiveKey, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12, 0)]}>{item.widget.type === 'clock' ? <ClockFaceWidget face={item.widget.face} color={item.widget.color} /> : item.widget.type === 'now_playing' ? <NowPlayingWidget media={mediaState} connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} seekMedia={seekMedia} /> : <PluginTextWidget widget={item.widget} immersive />}</View>;
               }
               const button = item.button;
               const placement = buttonPlacement({ id: widgetScreen.id, name: widgetScreen.name, rows: widgetRows, columns: widgetColumns, buttons: widgetScreen.buttons }, button);
@@ -628,7 +602,7 @@ export default function DeckScreen() {
               if (item.type === 'widget') {
                 const placement = item.widget.placement;
                 if (placement.row !== sourceRow || placement.column !== sourceColumn) return null;
-                return <View key={item.widget.id} style={[styles.key, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, widgetCellWidth, widgetCellHeight)]}>{item.widget.type === 'clock' ? <ClockWidget /> : item.widget.type === 'now_playing' ? <NowPlayingWidget media={mediaState} connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} seekMedia={seekMedia} /> : <PluginTextWidget widget={item.widget} />}</View>;
+                return <View key={item.widget.id} style={[styles.key, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, widgetCellWidth, widgetCellHeight)]}>{item.widget.type === 'clock' ? <ClockFaceWidget face={item.widget.face} color={item.widget.color} /> : item.widget.type === 'now_playing' ? <NowPlayingWidget media={mediaState} connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} seekMedia={seekMedia} /> : <PluginTextWidget widget={item.widget} />}</View>;
               }
               const button = item.button;
               const placement = buttonPlacement({ id: widgetScreen.id, name: widgetScreen.name, rows: widgetRows, columns: widgetColumns, buttons: widgetScreen.buttons }, button);
@@ -661,10 +635,6 @@ const styles = StyleSheet.create({
   immersiveWidgetPageIndicator: { position: 'absolute', top: 0, right: 12, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8, backgroundColor: colors.panel },
   immersiveKey: { borderRadius: 10, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panel, alignItems: 'center', justifyContent: 'center' },
   clockWidgetKey: { padding: 4, alignItems: 'center', justifyContent: 'center' },
-  clockWidgetContent: { flex: 1, width: '100%', alignItems: 'center', justifyContent: 'center', gap: 4 },
-  immersiveClockContent: { gap: 6 },
-  clockWidgetTime: { width: '100%', color: colors.text, fontSize: 21, fontWeight: '600', fontVariant: ['tabular-nums'], textAlign: 'center', includeFontPadding: false },
-  clockWidgetDate: { width: '100%', color: colors.muted, fontSize: 10, textAlign: 'center', includeFontPadding: false },
   pluginWidgetContent: { flex: 1, width: '100%', alignItems: 'center', justifyContent: 'center', gap: 4, paddingHorizontal: 3, overflow: 'hidden' },
   immersivePluginWidgetContent: { gap: 7, paddingHorizontal: 8 },
   pluginWidgetTitle: { width: '100%', flexShrink: 1, color: colors.text, fontWeight: '600', textAlign: 'center', includeFontPadding: false },

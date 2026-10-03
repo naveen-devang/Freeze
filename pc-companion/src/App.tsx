@@ -7,7 +7,6 @@ import {
   AppWindow,
   ChevronUp,
   Check,
-  Clock,
   ChevronDown,
   Command,
   Copy,
@@ -46,7 +45,10 @@ import { QRCodeSVG } from "qrcode.react";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 import { NowPlayingPreview, REFERENCE_WIDGET_SURFACE } from "./NowPlayingPreview";
-import type { WidgetSurface } from "./now-playing-layout";
+import { ClockFacePreview } from "./clock-faces/ClockFacePreview";
+import { ClockWidgetSettings } from "./clock-faces/ClockSettings";
+import { AddWidgetMenu, type WidgetChoice } from "./AddWidgetMenu";
+import { widgetBlockSize, type WidgetSurface } from "./now-playing-layout";
 
 type ConnectionInfo = {
   host: string;
@@ -69,7 +71,7 @@ type FreezePlugin = { id: string; name: string; version: string; description: st
 type FreezePluginListing = { plugins: FreezePlugin[]; warnings: string[] };
 type DeckPlacement = { row: number; column: number; rowSpan: number; columnSpan: number };
 type DeckButton = { id: string; label: string; icon: string; placement?: DeckPlacement; iconSvg?: string; appIconData?: string; action: DeckAction };
-type DeckWidget = { id: string; type: 'clock'; placement: DeckPlacement } | { id: string; type: 'now_playing'; placement: DeckPlacement } | { id: string; type: 'plugin'; pluginId: string; widgetId: string; renderType: string; values: Record<string, string>; placement: DeckPlacement };
+type DeckWidget = { id: string; type: 'clock'; placement: DeckPlacement; face?: string; color?: string } | { id: string; type: 'now_playing'; placement: DeckPlacement } | { id: string; type: 'plugin'; pluginId: string; widgetId: string; renderType: string; values: Record<string, string>; placement: DeckPlacement };
 type WidgetScreen = { enabled: boolean; rows: number; columns: number; buttons: DeckButton[]; widgets: DeckWidget[] };
 type WidgetPage = { id: string; name: string; buttons: DeckButton[]; widgets: DeckWidget[] };
 type WidgetArea = { enabled: boolean; rows: number; columns: number; pages: WidgetPage[] };
@@ -633,7 +635,7 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
   const [dragOverCellKey, setDragOverCellKey] = useState('');
   const [resizePreview, setResizePreview] = useState<{ id: string; placement: DeckPlacement; valid: boolean } | null>(null);
   const [autoSwitchAppDraft, setAutoSwitchAppDraft] = useState('');
-  const [clock, setClock] = useState(() => new Date());
+  const [addMenu, setAddMenu] = useState<{ anchor: DOMRect; row?: number; column?: number } | null>(null);
   const buttonDrag = useRef<{ id: string; surface: 'page' | 'widgets'; kind: 'button' | 'widget'; pointerId: number; x: number; y: number; active: boolean } | null>(null);
   const resizeDrag = useRef<{ id: string; surface: 'page' | 'widgets'; kind: 'button' | 'widget'; pointerId: number; x: number; y: number; placement: DeckPlacement } | null>(null);
   const canvasRef = useRef<HTMLDivElement | null>(null);
@@ -659,10 +661,6 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
   const activePage = activeProfile?.pages.find((item) => item.id === pageId) ?? activeProfile?.pages[0];
   useEffect(() => { if (activeProfile) setProfileName(activeProfile.name); }, [activeProfile?.id, activeProfile?.name]);
   useEffect(() => setAutoSwitchAppDraft(''), [activeProfile?.id]);
-  useEffect(() => {
-    const timer = window.setInterval(() => setClock(new Date()), 15_000);
-    return () => window.clearInterval(timer);
-  }, []);
 
   if (!config || !activeProfile || !activePage) return <div className="deck-loading">Loading your PC deck…</div>;
   const deck = config;
@@ -1144,42 +1142,33 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
     updateWidgetScreen({ [dimension]: nextValue });
   }
 
-  function addClockWidget(row?: number, column?: number) {
+  function addWidget(choice: WidgetChoice, row?: number, column?: number) {
+    setAddMenu(null);
     const placement = row === undefined || column === undefined
       ? firstWidgetPlacement(widgetScreen)
       : canPlaceWidgetItem(widgetScreen, '', { row, column, rowSpan: 1, columnSpan: 1 })
         ? { row, column, rowSpan: 1, columnSpan: 1 }
         : null;
     if (!placement) return setError('There is no free cell on the widget screen. Move or resize an item to make room.');
-    const widget: DeckWidget = { id: `widget-${Date.now()}`, type: 'clock', placement };
+    const id = `widget-${Date.now()}`;
+    let widget: DeckWidget;
+    if (choice.kind === 'plugin') {
+      const definition = plugins.find((item) => item.id === choice.pluginId)?.widgets?.find((item) => item.id === choice.widgetId);
+      if (!definition) return;
+      const values = Object.fromEntries(definition.inputs.map((input) => [input.id, input.default || (input.type === 'select' ? input.options[0] ?? '' : '')]));
+      widget = { id, type: 'plugin', pluginId: choice.pluginId, widgetId: choice.widgetId, renderType: definition.type, values, placement };
+    } else widget = { id, type: choice.kind, placement };
     setError('');
     setWidgetId(widget.id);
     setButtonId('');
     updateWidgetScreen({ enabled: true, widgets: [...widgetScreen.widgets, widget] });
   }
 
-  function addNowPlayingWidget() {
-    const placement = firstWidgetPlacement(widgetScreen);
-    if (!placement) return setError('There is no free cell on the widget screen. Move or resize an item to make room.');
-    const widget: DeckWidget = { id: `widget-${Date.now()}`, type: 'now_playing', placement };
-    setError('');
-    setWidgetId(widget.id);
-    setButtonId('');
-    updateWidgetScreen({ enabled: true, widgets: [...widgetScreen.widgets, widget] });
-  }
-
-  function addPluginWidget(pluginId: string, definitionId: string) {
-    const plugin = plugins.find((item) => item.id === pluginId);
-    const definition = plugin?.widgets?.find((item) => item.id === definitionId);
-    if (!plugin || !definition) return;
-    const placement = firstWidgetPlacement(widgetScreen);
-    if (!placement) return setError('There is no free cell on the widget screen. Move or resize an item to make room.');
-    const values = Object.fromEntries(definition.inputs.map((input) => [input.id, input.default || (input.type === 'select' ? input.options[0] ?? '' : '')]));
-    const widget: DeckWidget = { id: `widget-${Date.now()}`, type: 'plugin', pluginId, widgetId: definitionId, renderType: definition.type, values, placement };
-    setError('');
-    setWidgetId(widget.id);
-    setButtonId('');
-    updateWidgetScreen({ enabled: true, widgets: [...widgetScreen.widgets, widget] });
+  function updateSelectedClockWidget(patch: { face?: string; color?: string }) {
+    if (selectedWidget?.type !== 'clock') return;
+    replaceWidgetScreen({ ...widgetScreen, widgets: widgetScreen.widgets.map((widget) => widget.id === selectedWidget.id && widget.type === 'clock'
+      ? { ...widget, ...patch }
+      : widget) }, profile, false);
   }
 
   function updateSelectedPluginWidgetValue(inputId: string, value: string) {
@@ -1317,12 +1306,7 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
             <label className="widget-screen-toggle"><input type="checkbox" checked={widgetArea.enabled} disabled={busy} onChange={(event) => updateWidgetScreen({ enabled: event.target.checked })} /> Show on phone</label>
             <label className="grid-size-control">Rows<DeckSelect value={String(widgetScreen.rows)} disabled={busy} options={Array.from({ length: 6 }, (_, index) => ({ value: String(index + 1), label: String(index + 1) }))} onChange={(value) => resizeWidgetScreen('rows', value)} /></label>
             <label className="grid-size-control">Columns<DeckSelect value={String(widgetScreen.columns)} disabled={busy} options={Array.from({ length: 6 }, (_, index) => ({ value: String(index + 1), label: String(index + 1) }))} onChange={(value) => resizeWidgetScreen('columns', value)} /></label>
-            <button className="secondary-button" onClick={() => addClockWidget()} disabled={busy || !firstWidgetPlacement(widgetScreen)}><Plus size={14} /> Add clock</button>
-            <button className="secondary-button" onClick={addNowPlayingWidget} disabled={busy || !firstWidgetPlacement(widgetScreen)}><Music size={14} /> Now Playing</button>
-            <div className="widget-plugin-picker"><DeckSelect value="__add_plugin_widget__" disabled={busy || !firstWidgetPlacement(widgetScreen) || pluginWidgetOptions.length === 0} options={[{ value: '__add_plugin_widget__', label: 'Add plugin widget…' }, ...pluginWidgetOptions]} onChange={(value) => {
-              const [pluginId, definitionId] = value.split('::');
-              if (pluginId && definitionId) addPluginWidget(pluginId, definitionId);
-            }} /></div>
+            <button className="secondary-button" onClick={(event) => setAddMenu({ anchor: event.currentTarget.getBoundingClientRect() })} disabled={busy || !firstWidgetPlacement(widgetScreen)}><Plus size={14} /> Add widget</button>
           </div>
         </div>
         <div className="widget-page-toolbar">
@@ -1343,18 +1327,18 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
               const previewRows = Math.min(shown.rowSpan, widgetScreen.rows - placement.row);
               const previewColumns = Math.min(shown.columnSpan, widgetScreen.columns - placement.column);
               const phoneGrid = phoneWidgetGrid(page.buttons.length > 0, widgetScreen, itemId, shown);
-              return <button key={itemId} type="button" data-deck-item={itemId} data-deck-cell="true" data-surface="widgets" data-row={placement.row} data-column={placement.column} className={`deck-button ${item.type === 'widget' ? 'clock-widget' : ''} ${item.type === 'widget' && item.widget.type === 'now_playing' ? 'now-playing-widget-preview' : ''} ${item.type === 'button' && selected?.id === itemId ? 'selected' : ''} ${item.type === 'widget' && selectedWidget?.id === itemId ? 'selected' : ''} ${dragOverButtonId === itemId ? 'drop-target' : ''} ${draggingButtonId === itemId ? 'dragging' : ''} ${preview && !preview.valid ? 'resize-invalid' : ''}`} style={{ gridColumn: `${placement.column + 1} / span ${Math.min(shown.columnSpan, widgetScreen.columns - placement.column)}`, gridRow: `${placement.row + 1} / span ${Math.min(shown.rowSpan, widgetScreen.rows - placement.row)}` }} onClick={() => item.type === 'button' ? (setWidgetId(''), setButtonId(item.button.id)) : (setButtonId(''), setWidgetId(item.widget.id))} onPointerDown={(event) => item.type === 'button' ? startButtonDrag(event, item.button.id, 'widgets') : startWidgetDrag(event, item.widget.id)} onPointerMove={moveButtonDrag} onPointerUp={finishButtonDrag} onPointerCancel={cancelButtonDrag} onLostPointerCapture={cancelButtonDrag}>
-                {item.type === 'button' ? <><span>{iconForButton(item.button, playbackState)}</span><strong>{buttonLabel(item.button, playbackState)}</strong></> : item.widget.type === 'clock' ? <><span className="clock-widget-icon"><Clock size={18} /></span><strong>{clock.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</strong><small>{clock.toLocaleDateString()}</small></> : item.widget.type === 'now_playing' ? <NowPlayingPreview media={mediaState} surface={widgetSurface ?? REFERENCE_WIDGET_SURFACE} columns={phoneGrid.columns} rows={phoneGrid.rows} columnSpan={previewColumns} rowSpan={previewRows} /> : item.widget.renderType === 'text' ? <><span className="clock-widget-icon"><Package size={18} /></span><strong>{item.widget.values.title || item.widget.widgetId}</strong><small>{item.widget.values.body || 'Text widget'}</small></> : <><span className="clock-widget-icon"><Package size={18} /></span><strong>Unavailable widget</strong><small>{item.widget.renderType}</small></>}
+              return <button key={itemId} type="button" data-deck-item={itemId} data-deck-cell="true" data-surface="widgets" data-row={placement.row} data-column={placement.column} className={`deck-button ${item.type === 'widget' ? 'clock-widget' : ''} ${item.type === 'widget' && (item.widget.type === 'now_playing' || item.widget.type === 'clock') ? 'now-playing-widget-preview' : ''} ${item.type === 'button' && selected?.id === itemId ? 'selected' : ''} ${item.type === 'widget' && selectedWidget?.id === itemId ? 'selected' : ''} ${dragOverButtonId === itemId ? 'drop-target' : ''} ${draggingButtonId === itemId ? 'dragging' : ''} ${preview && !preview.valid ? 'resize-invalid' : ''}`} style={{ gridColumn: `${placement.column + 1} / span ${Math.min(shown.columnSpan, widgetScreen.columns - placement.column)}`, gridRow: `${placement.row + 1} / span ${Math.min(shown.rowSpan, widgetScreen.rows - placement.row)}` }} onClick={() => item.type === 'button' ? (setWidgetId(''), setButtonId(item.button.id)) : (setButtonId(''), setWidgetId(item.widget.id))} onPointerDown={(event) => item.type === 'button' ? startButtonDrag(event, item.button.id, 'widgets') : startWidgetDrag(event, item.widget.id)} onPointerMove={moveButtonDrag} onPointerUp={finishButtonDrag} onPointerCancel={cancelButtonDrag} onLostPointerCapture={cancelButtonDrag}>
+                {item.type === 'button' ? <><span>{iconForButton(item.button, playbackState)}</span><strong>{buttonLabel(item.button, playbackState)}</strong></> : item.widget.type === 'clock' ? (() => { const block = widgetBlockSize(widgetSurface ?? REFERENCE_WIDGET_SURFACE, phoneGrid.columns, phoneGrid.rows, previewColumns, previewRows); return <ClockFacePreview face={item.widget.face ?? 'digital'} color={item.widget.color} width={block.width} height={block.height} />; })() : item.widget.type === 'now_playing' ? <NowPlayingPreview media={mediaState} surface={widgetSurface ?? REFERENCE_WIDGET_SURFACE} columns={phoneGrid.columns} rows={phoneGrid.rows} columnSpan={previewColumns} rowSpan={previewRows} /> : item.widget.renderType === 'text' ? <><span className="clock-widget-icon"><Package size={18} /></span><strong>{item.widget.values.title || item.widget.widgetId}</strong><small>{item.widget.values.body || 'Text widget'}</small></> : <><span className="clock-widget-icon"><Package size={18} /></span><strong>Unavailable widget</strong><small>{item.widget.renderType}</small></>}
                 <span className="deck-button-size">{preview ? `${shown.columnSpan}×${shown.rowSpan}` : placement.rowSpan > 1 || placement.columnSpan > 1 ? `${placement.columnSpan}×${placement.rowSpan}` : null}</span>
                 <span className="deck-resize-handle" aria-hidden="true" onPointerDown={(event) => item.type === 'button' ? startResize(event, item.button, 'widgets', 'button') : startResize(event, item.widget, 'widgets', 'widget')} onPointerMove={moveResize} onPointerUp={finishResize} onPointerCancel={cancelResize} onLostPointerCapture={cancelResize} />
               </button>;
             }
-            return <button key={`widget-empty-${index}`} type="button" data-deck-cell="true" data-surface="widgets" data-row={row} data-column={column} className={`deck-button deck-slot ${dragOverCellKey === `${row}:${column}` ? 'drop-target' : ''}`} onClick={() => addClockWidget(row, column)} disabled={busy || !firstWidgetPlacement(widgetScreen)} aria-label={`Add clock in row ${row + 1}, column ${column + 1}`}><Plus size={17} /><span>Add clock</span></button>;
+            return <button key={`widget-empty-${index}`} type="button" data-deck-cell="true" data-surface="widgets" data-row={row} data-column={column} className={`deck-button deck-slot ${dragOverCellKey === `${row}:${column}` ? 'drop-target' : ''}`} onClick={(event) => setAddMenu({ anchor: event.currentTarget.getBoundingClientRect(), row, column })} disabled={busy || !firstWidgetPlacement(widgetScreen)} aria-label={`Add a widget in row ${row + 1}, column ${column + 1}`}><Plus size={17} /><span>Add widget</span></button>;
           })}
         </div>
       </section>
       </div>
-      <div className="button-properties"><div className="properties-heading"><div><h2>{selectedWidget ? 'Widget settings' : 'Button settings'}</h2><p>{selectedWidget?.type === 'clock' ? 'Clock · uses this PC’s local time' : selectedWidget?.type === 'now_playing' ? 'Now Playing · system media from this PC' : selectedWidget?.type === 'plugin' ? `${plugins.find((plugin) => plugin.id === selectedWidget.pluginId)?.name ?? 'Plugin'} · ${selectedWidgetDefinition?.name ?? selectedWidget.widgetId}` : selected ? 'Edit the selected control' : 'Select an item from either grid'}</p></div>{selected || selectedWidget ? <button className="icon-button" aria-label={selectedWidget ? 'Remove widget' : 'Remove button'} onClick={() => {
+      <div className="button-properties"><div className="properties-heading"><div><h2>{selectedWidget ? 'Widget settings' : 'Button settings'}</h2><p>{selectedWidget?.type === 'clock' ? 'Clock · shows the phone’s local time' : selectedWidget?.type === 'now_playing' ? 'Now Playing · system media from this PC' : selectedWidget?.type === 'plugin' ? `${plugins.find((plugin) => plugin.id === selectedWidget.pluginId)?.name ?? 'Plugin'} · ${selectedWidgetDefinition?.name ?? selectedWidget.widgetId}` : selected ? 'Edit the selected control' : 'Select an item from either grid'}</p></div>{selected || selectedWidget ? <button className="icon-button" aria-label={selectedWidget ? 'Remove widget' : 'Remove button'} onClick={() => {
         if (selectedWidget) { deleteSelectedWidget(); return; }
         if (!selected) return;
         setButtonId('');
@@ -1362,9 +1346,10 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
         else replaceWidgetScreen({ ...widgetScreen, buttons: widgetScreen.buttons.filter((item) => item.id !== selected.id) });
       }}><Trash2 size={15} /></button> : null}</div>
         {selected && !selectedWidget ? <button className="secondary-button widget-transfer-button" onClick={moveSelectedButtonToOtherSurface} disabled={busy}>{page.buttons.some((button) => button.id === selected.id) ? 'Move to widget area' : 'Move to button grid'}</button> : null}
-        {selectedWidget?.type === 'clock' ? <div className="widget-properties"><Clock size={22} /><strong>Clock</strong><span>Displays the phone’s local time and date.</span></div> : selectedWidget?.type === 'now_playing' ? <div className="widget-properties"><Music size={22} /><strong>Now Playing</strong><span>Shows the active media session, artwork and playback progress from this PC.</span></div> : selectedWidget?.type === 'plugin' ? <PluginWidgetProperties widget={selectedWidget} definition={selectedWidgetDefinition} busy={busy} onChange={updateSelectedPluginWidgetValue} /> : selected ? <ButtonProperties key={selected.id} button={selected} busy={busy} isMacos={isMacos} profiles={deck.profiles} pages={profile.pages} plugins={plugins} onChange={updateButton} /> : <div className="properties-empty">Select an item from either grid.</div>}
+        {selectedWidget?.type === 'clock' ? <ClockWidgetSettings key={selectedWidget.id} face={selectedWidget.face} color={selectedWidget.color} busy={busy} block={(() => { const grid = phoneWidgetGrid(page.buttons.length > 0, widgetScreen, selectedWidget.id, selectedWidget.placement); return widgetBlockSize(widgetSurface ?? REFERENCE_WIDGET_SURFACE, grid.columns, grid.rows, selectedWidget.placement.columnSpan, selectedWidget.placement.rowSpan); })()} onChange={updateSelectedClockWidget} /> : selectedWidget?.type === 'now_playing' ? <div className="widget-properties"><Music size={22} /><strong>Now Playing</strong><span>Shows the active media session, artwork and playback progress from this PC.</span></div> : selectedWidget?.type === 'plugin' ? <PluginWidgetProperties widget={selectedWidget} definition={selectedWidgetDefinition} busy={busy} onChange={updateSelectedPluginWidgetValue} /> : selected ? <ButtonProperties key={selected.id} button={selected} busy={busy} isMacos={isMacos} profiles={deck.profiles} pages={profile.pages} plugins={plugins} onChange={updateButton} /> : <div className="properties-empty">Select an item from either grid.</div>}
         {selected || selectedWidget ? <button className="primary-button save-button" onClick={() => void save(deck)} disabled={busy}><Save size={14} /> {busy ? 'Saving…' : 'Save deck'}</button> : null}
       </div>
+      {addMenu ? <AddWidgetMenu anchor={addMenu.anchor} plugins={pluginWidgetOptions.map((option) => ({ pluginId: option.plugin.id, widgetId: option.widget.id, label: option.label }))} onPick={(choice) => addWidget(choice, addMenu.row, addMenu.column)} onClose={() => setAddMenu(null)} /> : null}
     </section>
   </>;
 }

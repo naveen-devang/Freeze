@@ -184,6 +184,22 @@ struct DeckWidget {
     render_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     values: Option<HashMap<String, String>>,
+    /// Clock face id; one of CLOCK_FACES. Missing means the Digital face.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    face: Option<String>,
+    /// Clock face colour as #rrggbb, for faces that take one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    color: Option<String>,
+}
+
+/// Face ids defined in pc-companion/src/clock-faces/clock-faces.js (scripts/check-clock-faces.ts keeps them in sync).
+const CLOCK_FACES: &[&str] = &[
+    "digital", "analog", "flip", "glow", "word", "poster", "nixie", "led", "crt", "pong", "slots", "tape", "tide", "sky",
+    "aurora", "lava", "sand", "pendulum", "orbit", "clockclock", "ferro", "swarm", "rings", "radar", "fibonacci", "strips",
+];
+
+fn valid_hex_color(value: &str) -> bool {
+    value.len() == 7 && value.starts_with('#') && value[1..].chars().all(|c| c.is_ascii_hexdigit())
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -665,6 +681,15 @@ fn validate_page_layout(page: &DeckPage) -> Result<(), String> {
 }
 
 fn validate_deck_widget(widget: &DeckWidget) -> Result<(), String> {
+    if widget.kind != DeckWidgetType::Clock && (widget.face.is_some() || widget.color.is_some()) {
+        return Err("Only clock widgets have a face or colour".into());
+    }
+    if widget.face.as_deref().is_some_and(|face| !CLOCK_FACES.contains(&face)) {
+        return Err("Unknown clock face".into());
+    }
+    if widget.color.as_deref().is_some_and(|color| !valid_hex_color(color)) {
+        return Err("Clock colours must be #rrggbb".into());
+    }
     match widget.kind {
         DeckWidgetType::Clock
             if widget.plugin_id.is_none()

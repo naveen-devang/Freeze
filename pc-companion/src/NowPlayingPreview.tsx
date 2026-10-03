@@ -1,6 +1,6 @@
-import { useLayoutEffect, useRef, useState } from 'react';
 import { Music, Pause, Play, SkipBack, SkipForward, Volume2 } from 'lucide-react';
 import { nowPlayingLayout, widgetBlockSize, type WidgetSurface } from './now-playing-layout';
+import { useElementSize } from './useElementSize';
 
 // Used until a phone reports its widget area: an iPhone Pro Max in landscape on a widget-only page.
 export const REFERENCE_WIDGET_SURFACE: WidgetSurface = { width: 790, height: 385, gap: 10, inset: 5, fixedRowHeight: null };
@@ -12,15 +12,7 @@ const timeLabel = (milliseconds: number) => `${Math.floor(milliseconds / 60_000)
 // Lays the widget out at the phone's block size with the phone's own layout rules,
 // then scales the whole card to fit the editor cell, so both screens show the same thing.
 export function NowPlayingPreview({ media, surface, columns, rows, columnSpan, rowSpan }: { media: PreviewMedia; surface: WidgetSurface; columns: number; rows: number; columnSpan: number; rowSpan: number }) {
-  const frameRef = useRef<HTMLDivElement>(null);
-  const [box, setBox] = useState({ width: 0, height: 0 });
-  useLayoutEffect(() => {
-    const frame = frameRef.current;
-    if (!frame) return;
-    const observer = new ResizeObserver(([entry]) => setBox({ width: entry.contentRect.width, height: entry.contentRect.height }));
-    observer.observe(frame);
-    return () => observer.disconnect();
-  }, []);
+  const [frameRef, box] = useElementSize<HTMLDivElement>();
   const { width, height } = widgetBlockSize(surface, columns, rows, columnSpan, rowSpan);
   const layout = nowPlayingLayout(width, height);
   const scale = box.width && box.height ? Math.min(box.width / width, box.height / height) : 0;

@@ -11,7 +11,7 @@ export type DeckStep = { type: 'media'; command: DeckMediaCommand } | { type: 'h
 export type DeckAction = DeckStep | { type: 'run_script'; path: string; allowOnPc: boolean } | { type: 'plugin_action'; pluginId: string; actionId: string; allowOnPc: boolean; inputs?: Record<string, string> } | { type: 'sequence'; steps: DeckStep[] } | { type: 'select_profile'; profileId: string } | { type: 'select_page'; pageId: string };
 export type DeckPlacement = { row: number; column: number; rowSpan: number; columnSpan: number };
 export type DeckButton = { id: string; label: string; icon: string; placement?: DeckPlacement; iconSvg?: string; appIconData?: string; action: DeckAction };
-export type DeckWidget = { id: string; type: 'clock'; placement: DeckPlacement } | { id: string; type: 'now_playing'; placement: DeckPlacement } | { id: string; type: 'plugin'; pluginId: string; widgetId: string; renderType: string; values: Record<string, string>; placement: DeckPlacement };
+export type DeckWidget = { id: string; type: 'clock'; placement: DeckPlacement; face?: string; color?: string } | { id: string; type: 'now_playing'; placement: DeckPlacement } | { id: string; type: 'plugin'; pluginId: string; widgetId: string; renderType: string; values: Record<string, string>; placement: DeckPlacement };
 export type DeckWidgetPage = { id: string; name: string; buttons: DeckButton[]; widgets: DeckWidget[] };
 export type DeckWidgetArea = { enabled: boolean; rows: number; columns: number; pages: DeckWidgetPage[] };
 export type DeckPage = { id: string; name: string; rows?: number; columns?: number; buttons: DeckButton[]; widgetArea?: DeckWidgetArea };
@@ -105,7 +105,12 @@ function validDeckWidget(value: unknown): value is DeckWidget {
   const placement = widget.placement;
   if (typeof widget.id !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(widget.id) || !placement || typeof placement !== 'object' ||
       ![placement.row, placement.column, placement.rowSpan, placement.columnSpan].every(Number.isInteger)) return false;
-  if (widget.type === 'clock' || widget.type === 'now_playing') return true;
+  if (widget.type === 'clock') {
+    const clock = widget as Extract<DeckWidget, { type: 'clock' }>;
+    return (clock.face === undefined || (typeof clock.face === 'string' && /^[a-z]{1,24}$/.test(clock.face))) &&
+      (clock.color === undefined || (typeof clock.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(clock.color)));
+  }
+  if (widget.type === 'now_playing') return true;
   if (widget.type !== 'plugin' || !('pluginId' in widget) || !('widgetId' in widget) || !('renderType' in widget) || !('values' in widget)) return false;
   const pluginWidget = widget as Extract<DeckWidget, { type: 'plugin' }>;
   if (![pluginWidget.pluginId, pluginWidget.widgetId, pluginWidget.renderType].every((id) => typeof id === 'string' && /^[A-Za-z0-9._-]{1,64}$/.test(id)) ||
