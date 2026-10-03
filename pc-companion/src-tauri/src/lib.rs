@@ -207,6 +207,7 @@ fn valid_hex_color(value: &str) -> bool {
 enum DeckWidgetType {
     Clock,
     NowPlaying,
+    Lyrics,
     Plugin,
 }
 
@@ -699,7 +700,7 @@ fn validate_deck_widget(widget: &DeckWidget) -> Result<(), String> {
         {
             Ok(())
         }
-        DeckWidgetType::NowPlaying
+        DeckWidgetType::NowPlaying | DeckWidgetType::Lyrics
             if widget.plugin_id.is_none()
                 && widget.widget_id.is_none()
                 && widget.render_type.is_none()
@@ -734,7 +735,7 @@ fn validate_deck_widget(widget: &DeckWidget) -> Result<(), String> {
             }
             Ok(())
         }
-        DeckWidgetType::Clock | DeckWidgetType::NowPlaying => {
+        DeckWidgetType::Clock | DeckWidgetType::NowPlaying | DeckWidgetType::Lyrics => {
             Err("Built-in widgets cannot contain plugin metadata".into())
         }
     }

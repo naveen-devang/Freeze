@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
-import { Clock, Music, Package } from 'lucide-react';
+import { Clock, MicVocal, Music, Package } from 'lucide-react';
 
-export type WidgetChoice = { kind: 'clock' } | { kind: 'now_playing' } | { kind: 'plugin'; pluginId: string; widgetId: string };
+export type WidgetChoice = { kind: 'clock' } | { kind: 'now_playing' } | { kind: 'lyrics' } | { kind: 'plugin'; pluginId: string; widgetId: string };
 type PluginOption = { pluginId: string; widgetId: string; label: string };
 
 // One picker for every widget type, opened from the toolbar or from an empty cell.
@@ -24,6 +24,7 @@ export function AddWidgetMenu({ anchor, plugins, onPick, onClose }: { anchor: DO
   return <div ref={ref} className="add-widget-menu" role="menu" style={{ left, top, width }}>
     {option('clock', <Clock size={18} />, 'Clock', '26 faces, many with your own color', { kind: 'clock' })}
     {option('now_playing', <Music size={18} />, 'Now Playing', 'Artwork, controls and volume for this PC', { kind: 'now_playing' })}
+    {option('lyrics', <MicVocal size={18} />, 'Lyrics', 'Synced lyrics for what this PC is playing', { kind: 'lyrics' })}
     {plugins.map((plugin) => option(`${plugin.pluginId}::${plugin.widgetId}`, <Package size={18} />, plugin.label, 'Plugin widget', { kind: 'plugin', pluginId: plugin.pluginId, widgetId: plugin.widgetId }))}
   </div>;
 }

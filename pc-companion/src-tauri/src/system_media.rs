@@ -180,8 +180,18 @@ async fn read_system_media_state(
         .and_then(|timeline| {
             let start = timeline.StartTime().ok()?.Duration.max(0);
             let end = timeline.EndTime().ok()?.Duration;
-            let position = timeline.Position().ok()?.Duration;
+            let mut position = timeline.Position().ok()?.Duration;
             let duration = end.saturating_sub(start);
+            // Many players (Spotify, browsers) only refresh Position on events, so add the
+            // time played since it was last reported. Synced lyrics depend on this.
+            if playback_state == PlaybackState::Playing {
+                if let Ok(updated) = timeline.LastUpdatedTime() {
+                    let elapsed = windows_now_ticks().saturating_sub(updated.UniversalTime);
+                    if updated.UniversalTime > 0 && (0..=duration).contains(&elapsed) {
+                        position = position.saturating_add(elapsed);
+                    }
+                }
+            }
             (duration > 0).then(|| {
                 (
                     Some(position.saturating_sub(start).clamp(0, duration) as u64 / 10_000),
@@ -361,6 +371,16 @@ pub(super) async fn seek(position_ms: u64) -> Result<(), String> {
 #[cfg(not(windows))]
 pub(super) async fn seek(_position_ms: u64) -> Result<(), String> {
     Err("Seeking is not supported on this platform".into())
+}
+
+/// Current time as a Windows DateTime: 100 ns ticks since 1601-01-01 UTC.
+#[cfg(windows)]
+fn windows_now_ticks() -> i64 {
+    const UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
+    let since_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    UNIX_EPOCH_TICKS.saturating_add((since_unix.as_nanos() / 100) as i64)
 }
 
 #[cfg(windows)]

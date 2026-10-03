@@ -261,6 +261,21 @@ button:focus-visible { outline: 2px solid #d4d4d8; outline-offset: 2px; }
 .now-playing-preview-controls { width: 100%; display: flex; align-items: center; justify-content: center; }
 .now-playing-preview-controls i { display: grid; place-items: center; box-sizing: border-box; border: 1px solid transparent; border-radius: 9px; color: var(--muted); font-style: normal; }
 .now-playing-preview-controls i.primary { border-color: var(--border); background: #202024; color: var(--foreground); }
+/* Lyrics preview: mirrors phone-app/src/lyrics-widget.tsx (spring wave approximated with a CSS overshoot curve). */
+.lyrics-preview { background: transparent; }
+.lyrics-preview-lines { position: absolute; inset: 0; overflow: hidden; }
+.lyrics-preview-lines p { margin: 0; color: var(--foreground); font-weight: 700; line-height: 1.25; text-align: left; transform-origin: left center; transition: transform 600ms cubic-bezier(.25, 1.15, .4, 1), opacity 450ms cubic-bezier(.33, 1, .68, 1); }
+.lyrics-preview-center { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; padding: 8px; box-sizing: border-box; color: var(--muted); font-weight: 600; text-align: center; }
+.lyrics-preview-plain { height: 100%; box-sizing: border-box; overflow: hidden; color: var(--foreground); opacity: .85; font-weight: 600; line-height: 1.48; white-space: pre-line; }
+.lyrics-preview-dots { display: inline-flex; align-items: center; gap: .7em; height: 2.6em; }
+.lyrics-preview-dots i { width: 1em; height: 1em; border-radius: 50%; background: var(--foreground); opacity: .3; }
+.lyrics-preview-center .lyrics-preview-dots i, .lyrics-preview-dots.breathing i { opacity: 1; }
+.lyrics-preview-dots.breathing { animation: lyrics-breath 2s ease-in-out infinite; }
+@keyframes lyrics-breath { 50% { transform: scale(1.08); } }
+@media (prefers-reduced-motion: reduce) {
+  .lyrics-preview-lines p { transition: opacity 200ms; }
+  .lyrics-preview-dots.breathing { animation: none; }
+}
 .clock-widget strong { font-size: clamp(16px, 2vw, 24px); font-variant-numeric: tabular-nums; }
 .clock-widget small { font-size: 11px; }
 .widget-properties { min-height: 112px; padding: 18px 14px; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; color: var(--muted); }
