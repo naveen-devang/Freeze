@@ -19,7 +19,7 @@ export type DeckProfile = { id: string; name: string; pages: DeckPage[]; activeP
 export type DeckConfig = { schemaVersion: number; revision: number; profiles: DeckProfile[]; activeProfileId: string };
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 export type PlaybackState = 'playing' | 'paused' | 'stopped' | 'unavailable';
-export type SystemMediaState = { sourceAppId?: string; title?: string; artist?: string; album?: string; playbackState: PlaybackState; positionMs?: number; durationMs?: number; artworkDataUrl?: string; volumePercent?: number };
+export type SystemMediaState = { sourceAppId?: string; title?: string; artist?: string; album?: string; playbackState: PlaybackState; positionMs?: number; durationMs?: number; artworkDataUrl?: string; volumePercent?: number; canSeek?: boolean };
 export type ActionError = 'accessibility_permission_required' | 'app_launch_failed' | 'stale_revision' | 'unknown_button' | 'control_failed';
 
 type ConnectionContextValue = {
@@ -40,6 +40,7 @@ type ConnectionContextValue = {
   sendButton: (buttonId: string) => boolean;
   sendMediaCommand: (command: DeckMediaCommand) => boolean;
   sendSystemVolume: (volumePercent: number) => boolean;
+  seekMedia: (positionMs: number) => boolean;
   selectProfile: (profileId: string) => boolean;
   selectPage: (pageId: string) => boolean;
   reportWidgetSurface: (surface: WidgetSurface) => void;
@@ -267,6 +268,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
                 positionMs: number('positionMs'),
                 durationMs: number('durationMs'),
                 volumePercent: typeof value.volumePercent === 'number' && Number.isFinite(value.volumePercent) && value.volumePercent >= 0 && value.volumePercent <= 100 ? Math.round(value.volumePercent) : undefined,
+                canSeek: value.canSeek === true,
                 artworkDataUrl: artwork && /^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/]+=*$/.test(artwork) ? artwork : undefined,
               });
             }
@@ -456,6 +458,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
   const sendButton = useCallback((buttonId: string) => sendRequest('invoke_button', 'buttonId', buttonId), [sendRequest]);
   const sendMediaCommand = useCallback((command: DeckMediaCommand) => sendRequest('invoke_media_command', 'command', command), [sendRequest]);
   const sendSystemVolume = useCallback((volumePercent: number) => sendRequest('set_system_volume', 'volumePercent', Math.round(Math.max(0, Math.min(100, volumePercent)))), [sendRequest]);
+  const seekMedia = useCallback((positionMs: number) => sendRequest('seek_media', 'positionMs', Math.round(Math.max(0, positionMs))), [sendRequest]);
   const selectProfile = useCallback((profileId: string) => sendRequest('select_profile', 'profileId', profileId), [sendRequest]);
   const selectPage = useCallback((pageId: string) => sendRequest('select_page', 'pageId', pageId), [sendRequest]);
   // Tells the desktop how big the phone's widget area is, so its Now Playing preview matches.
@@ -469,7 +472,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
   }, [status]);
 
   return (
-    <ConnectionContext.Provider value={{ connection, pairedDevices, status, protocolError, playbackState, mediaState, deckConfig, independentNavigation, selectedProfileId, selectedPageId, actionError, connect, disconnect, removePairedDevice, sendButton, sendMediaCommand, sendSystemVolume, selectProfile, selectPage, reportWidgetSurface }}>
+    <ConnectionContext.Provider value={{ connection, pairedDevices, status, protocolError, playbackState, mediaState, deckConfig, independentNavigation, selectedProfileId, selectedPageId, actionError, connect, disconnect, removePairedDevice, sendButton, sendMediaCommand, sendSystemVolume, seekMedia, selectProfile, selectPage, reportWidgetSurface }}>
       {children}
     </ConnectionContext.Provider>
   );

@@ -1561,6 +1561,12 @@ enum ClientMessage {
     WidgetSurface {
         surface: WidgetSurface,
     },
+    SeekMedia {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "positionMs")]
+        position_ms: u64,
+    },
 }
 
 enum ClientAction {
@@ -2990,6 +2996,34 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                             break;
                         }
                     }
+                }
+            }
+            ClientMessage::SeekMedia {
+                request_id,
+                position_ms,
+            } if authenticated => {
+                let duration_ms = state.media_state.borrow().duration_ms;
+                let result = if valid_id(&request_id)
+                    && duration_ms.is_some_and(|duration| position_ms <= duration)
+                {
+                    system_media::seek(position_ms).await
+                } else {
+                    Err("invalid_request".to_owned())
+                };
+                let reply = match result {
+                    Ok(()) => {
+                        serde_json::json!({ "type": "action_result", "requestId": request_id, "ok": true })
+                    }
+                    Err(_) => {
+                        serde_json::json!({ "type": "action_result", "requestId": request_id, "ok": false, "reason": "control_failed" })
+                    }
+                };
+                if socket
+                    .send(Message::Text(reply.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
             }
             ClientMessage::WidgetSurface { surface } if authenticated => {

@@ -19,6 +19,8 @@ pub(super) struct SystemMediaState {
     pub(super) duration_ms: Option<u64>,
     pub(super) artwork_data_url: Option<String>,
     pub(super) volume_percent: Option<u8>,
+    /// Whether the current player accepts seek requests.
+    pub(super) can_seek: bool,
 }
 
 impl SystemMediaState {
@@ -33,6 +35,7 @@ impl SystemMediaState {
             duration_ms: None,
             artwork_data_url: None,
             volume_percent: read_system_volume(),
+            can_seek: false,
         }
     }
 
@@ -42,6 +45,7 @@ impl SystemMediaState {
             && self.artist == other.artist
             && self.album == other.album
             && self.artwork_data_url == other.artwork_data_url
+            && self.can_seek == other.can_seek
     }
 }
 
@@ -164,6 +168,12 @@ async fn read_system_media_state(
         })
         .unwrap_or(PlaybackState::Unavailable);
 
+    let can_seek = session
+        .GetPlaybackInfo()
+        .and_then(|info| info.Controls())
+        .and_then(|controls| controls.IsPlaybackPositionEnabled())
+        .unwrap_or(false);
+
     let (position_ms, duration_ms) = session
         .GetTimelineProperties()
         .ok()
@@ -207,6 +217,7 @@ async fn read_system_media_state(
         duration_ms,
         artwork_data_url: artwork_cache.clone(),
         volume_percent: read_system_volume(),
+        can_seek,
     }
 }
 
@@ -313,6 +324,43 @@ pub(super) fn set_system_volume(percent: u8) -> Result<(), String> {
         let _ = percent;
         Err("System volume control is not supported on this platform".into())
     }
+}
+
+/// Moves the current player to `position_ms` from the start of the track.
+#[cfg(windows)]
+pub(super) async fn seek(position_ms: u64) -> Result<(), String> {
+    use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager as SessionManager;
+
+    let manager = SessionManager::RequestAsync()
+        .map_err(|error| error.to_string())?
+        .await
+        .map_err(|error| error.to_string())?;
+    let session = manager.GetCurrentSession().map_err(|error| error.to_string())?;
+    let start = session
+        .GetTimelineProperties()
+        .and_then(|timeline| timeline.StartTime())
+        .map(|time| time.Duration.max(0))
+        .unwrap_or(0);
+    let ticks = i64::try_from(position_ms)
+        .ok()
+        .and_then(|ms| ms.checked_mul(10_000))
+        .and_then(|offset| offset.checked_add(start))
+        .ok_or("Seek position is out of range")?;
+    let accepted = session
+        .TryChangePlaybackPositionAsync(ticks)
+        .map_err(|error| error.to_string())?
+        .await
+        .map_err(|error| error.to_string())?;
+    if accepted {
+        Ok(())
+    } else {
+        Err("The player refused the seek".into())
+    }
+}
+
+#[cfg(not(windows))]
+pub(super) async fn seek(_position_ms: u64) -> Result<(), String> {
+    Err("Seeking is not supported on this platform".into())
 }
 
 #[cfg(windows)]

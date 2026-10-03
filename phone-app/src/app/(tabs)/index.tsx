@@ -1,4 +1,4 @@
-import { useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'expo-router';
 import { BackHandler, Image, PanResponder, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
@@ -102,64 +102,118 @@ function mediaTimeLabel(milliseconds: number | undefined) {
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
 }
 
-function SystemVolumeSlider({ value, disabled, height, controlSize, labelSize, onChange, onInteract, onClose }: { value?: number; disabled: boolean; height: number; controlSize: number; labelSize: number; onChange: (value: number) => boolean; onInteract: () => void; onClose: () => void }) {
+const clampUnit = (value: number) => Math.max(0, Math.min(1, value));
+
+type ScrubBarProps = {
+  value: number;
+  disabled: boolean;
+  height: number;
+  trackHeight: number;
+  knobSize: number;
+  alwaysShowKnob?: boolean;
+  hitSlop?: { top: number; bottom: number };
+  accessibilityLabel: string;
+  accessibilityValue: { min: number; max: number; now: number };
+  accessibilityStep: number;
+  onScrub?: (value: number) => void;
+  onCommit: (value: number) => boolean;
+};
+
+// A bar you press and drag along; values are 0–1. Once it has the touch it refuses to hand it
+// over, so the widget page swipe and the portrait scroll view can't cancel a scrub halfway.
+function ScrubBar({ value, disabled, height, trackHeight, knobSize, alwaysShowKnob = false, hitSlop, accessibilityLabel, accessibilityValue, accessibilityStep, onScrub, onCommit }: ScrubBarProps) {
   const [width, setWidth] = useState(1);
   const [dragValue, setDragValue] = useState<number | null>(null);
-  const dragValueRef = useRef<number | null>(null);
-  const currentValue = dragValue ?? value ?? 0;
-  const knob = Math.max(12, height * 0.36);
+  const [dragging, setDragging] = useState(false);
+  const drag = useRef<{ startX: number; value: number } | null>(null);
+  // The responder is created once, so it reads the latest props through this ref.
+  const latest = useRef({ width, disabled, onScrub, onCommit });
   useEffect(() => {
-    if (dragValue === null) return;
-    const timeout = setTimeout(() => setDragValue((current) => current === dragValue ? null : current), value === dragValue ? 0 : 1500);
+    latest.current = { width, disabled, onScrub, onCommit };
+  });
+  // After a release, keep showing the chosen value until the PC reports it (or 1.5 s pass).
+  useEffect(() => {
+    if (dragging || dragValue === null) return;
+    const timeout = setTimeout(() => setDragValue(null), 1500);
     return () => clearTimeout(timeout);
-  }, [dragValue, value]);
-  const updateFromEvent = useCallback((locationX: number) => {
-    const next = Math.round(Math.max(0, Math.min(1, locationX / width)) * 100);
-    dragValueRef.current = next;
-    setDragValue(next);
-    onInteract();
-  }, [onInteract, width]);
-  // PanResponder runs these callbacks for native gestures, after render; the ref
-  // preserves the latest touch value until its release callback commits it.
+  }, [dragValue, dragging]);
+  // PanResponder calls these after render, when the refs hold the live gesture and props.
   // eslint-disable-next-line react-hooks/refs
-  const responder = useMemo(() => PanResponder.create({
-    onStartShouldSetPanResponder: () => !disabled,
-    onMoveShouldSetPanResponder: () => !disabled,
-    onPanResponderGrant: (event) => updateFromEvent(event.nativeEvent.locationX),
-    onPanResponderMove: (event) => updateFromEvent(event.nativeEvent.locationX),
-    onPanResponderRelease: () => {
-      const next = dragValueRef.current;
-      dragValueRef.current = null;
-      onInteract();
-      if (next !== null) {
-        setDragValue(next);
-        if (!onChange(next)) setDragValue(null);
-      }
-    },
-    onPanResponderTerminate: () => {
-      dragValueRef.current = null;
-      setDragValue(null);
-    },
-  }), [disabled, onChange, onInteract, updateFromEvent]);
+  const [responder] = useState(() => {
+    const update = (next: number) => {
+      if (!drag.current) return;
+      drag.current.value = next;
+      setDragValue(next);
+      latest.current.onScrub?.(next);
+    };
+    return PanResponder.create({
+      onStartShouldSetPanResponder: () => !latest.current.disabled,
+      onMoveShouldSetPanResponder: () => !latest.current.disabled,
+      onPanResponderTerminationRequest: () => false,
+      onShouldBlockNativeResponder: () => true,
+      onPanResponderGrant: (event) => {
+        const startX = event.nativeEvent.locationX;
+        drag.current = { startX, value: 0 };
+        setDragging(true);
+        update(clampUnit(startX / latest.current.width));
+      },
+      // Track the finger from where it landed plus how far it moved; locationX alone jumps
+      // when the finger slides over another view or off the bar.
+      onPanResponderMove: (_, gesture) => {
+        if (drag.current) update(clampUnit((drag.current.startX + gesture.dx) / latest.current.width));
+      },
+      onPanResponderRelease: () => {
+        const finished = drag.current;
+        drag.current = null;
+        setDragging(false);
+        if (finished && !latest.current.onCommit(finished.value)) setDragValue(null);
+      },
+      onPanResponderTerminate: () => {
+        drag.current = null;
+        setDragging(false);
+        setDragValue(null);
+      },
+    });
+  });
+  const shown = dragValue !== null && (dragging || Math.abs(dragValue - value) >= 0.01) ? dragValue : value;
+  const rail = dragging ? trackHeight * 1.8 : trackHeight;
+  return <View accessibilityRole="adjustable" accessibilityLabel={accessibilityLabel} accessibilityValue={accessibilityValue} accessibilityActions={[{ name: 'increment' }, { name: 'decrement' }]} onAccessibilityAction={(event) => {
+    setDragValue(null);
+    onCommit(clampUnit(value + (event.nativeEvent.actionName === 'increment' ? accessibilityStep : -accessibilityStep)));
+  }} hitSlop={hitSlop} onLayout={(event) => setWidth(Math.max(1, event.nativeEvent.layout.width))} {...responder.panHandlers} style={[styles.scrubBar, { height }]}>
+    <View pointerEvents="none" style={[styles.scrubRail, { height: rail, borderRadius: rail / 2 }]}><View style={[styles.scrubFill, { width: `${shown * 100}%` }]} /></View>
+    {alwaysShowKnob || dragging ? <View pointerEvents="none" style={[styles.scrubKnob, { left: `${shown * 100}%`, width: knobSize, height: knobSize, marginLeft: -knobSize / 2, borderRadius: knobSize / 2 }]} /> : null}
+  </View>;
+}
+
+function SystemVolumeSlider({ value, disabled, height, controlSize, labelSize, onChange, onInteract, onClose }: { value?: number; disabled: boolean; height: number; controlSize: number; labelSize: number; onChange: (value: number) => boolean; onInteract: () => void; onClose: () => void }) {
+  const [scrubValue, setScrubValue] = useState<number | null>(null);
+  const lastSent = useRef(0);
   return <View style={[styles.nowPlayingVolume, { height, gap: controlSize * 0.3 }, disabled && styles.nowPlayingVolumeDisabled]}>
     <Pressable onPress={onClose} accessibilityRole="button" accessibilityLabel="Hide volume" style={[styles.nowPlayingControl, styles.nowPlayingVolumeClose, { width: controlSize, height: controlSize }]}>
       <Volume2 size={controlSize * 0.5} color="#93c5fd" strokeWidth={1.8} />
     </Pressable>
-    <View accessibilityRole="adjustable" accessibilityLabel="System volume" accessibilityValue={{ min: 0, max: 100, now: currentValue }} onAccessibilityAction={(event) => {
-      const next = Math.max(0, Math.min(100, currentValue + (event.nativeEvent.actionName === 'increment' ? 5 : -5)));
-      setDragValue(null);
+    <View style={styles.nowPlayingVolumeTrack}><ScrubBar value={(value ?? 0) / 100} disabled={disabled} height={height} trackHeight={5} knobSize={Math.max(12, height * 0.36)} alwaysShowKnob accessibilityLabel="System volume" accessibilityValue={{ min: 0, max: 100, now: Math.round((scrubValue ?? (value ?? 0) / 100) * 100) }} accessibilityStep={0.05} onScrub={(next) => {
+      setScrubValue(next);
       onInteract();
-      onChange(next);
-    }} accessibilityActions={[{ name: 'increment' }, { name: 'decrement' }]} onLayout={(event) => setWidth(Math.max(1, event.nativeEvent.layout.width))} {...responder.panHandlers} style={[styles.nowPlayingVolumeTrack, { height }]}>
-      <View pointerEvents="none" style={styles.nowPlayingVolumeRail}><View style={[styles.nowPlayingVolumeFill, { width: `${currentValue}%` }]} /></View>
-      <View pointerEvents="none" style={[styles.nowPlayingVolumeThumb, { left: `${currentValue}%`, width: knob, height: knob, marginLeft: -knob / 2, borderRadius: knob / 2 }]} />
-    </View>
-    <Text allowFontScaling={false} style={[styles.nowPlayingVolumeLabel, { fontSize: labelSize, minWidth: labelSize * 3.4 }]}>{value === undefined ? '—' : `${currentValue}%`}</Text>
+      // Live volume while scrubbing, at most every 100 ms; the release always sends the final value.
+      const now = Date.now();
+      if (now - lastSent.current >= 100) {
+        lastSent.current = now;
+        onChange(Math.round(next * 100));
+      }
+    }} onCommit={(next) => {
+      setScrubValue(null);
+      onInteract();
+      return onChange(Math.round(next * 100));
+    }} /></View>
+    <Text allowFontScaling={false} style={[styles.nowPlayingVolumeLabel, { fontSize: labelSize, minWidth: labelSize * 3.4 }]}>{value === undefined ? '—' : `${Math.round(scrubValue !== null ? scrubValue * 100 : value)}%`}</Text>
   </View>;
 }
 
-function NowPlayingWidget({ media, connected, sendCommand, sendVolume }: { media: SystemMediaState; connected: boolean; sendCommand: (command: DeckMediaCommand) => boolean; sendVolume: (volumePercent: number) => boolean }) {
+function NowPlayingWidget({ media, connected, sendCommand, sendVolume, seekMedia }: { media: SystemMediaState; connected: boolean; sendCommand: (command: DeckMediaCommand) => boolean; sendVolume: (volumePercent: number) => boolean; seekMedia: (positionMs: number) => boolean }) {
   const [size, setSize] = useState({ width: 0, height: 0 });
+  const [scrubPosition, setScrubPosition] = useState<number | null>(null);
   const [volumeOpen, setVolumeOpen] = useState(false);
   const volumeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Every size decision comes from the shared layout, which the desktop preview also uses.
@@ -185,6 +239,7 @@ function NowPlayingWidget({ media, connected, sendCommand, sendVolume }: { media
   const duration = media.durationMs && media.durationMs > 0 ? media.durationMs : 0;
   const currentPosition = duration ? Math.max(0, Math.min(duration, media.positionMs ?? 0)) : Math.max(0, media.positionMs ?? 0);
   const progress = duration ? currentPosition / duration : 0;
+  const canSeek = connected && Boolean(media.canSeek) && duration > 0;
   const artRadius = Math.max(5, layout.artSize * 0.13);
   const controlItems: { command: DeckMediaCommand; icon: typeof SkipBack; label: string; prominent?: boolean }[] = [
     { command: 'previous_track', icon: SkipBack, label: 'Previous track' },
@@ -205,9 +260,15 @@ function NowPlayingWidget({ media, connected, sendCommand, sendVolume }: { media
         <Text allowFontScaling={false} numberOfLines={1} style={[styles.nowPlayingTitle, { fontSize: layout.titleSize, lineHeight: layout.titleSize * 1.25, textAlign }]}>{hasTrack ? media.title || media.artist || media.album : 'No media'}</Text>
         {on('detail') ? <Text allowFontScaling={false} numberOfLines={1} style={[styles.nowPlayingDetail, { fontSize: layout.detailSize, lineHeight: layout.detailSize * 1.3, textAlign }]}>{supportingText}</Text> : null}
         {on('album') && media.album && media.album !== supportingText ? <Text allowFontScaling={false} numberOfLines={1} style={[styles.nowPlayingAlbum, { fontSize: layout.detailSize, lineHeight: layout.detailSize * 1.3, textAlign }]}>{media.album}</Text> : null}
-        {on('progress') ? <View style={[styles.nowPlayingProgressRow, { height: layout.barHeight + 2 }]}><View style={[styles.nowPlayingProgressTrack, { height: layout.barHeight }]}><View style={[styles.nowPlayingProgress, { width: `${progress * 100}%` }]} /></View></View> : null}
+        {on('progress') ? canSeek
+          // Seeks once on release; the time label follows the finger while dragging.
+          ? <ScrubBar value={progress} disabled={false} height={layout.barHeight + 2} trackHeight={layout.barHeight} knobSize={Math.max(12, layout.barHeight * 3)} hitSlop={{ top: 12, bottom: 12 }} accessibilityLabel="Playback position" accessibilityValue={{ min: 0, max: Math.round(duration / 1000), now: Math.round((scrubPosition ?? currentPosition) / 1000) }} accessibilityStep={Math.min(1, 10_000 / duration)} onScrub={(next) => setScrubPosition(next * duration)} onCommit={(next) => {
+            setScrubPosition(null);
+            return seekMedia(next * duration);
+          }} />
+          : <View style={[styles.nowPlayingProgressRow, { height: layout.barHeight + 2 }]}><View style={[styles.nowPlayingProgressTrack, { height: layout.barHeight }]}><View style={[styles.nowPlayingProgress, { width: `${progress * 100}%` }]} /></View></View> : null}
         {on('times') && duration > 0 ? <View style={styles.nowPlayingTimeLabels}>
-          <Text allowFontScaling={false} style={[styles.nowPlayingTimeLabel, { fontSize: layout.timeSize, lineHeight: layout.timeSize * 1.3 }]}>{mediaTimeLabel(currentPosition)}</Text>
+          <Text allowFontScaling={false} style={[styles.nowPlayingTimeLabel, { fontSize: layout.timeSize, lineHeight: layout.timeSize * 1.3 }]}>{mediaTimeLabel(scrubPosition ?? currentPosition)}</Text>
           <Text allowFontScaling={false} style={[styles.nowPlayingTimeLabel, { fontSize: layout.timeSize, lineHeight: layout.timeSize * 1.3 }]}>{mediaTimeLabel(duration)}</Text>
         </View> : null}
         {on('controls') ? volumeOpen && layout.volumeButton
@@ -231,7 +292,7 @@ function NowPlayingWidget({ media, connected, sendCommand, sendVolume }: { media
 export default function DeckScreen() {
   const router = useRouter();
   const setTabBarHidden = useContext(TabBarHiddenContext);
-  const { connection, status, playbackState, mediaState, actionError, deckConfig, independentNavigation, selectedProfileId, selectedPageId, sendButton, sendMediaCommand, sendSystemVolume, selectPage, reportWidgetSurface } = usePcConnection();
+  const { connection, status, playbackState, mediaState, actionError, deckConfig, independentNavigation, selectedProfileId, selectedPageId, sendButton, sendMediaCommand, sendSystemVolume, seekMedia, selectPage, reportWidgetSurface } = usePcConnection();
   const [feedback, setFeedback] = useState('');
   const [immersive, setImmersive] = useState(false);
   const [showImmersiveTools, setShowImmersiveTools] = useState(false);
@@ -463,7 +524,7 @@ export default function DeckScreen() {
               if (item.type === 'widget') {
                 const placement = item.widget.placement;
                 if (placement.row !== sourceRow || placement.column !== sourceColumn) return null;
-                return <View key={item.widget.id} style={[styles.immersiveKey, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12, 0)]}>{item.widget.type === 'clock' ? <ClockWidget immersive /> : item.widget.type === 'now_playing' ? <NowPlayingWidget media={mediaState} connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} /> : <PluginTextWidget widget={item.widget} immersive />}</View>;
+                return <View key={item.widget.id} style={[styles.immersiveKey, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12, 0)]}>{item.widget.type === 'clock' ? <ClockWidget immersive /> : item.widget.type === 'now_playing' ? <NowPlayingWidget media={mediaState} connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} seekMedia={seekMedia} /> : <PluginTextWidget widget={item.widget} immersive />}</View>;
               }
               const button = item.button;
               const placement = buttonPlacement({ id: widgetScreen.id, name: widgetScreen.name, rows: widgetRows, columns: widgetColumns, buttons: widgetScreen.buttons }, button);
@@ -567,7 +628,7 @@ export default function DeckScreen() {
               if (item.type === 'widget') {
                 const placement = item.widget.placement;
                 if (placement.row !== sourceRow || placement.column !== sourceColumn) return null;
-                return <View key={item.widget.id} style={[styles.key, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, widgetCellWidth, widgetCellHeight)]}>{item.widget.type === 'clock' ? <ClockWidget /> : item.widget.type === 'now_playing' ? <NowPlayingWidget media={mediaState} connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} /> : <PluginTextWidget widget={item.widget} />}</View>;
+                return <View key={item.widget.id} style={[styles.key, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, widgetCellWidth, widgetCellHeight)]}>{item.widget.type === 'clock' ? <ClockWidget /> : item.widget.type === 'now_playing' ? <NowPlayingWidget media={mediaState} connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} seekMedia={seekMedia} /> : <PluginTextWidget widget={item.widget} />}</View>;
               }
               const button = item.button;
               const placement = buttonPlacement({ id: widgetScreen.id, name: widgetScreen.name, rows: widgetRows, columns: widgetColumns, buttons: widgetScreen.buttons }, button);
@@ -635,10 +696,11 @@ const styles = StyleSheet.create({
   nowPlayingVolume: { width: '100%', flexDirection: 'row', alignItems: 'center' },
   nowPlayingVolumeDisabled: { opacity: 0.45 },
   nowPlayingVolumeClose: { borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panelRaised },
-  nowPlayingVolumeTrack: { flex: 1, justifyContent: 'center' },
-  nowPlayingVolumeRail: { height: 5, overflow: 'hidden', borderRadius: 4, backgroundColor: colors.border },
-  nowPlayingVolumeFill: { height: '100%', borderRadius: 4, backgroundColor: '#93c5fd' },
-  nowPlayingVolumeThumb: { position: 'absolute', borderWidth: 2, borderColor: colors.text, backgroundColor: '#93c5fd' },
+  scrubBar: { alignSelf: 'stretch', justifyContent: 'center' },
+  nowPlayingVolumeTrack: { flex: 1 },
+  scrubRail: { width: '100%', overflow: 'hidden', backgroundColor: colors.border },
+  scrubFill: { height: '100%', backgroundColor: '#93c5fd' },
+  scrubKnob: { position: 'absolute', borderWidth: 2, borderColor: colors.text, backgroundColor: '#93c5fd' },
   nowPlayingVolumeLabel: { color: colors.muted, fontVariant: ['tabular-nums'], textAlign: 'right', includeFontPadding: false },
   immersiveEmptyKey: { borderRadius: 10, backgroundColor: 'transparent' },
   immersiveEmptyDeck: { ...StyleSheet.absoluteFill, alignItems: 'center', justifyContent: 'center' },
