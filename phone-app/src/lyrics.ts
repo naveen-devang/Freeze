@@ -118,12 +118,20 @@ export function activeLineAt(lines: LyricLine[], positionMs: number): number {
 const TITLE_NOISE = /\s*[([](?:[^)\]]*?[\s,/&+-])?(?:official|video|audio|lyrics?|lyrical|visuali[sz]er|mv|hd|hq|4k|explicit|clean|full song)(?=$|[\s)\].,:/&+-])[^)\]]*[)\]]/gi;
 const FROM_FILM = /\s*[([]\s*from\s[^)\]]*[)\]]/gi;
 const FEATURING = /(?:^|[\s([])(?:feat\.?|ft\.?|featuring)\s.*$/i;
-const VIDEO_PREFIX = /^(?:full\s+(?:video|song|audio)|lyrical(?:\s+video)?|video\s+song|official\s+(?:music\s+)?(?:video|audio))\s*[:|\-–—]\s*/i;
+// Label words in front of the song name: "Full Video: X", "Lyrical - X", and with a colon only (so a song
+// that starts with one of these words keeps it) "Official: X", "Exclusive: X", "Latest: X", "New: X", "HD: X".
+const VIDEO_PREFIX = /^(?:(?:full\s+(?:video|song|audio)|lyrical(?:\s+video)?|video\s+song|official\s+(?:music\s+)?(?:video|audio))\s*[:|\-–—]|(?:official|exclusive|latest|new|hd)\s*:)\s*/i;
 const HASHTAGS = /(?:^|\s)#[^\s#]+/g;
 const EMOJI = /[\u{1f000}-\u{1faff}\u{2600}-\u{27bf}\u{fe0f}\u{200d}]/gu;
 const FIRST_ARTIST = /\s*(?:,|&|;|\/|\sx\s|\sand\s|\swith\s|\sfeat\.?\s|\sft\.?\s|\sfeaturing\s).*$/i;
 // Unbracketed video words at the end: "Song M/V", "Song Official MV", "Song Performance Video".
-const TRAILING_NOISE = /\s+(?:official\s+)?(?:m\/v|mv|music\s+video|lyrics?\s+video|performance\s+video|special\s+video|visuali[sz]er|video|audio)$/i;
+const TRAILING_NOISE = /\s+(?:official\s+)?(?:m\/v|mv|music\s+video|lyrics?\s+video|performance\s+video|special\s+video|visuali[sz]er|full\s+video\s+song|video\s+song|full\s+song|audio\s+song|lyrical(?:\s+video)?|video|audio)$/i;
+// Indian label uploads end the song name with "Song" ("Jhoome Jo Pathaan Song"), but so do real titles
+// ("Love Song", "Any Song"), so it is only ever tried as an extra reading, and only when 2+ words remain.
+const TRAILING_SONG = /^(\S+\s+\S.*?)\s+song$/i;
+
+// The title without a trailing "Song", or null when there is none to drop.
+export const withoutSong = (title: string) => title.match(TRAILING_SONG)?.[1] ?? null;
 // A quoted song name inside a video title, as K-pop and J-pop uploads write it: ARTIST 'Song' MV, ARTIST「Song」.
 // An ASCII or curly quote opens after a space, bracket or dash and closes before one, so apostrophes
 // inside words ("Don't", "It's Me") neither open nor close it. Corner brackets are always quotes.
@@ -168,6 +176,8 @@ export function searchQueries(track: LyricsTrack): SearchQuery[] {
     queries.push({ label, params: artistName === null ? { track_name: trackName } : { track_name: trackName, artist_name: artistName } });
   };
   add('title + artist', title, artist);
+  const songless = withoutSong(title);
+  if (songless) add('title without "Song" + artist', songless, artist);
   // A quoted song name is the strongest hint a video title carries, so it goes next.
   const quoted = quotedSong(track.title ?? '');
   if (quoted) {
@@ -186,6 +196,7 @@ export function searchQueries(track: LyricsTrack): SearchQuery[] {
     add('right half only', cleanTitle(dash[2]), null);
   }
   add('title only', title, null);
+  if (songless) add('title without "Song" only', songless, null);
   if (title) queries.push({ label: 'free text', params: { q: `${title} ${firstArtist}`.trim() } });
   return queries.filter((query, index) => queries.findIndex((other) => JSON.stringify(other.params) === JSON.stringify(query.params)) === index);
 }
@@ -346,8 +357,8 @@ export function matchContext(track: LyricsTrack, alias?: { title: string; artist
   const artist = cleanArtist(track.artist ?? '');
   return {
     durationMs: track.durationMs,
-    titles: [title, quoted?.title, dash?.[1], dash?.[2], alias?.title].filter((value): value is string => Boolean(value)).map((value) => comparable(cleanTitle(value))),
-    strongTitles: [title, quoted?.title, dash?.[2], alias?.title].filter((value): value is string => Boolean(value)).map((value) => comparable(cleanTitle(value))),
+    titles: [title, withoutSong(title), quoted?.title, dash?.[1], dash?.[2], alias?.title].filter((value): value is string => Boolean(value)).map((value) => comparable(cleanTitle(value))),
+    strongTitles: [title, withoutSong(title), quoted?.title, dash?.[2], alias?.title].filter((value): value is string => Boolean(value)).map((value) => comparable(cleanTitle(value))),
     // Title, channel and album together: an artist named anywhere in them counts ("Song | Arijit Singh" on a label's channel).
     text: ` ${comparable([track.title, track.artist, track.album, alias?.title, alias?.artist].filter(Boolean).join(' '))} `,
     artists: [artist, quoted?.artist, dash?.[1], alias?.artist].filter((value): value is string => Boolean(value)).map(squash).filter((value) => value.length >= 2),
@@ -382,15 +393,17 @@ export function artistMatches(record: LrclibRecord, context: MatchContext) {
 const durationGap = (record: LrclibRecord, durationMs?: number) => !durationMs ? 0 : typeof record.duration === 'number' ? Math.abs(record.duration - durationMs / 1000) : Infinity;
 const KIND_RANK: Record<Lyrics['kind'], number> = { synced: 0, instrumental: 1, plain: 2, none: 3, error: 3 };
 
-type Rated = { lyrics: Lyrics; gap: number; listedS?: number; title: boolean; strongTitle: boolean; artist: boolean };
+// `overruns`: synced lines running past the end of the track. Its timing belongs to a longer cut and is
+// never used automatically, but its words still serve as unsynced text and its timing is offered to pick.
+type Rated = { lyrics: Lyrics; gap: number; listedS?: number; title: boolean; strongTitle: boolean; artist: boolean; overruns: boolean };
 
 function rate(results: LrclibRecord[], context: MatchContext): Rated[] {
   return results.flatMap((record) => {
     const lyrics = fromRecord(record);
-    // Synced lines running past the end of the track belong to a longer version.
-    if (!lyrics || (lyrics.kind === 'synced' && context.durationMs && lyrics.lines[lyrics.lines.length - 1].timeMs > context.durationMs + 5000)) return [];
+    if (!lyrics) return [];
+    const overruns = lyrics.kind === 'synced' && Boolean(context.durationMs) && lyrics.lines[lyrics.lines.length - 1].timeMs > (context.durationMs ?? 0) + 5000;
     const listedS = typeof record.duration === 'number' ? record.duration : undefined;
-    return [{ lyrics, gap: durationGap(record, context.durationMs), listedS, title: titleMatches(record, context), strongTitle: titleMatches(record, context, true), artist: artistMatches(record, context) }];
+    return [{ lyrics, gap: durationGap(record, context.durationMs), listedS, title: titleMatches(record, context), strongTitle: titleMatches(record, context, true), artist: artistMatches(record, context), overruns }];
   }).sort((a, b) => Number(b.artist) - Number(a.artist) || Number(b.title) - Number(a.title) || KIND_RANK[a.lyrics.kind] - KIND_RANK[b.lyrics.kind] || a.gap - b.gap);
 }
 
@@ -438,14 +451,17 @@ function isVideo(context: MatchContext, matching: Rated[]) {
 // - Otherwise the timing most accepted entries share wins, so one odd entry can't outvote the rest.
 export function pickSearchResult(results: LrclibRecord[], context: MatchContext): Lyrics | null {
   const rated = rate(results, context);
-  const strict = rated.filter((entry) => context.durationMs
+  const strict = rated.filter((entry) => !entry.overruns && (context.durationMs
     ? entry.gap <= DURATION_TOLERANCE_S && (entry.title || entry.artist)
-    : entry.strongTitle && entry.artist);
+    : entry.strongTitle && entry.artist));
   const strong = rated.filter((entry) => entry.strongTitle && entry.artist);
-  const versions = timingVersions(syncedLines([...new Set([...strict, ...strong])]));
-  if (versions.length > 1 && isVideo(context, strong)) {
-    const usual = versions[0];
-    const later = versions
+  const pool = [...new Set([...strict, ...strong])];
+  // Every timing found is offered in the widget; only the ones that fit the track are chosen automatically.
+  const versions = timingVersions(syncedLines(pool));
+  const fitting = timingVersions(syncedLines(pool.filter((entry) => !entry.overruns)));
+  if (fitting.length > 1 && isVideo(context, strong)) {
+    const usual = fitting[0];
+    const later = fitting
       .filter((version) => version.firstMs > usual.firstMs + VERSION_TOLERANCE_MS && version.firstMs - usual.firstMs <= MAX_INTRO_MS)
       .sort((a, b) => b.firstMs - a.firstMs)[0];
     if (later) return { kind: 'synced', lines: later.lines, versions, reason: `music video: starts ${seconds(later.firstMs - usual.firstMs)} after the usual timing` };

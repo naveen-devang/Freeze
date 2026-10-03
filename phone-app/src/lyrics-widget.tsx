@@ -38,7 +38,8 @@ type SyncChoice = { offsetMs: number; versionFirstMs?: number; title?: string };
 type StoredSyncChoice = SyncChoice & { at: number };
 const SYNC_CHOICES_KEY = 'freeze.lyrics-sync';
 const MAX_SYNC_CHOICES = 300;
-const MAX_OFFSET_MS = 30_000;
+// Music videos can run a story for minutes before the song starts.
+const MAX_OFFSET_MS = 10 * 60_000;
 const NUDGE_MS = 500;
 const MAX_TYPED_TITLE = 200;
 // Matches TimingVersion grouping in lyrics.ts: versions this close are the same timing.
@@ -113,12 +114,21 @@ function useSyncChoice(key: string | null) {
   return [loaded?.key === key ? loaded.choice : NO_CHOICE, update] as const;
 }
 
-const signedSeconds = (milliseconds: number) => `${milliseconds > 0 ? '+' : milliseconds < 0 ? '−' : ''}${(Math.abs(milliseconds) / 1000).toFixed(1)} s`;
+// "+0.5 s", "−12.0 s", and past a minute "−2:30".
+const signedSeconds = (milliseconds: number) => {
+  const sign = milliseconds > 0 ? '+' : milliseconds < 0 ? '−' : '';
+  const total = Math.abs(milliseconds) / 1000;
+  return total < 60 ? `${sign}${total.toFixed(1)} s` : `${sign}${Math.floor(total / 60)}:${String(Math.floor(total % 60)).padStart(2, '0')}`;
+};
 const firstSungMs = (lines: LyricLine[]) => lines.find((line) => !isGapLine(line))?.timeMs ?? 0;
 
-// A tap steps once; holding keeps stepping until release. Only one repeat timer ever runs: a new hold
-// clears any earlier one, so fast taps can't leave a timer stepping on its own.
-function RepeatButton({ onStep, label, size, children }: { onStep: () => void; label: string; size: number; children: React.ReactNode }) {
+// Holding speeds up: steps 1-10 move 1x, the next 10 move 4x, then 20x (0.5 s, 2 s, 10 s for nudges),
+// so a minutes-long intro is a few seconds of holding.
+const holdScale = (step: number) => step < 10 ? 1 : step < 20 ? 4 : 20;
+
+// A tap steps once; holding keeps stepping, faster and faster, until release. Only one repeat timer ever
+// runs: a new hold clears any earlier one, so fast taps can't leave a timer stepping on its own.
+function RepeatButton({ onStep, label, size, children }: { onStep: (scale: number) => void; label: string; size: number; children: React.ReactNode }) {
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   const stop = useCallback(() => {
     if (timer.current) clearInterval(timer.current);
@@ -127,10 +137,14 @@ function RepeatButton({ onStep, label, size, children }: { onStep: () => void; l
   useEffect(() => stop, [stop]);
   const hold = () => {
     stop();
-    onStep();
-    timer.current = setInterval(onStep, 150);
+    let step = 0;
+    onStep(1);
+    timer.current = setInterval(() => {
+      step += 1;
+      onStep(holdScale(step));
+    }, 150);
   };
-  return <Pressable onPress={onStep} onLongPress={hold} delayLongPress={400} onPressOut={stop} hitSlop={6} accessibilityRole="button" accessibilityLabel={label} style={({ pressed }) => [styles.syncButton, { width: size + 8, height: size + 8, opacity: pressed ? 0.9 : 0.45 }]}>
+  return <Pressable onPress={() => onStep(1)} onLongPress={hold} delayLongPress={400} onPressOut={stop} hitSlop={6} accessibilityRole="button" accessibilityLabel={label} style={({ pressed }) => [styles.syncButton, { width: size + 8, height: size + 8, opacity: pressed ? 0.9 : 0.45 }]}>
     {children}
   </Pressable>;
 }
@@ -440,13 +454,13 @@ function SyncedLyrics({ lines, media, width, height, canSeek, seekMedia, onLongP
     {/* Earlier/later nudges around the resync button; the offset shows beneath them while set. */}
     <View style={[styles.syncControls, { top: padding * 0.5, right: padding * 0.5 }]}>
       <View style={styles.syncRow}>
-        <RepeatButton onStep={() => onNudge(-NUDGE_MS)} label="Show lyrics half a second later" size={icon}>
+        <RepeatButton onStep={(scale) => onNudge(-NUDGE_MS * scale)} label="Show lyrics later; hold to move faster" size={icon}>
           <Minus size={icon} color={colors.text} strokeWidth={2} />
         </RepeatButton>
         <Pressable onPress={resync} onLongPress={onLongPress} hitSlop={6} accessibilityRole="button" accessibilityLabel="Resync lyrics with the PC and clear the offset" style={({ pressed }) => [styles.syncButton, { width: icon + 8, height: icon + 8, opacity: pressed ? 0.9 : 0.45 }]}>
           <RefreshCw size={icon} color={colors.text} strokeWidth={2} />
         </Pressable>
-        <RepeatButton onStep={() => onNudge(NUDGE_MS)} label="Show lyrics half a second earlier" size={icon}>
+        <RepeatButton onStep={(scale) => onNudge(NUDGE_MS * scale)} label="Show lyrics earlier; hold to move faster" size={icon}>
           <Plus size={icon} color={colors.text} strokeWidth={2} />
         </RepeatButton>
       </View>

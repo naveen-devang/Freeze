@@ -1,7 +1,7 @@
 // Run: node scripts/check-lyrics.ts
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { activeLineAt, artistMatches, cleanArtist, cleanTitle, isGapLine, latinArtist, latinPart, lyricsTrackKey, matchAlias, matchContext, nativePart, nativeSongTitle, normalizeText, parseLrc, pickLooseResult, pickSearchResult, quotedSong, romanize, searchQueries, soundKey, timingVersions, titleMatches, withIntroGap } from '../phone-app/src/lyrics.ts';
+import { activeLineAt, withoutSong, artistMatches, cleanArtist, cleanTitle, isGapLine, latinArtist, latinPart, lyricsTrackKey, matchAlias, matchContext, nativePart, nativeSongTitle, normalizeText, parseLrc, pickLooseResult, pickSearchResult, quotedSong, romanize, searchQueries, soundKey, timingVersions, titleMatches, withIntroGap } from '../phone-app/src/lyrics.ts';
 
 assert.equal(
   readFileSync(new URL('../phone-app/src/lyrics.ts', import.meta.url), 'utf8'),
@@ -259,5 +259,30 @@ assert.equal(pick([iuWrong], { title: '아이유 - 좋은 날', artist: 'IU' }),
 // The found Latin title counts as the song's title when checking results.
 assert.ok(titleMatches({ trackName: 'Catch Catch' }, matchContext({ title: "YENA(최예나) - '캐치 캐치' M/V" }, { title: 'Catch Catch', artist: 'YENA' }), true));
 assert.equal(cleanTitle('[MV] IU(아이유) _ 좋은 날(Good Day)'), 'IU(아이유) - 좋은 날(Good Day)');
+
+// Indian label uploads: unambiguous "... Song" endings go; a bare trailing "Song" is only an extra reading.
+assert.equal(cleanTitle('Tum Hi Ho Full Video Song'), 'Tum Hi Ho');
+assert.equal(cleanTitle('Kesariya Video Song'), 'Kesariya');
+assert.equal(cleanTitle('Love Song'), 'Love Song');
+assert.equal(cleanTitle('Official: Desi Kalakaar Full VIDEO Song | Yo Yo Honey Singh | Honey Singh New Songs 2014'), 'Desi Kalakaar');
+assert.equal(cleanTitle('Exclusive: LOVE DOSE Full Video Song | Yo Yo Honey Singh'), 'LOVE DOSE');
+assert.equal(cleanTitle('Chaar Botal Vodka Full Song Feat. Yo Yo Honey Singh'), 'Chaar Botal Vodka');
+assert.equal(cleanTitle('New Rules'), 'New Rules');
+assert.equal(cleanTitle('Official Love'), 'Official Love');
+assert.equal(withoutSong('Jhoome Jo Pathaan Song'), 'Jhoome Jo Pathaan');
+assert.equal(withoutSong('Love Song'), null);
+assert.equal(withoutSong('Any Song'), null);
+assert.equal(withoutSong('Songbird'), null);
+assert.deepEqual(steps('Jhoome Jo Pathaan Song | Shah Rukh Khan', 'YRF').map(([label]) => label), [
+  'title + artist', 'title without "Song" + artist', 'title only', 'title without "Song" only', 'free text',
+]);
+// Its entries run 6 s longer than the 202 s video, past its end: their timing isn't used automatically,
+// but their words are, and their timing is offered.
+const pathaan = (artistName: string) => ({ trackName: 'Jhoome Jo Pathaan', artistName, duration: 208, syncedLyrics: '[00:26.59] Tumne mohabbat karni hai\n[01:30.00] Two\n[03:27.21] Three', plainLyrics: 'Tumne mohabbat karni hai\nTwo\nThree' });
+const pathaanVideo = { title: 'Jhoome Jo Pathaan Song | Shah Rukh Khan, Deepika | Vishal & Sheykhar, Arijit Singh, Sukriti, Kumaar', artist: 'YRF', durationMs: 202_000 };
+assert.equal(pick([pathaan('Arijit Singh'), pathaan('Kumaar')], pathaanVideo), null);
+const pathaanText = loosePick([pathaan('Arijit Singh'), pathaan('Kumaar')], pathaanVideo);
+assert.equal(pathaanText?.kind === 'plain' && pathaanText.text.split('\n')[0], 'Tumne mohabbat karni hai');
+assert.equal(pathaanText?.kind === 'plain' && pathaanText.versions?.[0].entries, 2);
 
 console.log('lyrics checks passed');
