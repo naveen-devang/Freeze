@@ -19,7 +19,7 @@ export type DeckProfile = { id: string; name: string; pages: DeckPage[]; activeP
 export type DeckConfig = { schemaVersion: number; revision: number; profiles: DeckProfile[]; activeProfileId: string };
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 export type PlaybackState = 'playing' | 'paused' | 'stopped' | 'unavailable';
-export type SystemMediaState = { sourceAppId?: string; title?: string; artist?: string; album?: string; playbackState: PlaybackState; positionMs?: number; durationMs?: number; artworkDataUrl?: string; volumePercent?: number; canSeek?: boolean };
+export type SystemMediaState = { sourceAppId?: string; title?: string; artist?: string; album?: string; playbackState: PlaybackState; positionMs?: number; durationMs?: number; artworkDataUrl?: string; volumePercent?: number; canSeek?: boolean; playbackRate?: number };
 export type ActionError = 'accessibility_permission_required' | 'app_launch_failed' | 'stale_revision' | 'unknown_button' | 'control_failed';
 
 type ConnectionContextValue = {
@@ -56,6 +56,8 @@ const LEGACY_SOURCE_KEY = 'freeze.legacy-import-source';
 const LEGACY_IMPORTED_KEY = 'freeze.legacy-imported';
 const ConnectionContext = createContext<ConnectionContextValue | null>(null);
 const EMPTY_MEDIA_STATE: SystemMediaState = { playbackState: 'unavailable' };
+// The PC's playback speed: 0 while a browser buffers; missing means normal speed.
+const playbackRate = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 16 ? value : undefined;
 
 export function connectionId(connection: PcConnection) {
   return `${connection.host.toLowerCase()}:${connection.port}`;
@@ -274,18 +276,20 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
                 durationMs: number('durationMs'),
                 volumePercent: typeof value.volumePercent === 'number' && Number.isFinite(value.volumePercent) && value.volumePercent >= 0 && value.volumePercent <= 100 ? Math.round(value.volumePercent) : undefined,
                 canSeek: value.canSeek === true,
+                playbackRate: playbackRate(value.playbackRate),
                 artworkDataUrl: artwork && /^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/]+=*$/.test(artwork) ? artwork : undefined,
               });
             }
           }
           if (message.type === 'media_progress') {
-            const progress = message as { playbackState?: unknown; positionMs?: unknown; durationMs?: unknown; volumePercent?: unknown };
+            const progress = message as { playbackState?: unknown; positionMs?: unknown; durationMs?: unknown; volumePercent?: unknown; playbackRate?: unknown };
             const finiteTime = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 86_400_000 ? value : undefined;
             setMediaState((current) => ({
               ...current,
               playbackState: typeof progress.playbackState === 'string' && ['playing', 'paused', 'stopped', 'unavailable'].includes(progress.playbackState) ? progress.playbackState as PlaybackState : current.playbackState,
               positionMs: finiteTime(progress.positionMs),
               durationMs: finiteTime(progress.durationMs),
+              playbackRate: playbackRate(progress.playbackRate),
               volumePercent: typeof progress.volumePercent === 'number' && Number.isFinite(progress.volumePercent) && progress.volumePercent >= 0 && progress.volumePercent <= 100 ? Math.round(progress.volumePercent) : current.volumePercent,
             }));
           }

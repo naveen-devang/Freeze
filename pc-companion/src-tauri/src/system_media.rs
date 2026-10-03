@@ -21,6 +21,8 @@ pub(super) struct SystemMediaState {
     pub(super) volume_percent: Option<u8>,
     /// Whether the current player accepts seek requests.
     pub(super) can_seek: bool,
+    /// Playback speed while playing; 0 while a browser buffers. Missing means normal speed.
+    pub(super) playback_rate: Option<f64>,
 }
 
 impl SystemMediaState {
@@ -36,6 +38,7 @@ impl SystemMediaState {
             artwork_data_url: None,
             volume_percent: read_system_volume(),
             can_seek: false,
+            playback_rate: None,
         }
     }
 
@@ -96,6 +99,7 @@ pub(super) fn spawn_system_media_monitor(updates: watch::Sender<SystemMediaState
                             "positionMs": snapshot.position_ms,
                             "durationMs": snapshot.duration_ms,
                             "volumePercent": snapshot.volume_percent,
+                            "playbackRate": snapshot.playback_rate,
                         }),
                     );
                 }
@@ -108,7 +112,7 @@ pub(super) fn spawn_system_media_monitor(updates: watch::Sender<SystemMediaState
 #[cfg(windows)]
 async fn read_system_media_state(
     manager: &mut Option<windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager>,
-    artwork_track_key: &mut Option<String>,
+    artwork_track_key: &mut Option<(String, std::time::Instant)>,
     artwork_cache: &mut Option<String>,
     last_artwork_attempt: &mut Option<std::time::Instant>,
 ) -> SystemMediaState {
@@ -174,6 +178,16 @@ async fn read_system_media_state(
         .and_then(|controls| controls.IsPlaybackPositionEnabled())
         .unwrap_or(false);
 
+    // Browsers stay "playing" at rate 0 while they buffer or show an ad. Players that publish no
+    // rate are taken to play at normal speed.
+    let playback_rate = session
+        .GetPlaybackInfo()
+        .and_then(|info| info.PlaybackRate())
+        .and_then(|rate| rate.Value())
+        .ok()
+        .filter(|rate| rate.is_finite())
+        .map(|rate| rate.clamp(0.0, 16.0));
+
     let (position_ms, duration_ms) = session
         .GetTimelineProperties()
         .ok()
@@ -183,12 +197,13 @@ async fn read_system_media_state(
             let mut position = timeline.Position().ok()?.Duration;
             let duration = end.saturating_sub(start);
             // Many players (Spotify, browsers) only refresh Position on events, so add the
-            // time played since it was last reported. Synced lyrics depend on this.
+            // time played since it was last reported, at the current rate. Synced lyrics depend on this.
             if playback_state == PlaybackState::Playing {
                 if let Ok(updated) = timeline.LastUpdatedTime() {
                     let elapsed = windows_now_ticks().saturating_sub(updated.UniversalTime);
                     if updated.UniversalTime > 0 && (0..=duration).contains(&elapsed) {
-                        position = position.saturating_add(elapsed);
+                        let played = (elapsed as f64 * playback_rate.unwrap_or(1.0)) as i64;
+                        position = position.saturating_add(played);
                     }
                 }
             }
@@ -208,13 +223,32 @@ async fn read_system_media_state(
         artist.as_deref().unwrap_or_default(),
         album.as_deref().unwrap_or_default()
     );
-    let track_changed = artwork_track_key.as_deref() != Some(track_key.as_str());
-    let retry_missing_artwork = artwork_cache.is_none()
-        && last_artwork_attempt
-            .is_none_or(|last_attempt| last_attempt.elapsed() >= std::time::Duration::from_secs(3));
-    if track_changed || retry_missing_artwork {
-        *artwork_track_key = Some(track_key);
-        *artwork_cache = read_artwork(&properties);
+    let track_changed = artwork_track_key.as_ref().map(|(key, _)| key.as_str()) != Some(track_key.as_str());
+    if track_changed {
+        *artwork_track_key = Some((track_key, std::time::Instant::now()));
+    }
+    // Browsers often publish their own app icon first and swap in the real artwork later without
+    // changing the title, so the thumbnail is re-read for the same track too: every poll for the
+    // first 15 s, then every 3 s while there is none, else every 10 s.
+    let track_age = artwork_track_key
+        .as_ref()
+        .map(|(_, started)| started.elapsed())
+        .unwrap_or_default();
+    let refresh_every = if track_age < std::time::Duration::from_secs(15) {
+        std::time::Duration::ZERO
+    } else if artwork_cache.is_none() {
+        std::time::Duration::from_secs(3)
+    } else {
+        std::time::Duration::from_secs(10)
+    };
+    let refresh_due = last_artwork_attempt
+        .is_none_or(|last_attempt| last_attempt.elapsed() >= refresh_every);
+    if track_changed || refresh_due {
+        let artwork = read_artwork(&properties);
+        // A failed re-read keeps the artwork already shown; a new track never keeps the old one.
+        if track_changed || artwork.is_some() {
+            *artwork_cache = artwork;
+        }
         *last_artwork_attempt = Some(std::time::Instant::now());
     }
     SystemMediaState {
@@ -228,6 +262,7 @@ async fn read_system_media_state(
         artwork_data_url: artwork_cache.clone(),
         volume_percent: read_system_volume(),
         can_seek,
+        playback_rate: (playback_state == PlaybackState::Playing).then_some(playback_rate).flatten(),
     }
 }
 

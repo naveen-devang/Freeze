@@ -2594,7 +2594,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     last_media_content = Some(media.clone());
                     serde_json::json!({ "type": "media_state", "state": media })
                 } else {
-                    serde_json::json!({ "type": "media_progress", "playbackState": media.playback_state, "positionMs": media.position_ms, "durationMs": media.duration_ms, "volumePercent": media.volume_percent })
+                    serde_json::json!({ "type": "media_progress", "playbackState": media.playback_state, "positionMs": media.position_ms, "durationMs": media.duration_ms, "volumePercent": media.volume_percent, "playbackRate": media.playback_rate })
                 };
                 if socket.send(Message::Text(message.to_string().into())).await.is_err() {
                     break;

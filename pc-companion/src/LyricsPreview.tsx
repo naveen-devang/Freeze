@@ -3,7 +3,7 @@ import { activeLineAt, fetchLyrics, isGapLine, lyricLineOpacity, lyricsLayout, l
 import { widgetBlockSize, type WidgetSurface } from './now-playing-layout';
 import { useElementSize } from './useElementSize';
 
-type PreviewMedia = { title?: string | null; artist?: string | null; album?: string | null; playbackState: string; positionMs?: number | null; durationMs?: number | null };
+type PreviewMedia = { title?: string | null; artist?: string | null; album?: string | null; playbackState: string; positionMs?: number | null; durationMs?: number | null; playbackRate?: number | null };
 
 const LEAD_MS = 250;
 
@@ -26,18 +26,19 @@ export function LyricsPreview({ media, surface, columns, rows, columnSpan, rowSp
   const lines = useMemo(() => lyrics !== 'loading' && lyrics.kind === 'synced' ? withIntroGap(lyrics.lines) : null, [lyrics]);
 
   // Positions arrive once a second; count forward between them while playing.
-  const playing = media.playbackState === 'playing';
+  // Rate 0 while the player buffers: the lyrics wait with it.
+  const rate = media.playbackState === 'playing' ? media.playbackRate ?? 1 : 0;
   const [clock, setClock] = useState({ positionMs: 0, at: 0 });
   const [now, setNow] = useState(0);
   useEffect(() => {
     setClock({ positionMs: media.positionMs ?? 0, at: performance.now() });
-  }, [media.positionMs, playing]);
+  }, [media.positionMs, rate]);
   useEffect(() => {
-    if (!playing || !lines) return;
+    if (rate <= 0 || !lines) return;
     const interval = setInterval(() => setNow(performance.now()), 100);
     return () => clearInterval(interval);
-  }, [playing, lines]);
-  const position = clock.positionMs + (playing ? Math.max(0, now - clock.at) : 0) + LEAD_MS;
+  }, [rate, lines]);
+  const position = clock.positionMs + Math.max(0, now - clock.at) * rate + LEAD_MS;
   const active = lines ? activeLineAt(lines, position) : -1;
 
   const lineRefs = useRef<(HTMLParagraphElement | null)[]>([]);
