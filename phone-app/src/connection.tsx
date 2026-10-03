@@ -7,10 +7,10 @@ import { createContext, PropsWithChildren, useCallback, useContext, useEffect, u
 export type PcConnection = { host: string; port: number; token: string; deviceName?: string; transport?: 'wifi' | 'usb' };
 export type DeckMediaCommand = 'play_pause' | 'next_track' | 'previous_track' | 'volume_up' | 'volume_down' | 'mute';
 export type DeckStep = { type: 'media'; command: DeckMediaCommand } | { type: 'hotkey'; keys: string[] } | { type: 'launch_app'; app: string } | { type: 'launch_file'; path: string } | { type: 'launch_folder'; path: string };
-export type DeckAction = DeckStep | { type: 'sequence'; steps: DeckStep[] } | { type: 'select_profile'; profileId: string } | { type: 'select_page'; pageId: string };
+export type DeckAction = DeckStep | { type: 'run_script'; path: string; allowOnPc: boolean } | { type: 'plugin_action'; pluginId: string; actionId: string; allowOnPc: boolean; inputs?: Record<string, string> } | { type: 'sequence'; steps: DeckStep[] } | { type: 'select_profile'; profileId: string } | { type: 'select_page'; pageId: string };
 export type DeckPlacement = { row: number; column: number; rowSpan: number; columnSpan: number };
 export type DeckButton = { id: string; label: string; icon: string; placement?: DeckPlacement; iconSvg?: string; appIconData?: string; action: DeckAction };
-export type DeckWidget = { id: string; type: 'clock'; placement: DeckPlacement };
+export type DeckWidget = { id: string; type: 'clock'; placement: DeckPlacement } | { id: string; type: 'now_playing'; placement: DeckPlacement } | { id: string; type: 'plugin'; pluginId: string; widgetId: string; renderType: string; values: Record<string, string>; placement: DeckPlacement };
 export type DeckWidgetPage = { id: string; name: string; buttons: DeckButton[]; widgets: DeckWidget[] };
 export type DeckWidgetArea = { enabled: boolean; rows: number; columns: number; pages: DeckWidgetPage[] };
 export type DeckPage = { id: string; name: string; rows?: number; columns?: number; buttons: DeckButton[]; widgetArea?: DeckWidgetArea };
@@ -18,6 +18,7 @@ export type DeckProfile = { id: string; name: string; pages: DeckPage[]; activeP
 export type DeckConfig = { schemaVersion: number; revision: number; profiles: DeckProfile[]; activeProfileId: string };
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 export type PlaybackState = 'playing' | 'paused' | 'stopped' | 'unavailable';
+export type SystemMediaState = { sourceAppId?: string; title?: string; artist?: string; album?: string; playbackState: PlaybackState; positionMs?: number; durationMs?: number; artworkDataUrl?: string; volumePercent?: number };
 export type ActionError = 'accessibility_permission_required' | 'app_launch_failed' | 'stale_revision' | 'unknown_button' | 'control_failed';
 
 type ConnectionContextValue = {
@@ -26,6 +27,7 @@ type ConnectionContextValue = {
   status: ConnectionStatus;
   protocolError: string | null;
   playbackState: PlaybackState;
+  mediaState: SystemMediaState;
   deckConfig: DeckConfig | null;
   independentNavigation: boolean;
   selectedProfileId: string | null;
@@ -35,6 +37,8 @@ type ConnectionContextValue = {
   disconnect: () => Promise<void>;
   removePairedDevice: (id: string) => Promise<void>;
   sendButton: (buttonId: string) => boolean;
+  sendMediaCommand: (command: DeckMediaCommand) => boolean;
+  sendSystemVolume: (volumePercent: number) => boolean;
   selectProfile: (profileId: string) => boolean;
   selectPage: (pageId: string) => boolean;
 };
@@ -48,6 +52,7 @@ const DEVICE_SELECTION_KEY = 'freeze.device-navigation';
 const LEGACY_SOURCE_KEY = 'freeze.legacy-import-source';
 const LEGACY_IMPORTED_KEY = 'freeze.legacy-imported';
 const ConnectionContext = createContext<ConnectionContextValue | null>(null);
+const EMPTY_MEDIA_STATE: SystemMediaState = { playbackState: 'unavailable' };
 
 export function connectionId(connection: PcConnection) {
   return `${connection.host.toLowerCase()}:${connection.port}`;
@@ -82,6 +87,31 @@ function validDeckButton(value: unknown): value is DeckButton {
     !!button.action && typeof button.action.type === 'string';
 }
 
+function utf8ByteLength(value: string) {
+  let length = 0;
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    length += codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+  }
+  return length;
+}
+
+function validDeckWidget(value: unknown): value is DeckWidget {
+  if (!value || typeof value !== 'object') return false;
+  const widget = value as Partial<DeckWidget>;
+  const placement = widget.placement;
+  if (typeof widget.id !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(widget.id) || !placement || typeof placement !== 'object' ||
+      ![placement.row, placement.column, placement.rowSpan, placement.columnSpan].every(Number.isInteger)) return false;
+  if (widget.type === 'clock' || widget.type === 'now_playing') return true;
+  if (widget.type !== 'plugin' || !('pluginId' in widget) || !('widgetId' in widget) || !('renderType' in widget) || !('values' in widget)) return false;
+  const pluginWidget = widget as Extract<DeckWidget, { type: 'plugin' }>;
+  if (![pluginWidget.pluginId, pluginWidget.widgetId, pluginWidget.renderType].every((id) => typeof id === 'string' && /^[A-Za-z0-9._-]{1,64}$/.test(id)) ||
+      !pluginWidget.values || typeof pluginWidget.values !== 'object' || Array.isArray(pluginWidget.values)) return false;
+  const entries = Object.entries(pluginWidget.values);
+  return entries.length <= 16 && entries.every(([id, text]) => /^[A-Za-z0-9._-]{1,64}$/.test(id) && typeof text === 'string' && utf8ByteLength(text) <= 1024 && !/[\u0000-\u001f\u007f-\u009f]/.test(text)) &&
+    entries.reduce((total, [, text]) => total + utf8ByteLength(text), 0) <= 8192;
+}
+
 function validWidgetArea(value: unknown): value is DeckWidgetArea {
   if (!value || typeof value !== 'object') return false;
   const area = value as Partial<DeckWidgetArea>;
@@ -89,9 +119,7 @@ function validWidgetArea(value: unknown): value is DeckWidgetArea {
     (area.rows ?? 0) >= 1 && (area.rows ?? 0) <= 6 && (area.columns ?? 0) >= 1 && (area.columns ?? 0) <= 6 &&
     Array.isArray(area.pages) && area.pages.length > 0 && area.pages.length <= 9 &&
     area.pages.every((page) => page && typeof page.id === 'string' && typeof page.name === 'string' && Array.isArray(page.buttons) && Array.isArray(page.widgets) &&
-      page.buttons.length + page.widgets.length <= (area.rows ?? 0) * (area.columns ?? 0) && page.buttons.every(validDeckButton) &&
-      page.widgets.every((widget) => widget && typeof widget.id === 'string' && widget.type === 'clock' && widget.placement &&
-        [widget.placement.row, widget.placement.column, widget.placement.rowSpan, widget.placement.columnSpan].every(Number.isInteger))) &&
+      page.buttons.length + page.widgets.length <= (area.rows ?? 0) * (area.columns ?? 0) && page.buttons.every(validDeckButton) && page.widgets.every(validDeckWidget)) &&
     validDeckWidgetAreaLayout(area as DeckWidgetArea);
 }
 
@@ -128,6 +156,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
   const [protocolError, setProtocolError] = useState<string | null>(null);
   const [playbackState, setPlaybackState] = useState<PlaybackState>('unavailable');
+  const [mediaState, setMediaState] = useState<SystemMediaState>(EMPTY_MEDIA_STATE);
   const [deckConfig, setDeckConfig] = useState<DeckConfig | null>(null);
   const [independentNavigation, setIndependentNavigation] = useState(false);
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
@@ -161,6 +190,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
       setSelectedPageId(null);
       setProtocolError(null);
       setPlaybackState('unavailable');
+      setMediaState(EMPTY_MEDIA_STATE);
       setActionError(null);
     }
 
@@ -208,12 +238,46 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
       socket.onmessage = async (event) => {
         if (socketRef.current !== socket || typeof event.data !== 'string') return;
         try {
-          const message = JSON.parse(event.data) as { type?: string; message?: string; state?: PlaybackState; ok?: boolean; reason?: string; requestId?: string; sourceId?: string };
+          const message = JSON.parse(event.data) as { type?: string; message?: string; state?: unknown; ok?: boolean; reason?: string; requestId?: string; sourceId?: string; volumePercent?: unknown };
           if (message.type === 'ready') {
             reconnectAttemptRef.current = 0;
             setStatus('connected');
           }
-          if (message.type === 'playback_state' && message.state && ['playing', 'paused', 'stopped', 'unavailable'].includes(message.state)) setPlaybackState(message.state);
+          if (message.type === 'playback_state' && typeof message.state === 'string' && ['playing', 'paused', 'stopped', 'unavailable'].includes(message.state)) setPlaybackState(message.state as PlaybackState);
+          if (message.type === 'media_state') {
+            const state = message.state;
+            if (!state || typeof state !== 'object' || Array.isArray(state)) {
+              setMediaState(EMPTY_MEDIA_STATE);
+            } else {
+              const value = state as Record<string, unknown>;
+              const text = (key: string, max: number) => typeof value[key] === 'string' && value[key].length > 0 && value[key].length <= max ? value[key] as string : undefined;
+              const number = (key: string) => typeof value[key] === 'number' && Number.isFinite(value[key]) && (value[key] as number) >= 0 && (value[key] as number) <= 86_400_000 ? value[key] as number : undefined;
+              const playback = value.playbackState;
+              const artwork = text('artworkDataUrl', 2_800_000);
+              setMediaState({
+                sourceAppId: text('sourceAppId', 256),
+                title: text('title', 512),
+                artist: text('artist', 512),
+                album: text('album', 512),
+                playbackState: typeof playback === 'string' && ['playing', 'paused', 'stopped', 'unavailable'].includes(playback) ? playback as PlaybackState : 'unavailable',
+                positionMs: number('positionMs'),
+                durationMs: number('durationMs'),
+                volumePercent: typeof value.volumePercent === 'number' && Number.isFinite(value.volumePercent) && value.volumePercent >= 0 && value.volumePercent <= 100 ? Math.round(value.volumePercent) : undefined,
+                artworkDataUrl: artwork && /^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/]+=*$/.test(artwork) ? artwork : undefined,
+              });
+            }
+          }
+          if (message.type === 'media_progress') {
+            const progress = message as { playbackState?: unknown; positionMs?: unknown; durationMs?: unknown; volumePercent?: unknown };
+            const finiteTime = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 86_400_000 ? value : undefined;
+            setMediaState((current) => ({
+              ...current,
+              playbackState: typeof progress.playbackState === 'string' && ['playing', 'paused', 'stopped', 'unavailable'].includes(progress.playbackState) ? progress.playbackState as PlaybackState : current.playbackState,
+              positionMs: finiteTime(progress.positionMs),
+              durationMs: finiteTime(progress.durationMs),
+              volumePercent: typeof progress.volumePercent === 'number' && Number.isFinite(progress.volumePercent) && progress.volumePercent >= 0 && progress.volumePercent <= 100 ? Math.round(progress.volumePercent) : current.volumePercent,
+            }));
+          }
           if (message.type === 'action_result' && message.requestId && pendingRequestsRef.current.delete(message.requestId)) {
             const reason = message.reason;
             setActionError(message.ok ? null : reason === 'accessibility_permission_required' || reason === 'app_launch_failed' || reason === 'stale_revision' || reason === 'unknown_button' ? reason : 'control_failed');
@@ -357,6 +421,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
     setConnection(null);
     setStatus('disconnected');
     setPlaybackState('unavailable');
+    setMediaState(EMPTY_MEDIA_STATE);
     setIndependentNavigation(false);
     setSelectedProfileId(null);
     setSelectedPageId(null);
@@ -369,7 +434,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
     await persistPairedDevices(pairedDevicesRef.current.filter((device) => connectionId(device) !== id));
   }, [connection, disconnect, persistPairedDevices]);
 
-  const sendRequest = useCallback((type: string, idField: string, id: string) => {
+  const sendRequest = useCallback((type: string, idField: string, id: string | number) => {
     const socket = socketRef.current;
     if (status !== 'connected' || socket?.readyState !== WebSocket.OPEN || !deckConfig) return false;
     setActionError(null);
@@ -385,11 +450,13 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
     return true;
   }, [deckConfig, status]);
   const sendButton = useCallback((buttonId: string) => sendRequest('invoke_button', 'buttonId', buttonId), [sendRequest]);
+  const sendMediaCommand = useCallback((command: DeckMediaCommand) => sendRequest('invoke_media_command', 'command', command), [sendRequest]);
+  const sendSystemVolume = useCallback((volumePercent: number) => sendRequest('set_system_volume', 'volumePercent', Math.round(Math.max(0, Math.min(100, volumePercent)))), [sendRequest]);
   const selectProfile = useCallback((profileId: string) => sendRequest('select_profile', 'profileId', profileId), [sendRequest]);
   const selectPage = useCallback((pageId: string) => sendRequest('select_page', 'pageId', pageId), [sendRequest]);
 
   return (
-    <ConnectionContext.Provider value={{ connection, pairedDevices, status, protocolError, playbackState, deckConfig, independentNavigation, selectedProfileId, selectedPageId, actionError, connect, disconnect, removePairedDevice, sendButton, selectProfile, selectPage }}>
+    <ConnectionContext.Provider value={{ connection, pairedDevices, status, protocolError, playbackState, mediaState, deckConfig, independentNavigation, selectedProfileId, selectedPageId, actionError, connect, disconnect, removePairedDevice, sendButton, sendMediaCommand, sendSystemVolume, selectProfile, selectPage }}>
       {children}
     </ConnectionContext.Provider>
   );

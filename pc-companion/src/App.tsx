@@ -1,5 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
@@ -16,6 +17,7 @@ import {
   Layers,
   Keyboard,
   Layers2,
+  Package,
   LayoutDashboard,
   ListOrdered,
   Mic,
@@ -57,14 +59,20 @@ type ConnectionInfo = {
 
 type MediaCommand = 'play_pause' | 'next_track' | 'previous_track' | 'volume_up' | 'volume_down' | 'mute';
 type DeckStep = { type: 'media'; command: MediaCommand } | { type: 'hotkey'; keys: string[] } | { type: 'launch_app'; app: string } | { type: 'launch_file'; path: string } | { type: 'launch_folder'; path: string };
-type DeckAction = DeckStep | { type: 'launch_app'; app: string } | { type: 'sequence'; steps: DeckStep[] } | { type: 'select_profile'; profileId: string } | { type: 'select_page'; pageId: string };
+type DeckAction = DeckStep | { type: 'run_script'; path: string; allowOnPc: boolean } | { type: 'plugin_action'; pluginId: string; actionId: string; allowOnPc: boolean; inputs: Record<string, string> } | { type: 'launch_app'; app: string } | { type: 'sequence'; steps: DeckStep[] } | { type: 'select_profile'; profileId: string } | { type: 'select_page'; pageId: string };
+type FreezePluginInput = { id: string; label: string; type: 'text' | 'number' | 'select'; default: string; options: string[]; optionLabels: string[] };
+type FreezePluginWidget = { id: string; name: string; description: string; type: 'text'; inputs: FreezePluginInput[] };
+type FreezePlugin = { id: string; name: string; version: string; description: string; actions: { id: string; name: string; description: string; script: string; inputs: FreezePluginInput[] }[]; widgets: FreezePluginWidget[] };
+type FreezePluginListing = { plugins: FreezePlugin[]; warnings: string[] };
 type DeckPlacement = { row: number; column: number; rowSpan: number; columnSpan: number };
 type DeckButton = { id: string; label: string; icon: string; placement?: DeckPlacement; iconSvg?: string; appIconData?: string; action: DeckAction };
-type DeckWidget = { id: string; type: 'clock'; placement: DeckPlacement };
+type DeckWidget = { id: string; type: 'clock'; placement: DeckPlacement } | { id: string; type: 'now_playing'; placement: DeckPlacement } | { id: string; type: 'plugin'; pluginId: string; widgetId: string; renderType: string; values: Record<string, string>; placement: DeckPlacement };
 type WidgetScreen = { enabled: boolean; rows: number; columns: number; buttons: DeckButton[]; widgets: DeckWidget[] };
 type WidgetPage = { id: string; name: string; buttons: DeckButton[]; widgets: DeckWidget[] };
 type WidgetArea = { enabled: boolean; rows: number; columns: number; pages: WidgetPage[] };
 type PlaybackState = 'playing' | 'paused' | 'stopped' | 'unavailable';
+type SystemMediaState = { sourceAppId?: string | null; title?: string | null; artist?: string | null; album?: string | null; playbackState: PlaybackState; positionMs?: number | null; durationMs?: number | null; artworkDataUrl?: string | null; volumePercent?: number | null };
+type SystemMediaProgress = Pick<SystemMediaState, 'playbackState' | 'positionMs' | 'durationMs' | 'volumePercent'>;
 type LucideRegistry = Record<string, typeof Command>;
 type DeckPage = { id: string; name: string; rows: number; columns: number; buttons: DeckButton[]; widgetArea?: WidgetArea };
 type DeckProfile = { id: string; name: string; pages: DeckPage[]; activePageId: string; autoSwitchApps: string[]; autoSwitchEnabled: boolean };
@@ -189,8 +197,11 @@ function App() {
   const [navigationSettingBusy, setNavigationSettingBusy] = useState(false);
   const [navigationSettingError, setNavigationSettingError] = useState('');
   const [playbackState, setPlaybackState] = useState<PlaybackState>('unavailable');
+  const [mediaState, setMediaState] = useState<SystemMediaState>({ playbackState: 'unavailable' });
   const [legacyImports, setLegacyImports] = useState<LegacyImportSummary[]>([]);
   const [importError, setImportError] = useState('');
+  const [freezePlugins, setFreezePlugins] = useState<FreezePlugin[]>([]);
+  const [freezePluginWarnings, setFreezePluginWarnings] = useState<string[]>([]);
 
   useEffect(() => {
     let live = true;
@@ -213,10 +224,46 @@ function App() {
     void refresh();
     void invoke<DeckConfig>('deck_config').then((config) => { if (live) setDeckConfig(config); }).catch(() => {});
     void invoke<boolean>('get_independent_navigation').then((enabled) => { if (live) setIndependentNavigation(enabled); }).catch(() => {});
+    void invoke<FreezePluginListing>('list_freeze_plugins').then(({ plugins, warnings }) => { if (live) { setFreezePlugins(plugins); setFreezePluginWarnings(warnings); } }).catch(() => {});
     const timer = window.setInterval(refresh, 2000);
     return () => {
       live = false;
       window.clearInterval(timer);
+    };
+  }, []);
+
+  useEffect(() => {
+    let live = true;
+    let eventRevision = 0;
+    let unlistenState: (() => void) | undefined;
+    let unlistenProgress: (() => void) | undefined;
+    void Promise.all([
+      listen<SystemMediaState>('system-media-state', ({ payload }) => {
+        eventRevision += 1;
+        if (live) setMediaState(payload);
+      }),
+      listen<SystemMediaProgress>('system-media-progress', ({ payload }) => {
+        eventRevision += 1;
+        if (!live) return;
+        setMediaState((current) => ({ ...current, ...payload }));
+      }),
+    ]).then(([stopState, stopProgress]) => {
+      if (!live) {
+        stopState();
+        stopProgress();
+        return;
+      }
+      unlistenState = stopState;
+      unlistenProgress = stopProgress;
+      const revision = eventRevision;
+      void invoke<SystemMediaState>('get_system_media_state').then((snapshot) => {
+        if (live && revision === eventRevision) setMediaState(snapshot);
+      }).catch(() => {});
+    }).catch(() => {});
+    return () => {
+      live = false;
+      unlistenState?.();
+      unlistenProgress?.();
     };
   }, []);
 
@@ -365,13 +412,14 @@ function App() {
             <div className="legacy-import-actions">{legacyImports.map((item) => <button key={item.sourceId} className="secondary-button" onClick={() => void (item.ready ? importPhoneDeck(item.sourceId) : requestPhoneDeck(item.sourceId))}>{item.ready ? 'Import phone deck' : item.requested ? 'Request again' : 'Transfer phone deck'}</button>)}</div>
             {importError ? <p className="usb-error" role="alert">{importError}</p> : null}
           </section> : null}
-          {screen === 'deck' ? <DesktopDeckEditor config={deckConfig} onSaved={setDeckConfig} playbackState={playbackState} isMacos={connection?.isMacos ?? false} /> : screen === 'settings' ? <>
-          <div className="page-heading"><div><h1>Settings</h1><p>Choose how connected devices navigate their decks.</p></div></div>
+          {screen === 'deck' ? <DesktopDeckEditor config={deckConfig} onSaved={setDeckConfig} playbackState={playbackState} mediaState={mediaState} isMacos={connection?.isMacos ?? false} plugins={freezePlugins} /> : screen === 'settings' ? <>
+          <div className="page-heading"><div><h1>Settings</h1><p>Manage device navigation and Freeze plugins.</p></div></div>
           <section className="device-navigation-setting">
             <div className="device-navigation-copy"><h2>Independent device navigation</h2><p>Let each connected phone use its own profile and page. Turn this off to mirror navigation across all phones.</p></div>
             <button className={`setting-switch ${independentNavigation ? 'enabled' : ''}`} type="button" role="switch" aria-checked={independentNavigation} aria-label="Independent device navigation" disabled={navigationSettingBusy} onClick={() => void saveIndependentNavigation(!independentNavigation)}><span /></button>
             {navigationSettingError ? <p className="setting-error" role="alert">{navigationSettingError}</p> : null}
           </section>
+          <FreezePluginSettings plugins={freezePlugins} warnings={freezePluginWarnings} onChange={(plugins, warnings) => { setFreezePlugins(plugins); setFreezePluginWarnings(warnings); }} />
           </> : <>
           <div className="page-heading">
             <div>
@@ -509,7 +557,45 @@ function App() {
   );
 }
 
-function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMacos }: { config: DeckConfig | null; onSaved: (config: DeckConfig) => void; playbackState: PlaybackState; isMacos: boolean }) {
+function FreezePluginSettings({ plugins, warnings, onChange }: { plugins: FreezePlugin[]; warnings: string[]; onChange: (plugins: FreezePlugin[], warnings: string[]) => void }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  async function refresh() {
+    const listing = await invoke<FreezePluginListing>('list_freeze_plugins');
+    onChange(listing.plugins, listing.warnings);
+  }
+  async function install() {
+    setBusy(true);
+    setError('');
+    try {
+      const sourcePath = await openFileDialog({ title: 'Choose a Freeze plugin folder', multiple: false, directory: true });
+      if (typeof sourcePath !== 'string') return;
+      await invoke<FreezePlugin>('install_freeze_plugin', { sourcePath });
+      await refresh();
+    } catch (error) { setError(String(error)); }
+    finally { setBusy(false); }
+  }
+  async function uninstall(plugin: FreezePlugin) {
+    if (!window.confirm(`Remove Freeze plugin “${plugin.name}”? Deck items using its actions or widgets must be removed or reconfigured first.`)) return;
+    setBusy(true);
+    setError('');
+    try {
+      await invoke('uninstall_freeze_plugin', { pluginId: plugin.id });
+      await refresh();
+    } catch (error) { setError(String(error)); }
+    finally { setBusy(false); }
+  }
+  return <section className="freeze-plugin-settings">
+    <div className="freeze-plugin-heading"><div><h2><Package size={16} /> Freeze plugins</h2><p>Install Freeze-native actions and widgets for your deck.</p></div><button type="button" className="secondary-button" disabled={busy} onClick={() => void install()}><Plus size={14} /> Install plugin</button></div>
+    <p className="freeze-plugin-warning">Only install code from people you trust. Plugin scripts run as your PC user and may access your files and applications. Each deck button requires separate permission before it can run. Elgato Stream Deck packages are not supported.</p>
+    {error ? <p className="form-error" role="alert">{error}</p> : null}
+    {warnings.length ? <div className="freeze-plugin-errors" role="status">{warnings.map((warning, index) => <p key={`${index}-${warning}`}>{warning}</p>)}</div> : null}
+    {plugins.length ? <div className="freeze-plugin-list">{plugins.map((plugin) => <article className="freeze-plugin-item" key={plugin.id}><div><strong>{plugin.name} <span>v{plugin.version}</span></strong><small>{plugin.description || `${plugin.actions.length} actions`}</small><small>{plugin.actions.map((action) => action.name).join(' · ')}</small></div><button type="button" className="icon-button" aria-label={`Remove ${plugin.name}`} title="Remove plugin" disabled={busy} onClick={() => void uninstall(plugin)}><Trash2 size={14} /></button></article>)}</div> : <p className="freeze-plugin-empty">No Freeze plugins installed.</p>}
+    <details className="freeze-plugin-format"><summary>Plugin folder format</summary><code>{`manifest.json\nscripts/your-action.ps1  (Windows)\nscripts/your-action.sh    (macOS)`}</code><span>Manifest schema and a complete example: pc-companion/docs/freeze-plugin-format.md</span></details>
+  </section>;
+}
+
+function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaState, isMacos, plugins }: { config: DeckConfig | null; onSaved: (config: DeckConfig) => void; playbackState: PlaybackState; mediaState: SystemMediaState; isMacos: boolean; plugins: FreezePlugin[] }) {
   const [workingConfig, setWorkingConfig] = useState<DeckConfig | null>(savedConfig);
   const [profileId, setProfileId] = useState('');
   const [pageId, setPageId] = useState('');
@@ -566,15 +652,64 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
   const widgetScreen: WidgetScreen = { enabled: widgetArea.enabled, rows: widgetArea.rows, columns: widgetArea.columns, buttons: widgetPage?.buttons ?? [], widgets: widgetPage?.widgets ?? [] };
   const selected = page.buttons.find((button) => button.id === buttonId) ?? widgetScreen.buttons.find((button) => button.id === buttonId) ?? null;
   const selectedWidget = widgetScreen.widgets.find((widget) => widget.id === widgetId) ?? null;
+  const selectedWidgetDefinition = selectedWidget?.type === 'plugin'
+    ? plugins.find((plugin) => plugin.id === selectedWidget.pluginId)?.widgets?.find((widget) => widget.id === selectedWidget.widgetId) ?? null
+    : null;
+  const pluginWidgetOptions = plugins.flatMap((plugin) => (plugin.widgets ?? []).map((widget) => ({
+    value: `${plugin.id}::${widget.id}`,
+    label: `${plugin.name} · ${widget.name}`,
+    plugin,
+    widget,
+  })));
   const occupied = occupiedDeckCells(page);
   const widgetOccupied = occupiedWidgetCells(widgetScreen);
   const hasFreeCell = occupied.size < page.rows * page.columns;
 
   async function save(next: DeckConfig) {
+    const normalized: DeckConfig = {
+      ...next,
+      profiles: next.profiles.map((item) => ({
+        ...item,
+        pages: item.pages.map((deckPage) => {
+          const area = deckPage.widgetArea;
+          if (!area) return deckPage;
+          return {
+            ...deckPage,
+            widgetArea: {
+              ...area,
+              pages: area.pages.map((widgetPage) => ({
+                ...widgetPage,
+                widgets: widgetPage.widgets.map((widget) => {
+                  if (widget.type !== 'plugin') return widget;
+                  const definition = plugins.find((plugin) => plugin.id === widget.pluginId)?.widgets?.find((candidate) => candidate.id === widget.widgetId);
+                  if (!definition) return widget;
+                  const values = Object.fromEntries(definition.inputs.map((input) => [input.id, widget.values[input.id] ?? (input.default || (input.type === 'select' ? input.options[0] ?? '' : ''))]));
+                  return { ...widget, values };
+                }),
+              })),
+            },
+          };
+        }),
+      })),
+    };
+    for (const widget of normalized.profiles.flatMap((item) => item.pages.flatMap((deckPage) => deckPage.widgetArea?.pages.flatMap((widgetPage) => widgetPage.widgets) ?? []))) {
+      if (widget.type !== 'plugin') continue;
+      const definition = plugins.find((plugin) => plugin.id === widget.pluginId)?.widgets?.find((item) => item.id === widget.widgetId);
+      if (!definition) continue;
+      const inputs = new Map(definition.inputs.map((input) => [input.id, input]));
+      if (Object.keys(widget.values).some((id) => !inputs.has(id))) {
+        setError(`“${definition.name}” contains an unknown input. Reconfigure it before saving.`);
+        return;
+      }
+      if (definition.inputs.some((input) => input.type === 'select' && !input.options.includes(widget.values[input.id] ?? ''))) {
+        setError(`Choose a valid option for every select field in “${definition.name}”.`);
+        return;
+      }
+    }
     setBusy(true);
     setError('');
     try {
-      const saved = await invoke<DeckConfig>('save_deck_config', { config: next });
+      const saved = await invoke<DeckConfig>('save_deck_config', { config: normalized });
       onSaved(saved);
     } catch (cause) {
       setError(String(cause));
@@ -1002,6 +1137,39 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
     updateWidgetScreen({ enabled: true, widgets: [...widgetScreen.widgets, widget] });
   }
 
+  function addNowPlayingWidget() {
+    const placement = firstWidgetPlacement(widgetScreen);
+    if (!placement) return setError('There is no free cell on the widget screen. Move or resize an item to make room.');
+    const widget: DeckWidget = { id: `widget-${Date.now()}`, type: 'now_playing', placement };
+    setError('');
+    setWidgetId(widget.id);
+    setButtonId('');
+    updateWidgetScreen({ enabled: true, widgets: [...widgetScreen.widgets, widget] });
+  }
+
+  function addPluginWidget(pluginId: string, definitionId: string) {
+    const plugin = plugins.find((item) => item.id === pluginId);
+    const definition = plugin?.widgets?.find((item) => item.id === definitionId);
+    if (!plugin || !definition) return;
+    const placement = firstWidgetPlacement(widgetScreen);
+    if (!placement) return setError('There is no free cell on the widget screen. Move or resize an item to make room.');
+    const values = Object.fromEntries(definition.inputs.map((input) => [input.id, input.default || (input.type === 'select' ? input.options[0] ?? '' : '')]));
+    const widget: DeckWidget = { id: `widget-${Date.now()}`, type: 'plugin', pluginId, widgetId: definitionId, renderType: definition.type, values, placement };
+    setError('');
+    setWidgetId(widget.id);
+    setButtonId('');
+    updateWidgetScreen({ enabled: true, widgets: [...widgetScreen.widgets, widget] });
+  }
+
+  function updateSelectedPluginWidgetValue(inputId: string, value: string) {
+    if (selectedWidget?.type !== 'plugin' || !selectedWidgetDefinition?.inputs.some((input) => input.id === inputId)) return;
+    const values = Object.fromEntries(selectedWidgetDefinition.inputs.map((input) => [input.id, selectedWidget.values[input.id] ?? input.default]));
+    values[inputId] = value;
+    replaceWidgetScreen({ ...widgetScreen, widgets: widgetScreen.widgets.map((widget) => widget.id === selectedWidget.id && widget.type === 'plugin'
+      ? { ...widget, values }
+      : widget) }, profile, false);
+  }
+
   function deleteSelectedWidget() {
     if (!selectedWidget) return;
     updateWidgetScreen({ widgets: widgetScreen.widgets.filter((widget) => widget.id !== selectedWidget.id) });
@@ -1048,12 +1216,6 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
 
   function updateFallbackProfile(fallbackProfileId: string) {
     void save({ ...deck, fallbackProfileId });
-  }
-
-  function actionType(action: DeckAction): string {
-    if (action.type === 'sequence') return 'sequence';
-    if (action.type === 'select_page' || action.type === 'select_profile') return action.type;
-    return action.type;
   }
 
   return <>
@@ -1121,7 +1283,7 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
             }
           }}
           title="Drag to move · Drag the lower-right corner to resize · Alt+Arrow to move · Shift+Arrow to resize"
-          ><span>{iconForButton(button, playbackState)}</span><strong>{buttonLabel(button, playbackState)}</strong><small>{actionType(button.action).replace('_', ' ')}</small><span className="deck-button-size">{preview ? `${requestedPlacement.columnSpan}×${requestedPlacement.rowSpan}` : placement.rowSpan > 1 || placement.columnSpan > 1 ? `${placement.columnSpan}×${placement.rowSpan}` : null}</span><span className="deck-resize-handle" aria-hidden="true" onPointerDown={(event) => startResize(event, button, 'page')} onPointerMove={moveResize} onPointerUp={finishResize} onPointerCancel={cancelResize} onLostPointerCapture={cancelResize} /></button>;
+          ><span>{iconForButton(button, playbackState)}</span><strong>{buttonLabel(button, playbackState)}</strong><span className="deck-button-size">{preview ? `${requestedPlacement.columnSpan}×${requestedPlacement.rowSpan}` : placement.rowSpan > 1 || placement.columnSpan > 1 ? `${placement.columnSpan}×${placement.rowSpan}` : null}</span><span className="deck-resize-handle" aria-hidden="true" onPointerDown={(event) => startResize(event, button, 'page')} onPointerMove={moveResize} onPointerUp={finishResize} onPointerCancel={cancelResize} onLostPointerCapture={cancelResize} /></button>;
           }
           return <button key={`empty-${index}`} type="button" data-deck-cell="true" data-surface="page" data-row={row} data-column={column} className={`deck-button deck-slot ${dragOverCellKey === `${row}:${column}` ? 'drop-target' : ''}`} onClick={() => addButton(row, column)} disabled={busy || !hasFreeCell} aria-label={`Add button in row ${row + 1}, column ${column + 1}`}><Plus size={17} /><span>Add button</span></button>;
         })}
@@ -1135,6 +1297,11 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
             <label className="grid-size-control">Rows<DeckSelect value={String(widgetScreen.rows)} disabled={busy} options={Array.from({ length: 6 }, (_, index) => ({ value: String(index + 1), label: String(index + 1) }))} onChange={(value) => resizeWidgetScreen('rows', value)} /></label>
             <label className="grid-size-control">Columns<DeckSelect value={String(widgetScreen.columns)} disabled={busy} options={Array.from({ length: 6 }, (_, index) => ({ value: String(index + 1), label: String(index + 1) }))} onChange={(value) => resizeWidgetScreen('columns', value)} /></label>
             <button className="secondary-button" onClick={() => addClockWidget()} disabled={busy || !firstWidgetPlacement(widgetScreen)}><Plus size={14} /> Add clock</button>
+            <button className="secondary-button" onClick={addNowPlayingWidget} disabled={busy || !firstWidgetPlacement(widgetScreen)}><Music size={14} /> Now Playing</button>
+            <div className="widget-plugin-picker"><DeckSelect value="__add_plugin_widget__" disabled={busy || !firstWidgetPlacement(widgetScreen) || pluginWidgetOptions.length === 0} options={[{ value: '__add_plugin_widget__', label: 'Add plugin widget…' }, ...pluginWidgetOptions]} onChange={(value) => {
+              const [pluginId, definitionId] = value.split('::');
+              if (pluginId && definitionId) addPluginWidget(pluginId, definitionId);
+            }} /></div>
           </div>
         </div>
         <div className="widget-page-toolbar">
@@ -1152,8 +1319,24 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
               const itemId = item.type === 'button' ? item.button.id : item.widget.id;
               const preview = resizePreview?.id === itemId ? resizePreview : null;
               const shown = preview?.placement ?? placement;
-              return <button key={itemId} type="button" data-deck-item={itemId} data-deck-cell="true" data-surface="widgets" data-row={placement.row} data-column={placement.column} className={`deck-button ${item.type === 'widget' ? 'clock-widget' : ''} ${item.type === 'button' && selected?.id === itemId ? 'selected' : ''} ${item.type === 'widget' && selectedWidget?.id === itemId ? 'selected' : ''} ${dragOverButtonId === itemId ? 'drop-target' : ''} ${draggingButtonId === itemId ? 'dragging' : ''} ${preview && !preview.valid ? 'resize-invalid' : ''}`} style={{ gridColumn: `${placement.column + 1} / span ${Math.min(shown.columnSpan, widgetScreen.columns - placement.column)}`, gridRow: `${placement.row + 1} / span ${Math.min(shown.rowSpan, widgetScreen.rows - placement.row)}` }} onClick={() => item.type === 'button' ? (setWidgetId(''), setButtonId(item.button.id)) : (setButtonId(''), setWidgetId(item.widget.id))} onPointerDown={(event) => item.type === 'button' ? startButtonDrag(event, item.button.id, 'widgets') : startWidgetDrag(event, item.widget.id)} onPointerMove={moveButtonDrag} onPointerUp={finishButtonDrag} onPointerCancel={cancelButtonDrag} onLostPointerCapture={cancelButtonDrag}>
-                {item.type === 'button' ? <><span>{iconForButton(item.button, playbackState)}</span><strong>{buttonLabel(item.button, playbackState)}</strong><small>button · {actionType(item.button.action).replace('_', ' ')}</small></> : <><span className="clock-widget-icon"><Clock size={18} /></span><strong>{clock.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</strong><small>{clock.toLocaleDateString()}</small></>}
+              const previewRows = Math.min(shown.rowSpan, widgetScreen.rows - placement.row);
+              const previewColumns = Math.min(shown.columnSpan, widgetScreen.columns - placement.column);
+              const previewCells = previewRows * previewColumns;
+              const mediaLayout = previewCells >= 6 ? 'expanded' : previewCells >= 4 ? 'standard' : previewCells >= 2 ? 'wide' : 'compact';
+              const mediaDuration = mediaState.durationMs && mediaState.durationMs > 0 ? mediaState.durationMs : 0;
+              const mediaPosition = Math.max(0, Math.min(mediaDuration, mediaState.positionMs ?? 0));
+              const mediaTime = (milliseconds: number) => `${Math.floor(milliseconds / 60_000)}:${String(Math.floor(milliseconds / 1000) % 60).padStart(2, '0')}`;
+              return <button key={itemId} type="button" data-deck-item={itemId} data-deck-cell="true" data-surface="widgets" data-row={placement.row} data-column={placement.column} className={`deck-button ${item.type === 'widget' ? 'clock-widget' : ''} ${item.type === 'widget' && item.widget.type === 'now_playing' ? 'now-playing-widget-preview' : ''} ${item.type === 'button' && selected?.id === itemId ? 'selected' : ''} ${item.type === 'widget' && selectedWidget?.id === itemId ? 'selected' : ''} ${dragOverButtonId === itemId ? 'drop-target' : ''} ${draggingButtonId === itemId ? 'dragging' : ''} ${preview && !preview.valid ? 'resize-invalid' : ''}`} style={{ gridColumn: `${placement.column + 1} / span ${Math.min(shown.columnSpan, widgetScreen.columns - placement.column)}`, gridRow: `${placement.row + 1} / span ${Math.min(shown.rowSpan, widgetScreen.rows - placement.row)}` }} onClick={() => item.type === 'button' ? (setWidgetId(''), setButtonId(item.button.id)) : (setButtonId(''), setWidgetId(item.widget.id))} onPointerDown={(event) => item.type === 'button' ? startButtonDrag(event, item.button.id, 'widgets') : startWidgetDrag(event, item.widget.id)} onPointerMove={moveButtonDrag} onPointerUp={finishButtonDrag} onPointerCancel={cancelButtonDrag} onLostPointerCapture={cancelButtonDrag}>
+                {item.type === 'button' ? <><span>{iconForButton(item.button, playbackState)}</span><strong>{buttonLabel(item.button, playbackState)}</strong></> : item.widget.type === 'clock' ? <><span className="clock-widget-icon"><Clock size={18} /></span><strong>{clock.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</strong><small>{clock.toLocaleDateString()}</small></> : item.widget.type === 'now_playing' ? <div className={`now-playing-preview now-playing-preview--${mediaLayout}${previewRows / Math.max(1, previewColumns) >= 0.75 ? ' now-playing-preview--stacked' : ''}`}>
+                  {mediaLayout === 'expanded' && mediaState.artworkDataUrl ? <><span className="now-playing-preview-backdrop"><img src={mediaState.artworkDataUrl} alt="" /></span><span className="now-playing-preview-tint" /></> : null}
+                  <span className="now-playing-preview-art">{mediaState.artworkDataUrl ? <img src={mediaState.artworkDataUrl} alt="" /> : <Music size={19} />}</span>
+                  <div className="now-playing-preview-copy"><strong>{mediaState.title || mediaState.artist || 'No media'}</strong><small>{mediaState.artist || mediaState.album || (mediaState.playbackState === 'unavailable' ? 'Waiting for media' : mediaState.playbackState === 'paused' ? 'Paused' : 'System media')}</small>{mediaLayout === 'expanded' && mediaState.album ? <small className="now-playing-preview-album">{mediaState.album}</small> : null}
+                    <span className="now-playing-preview-progress"><i style={{ width: `${mediaDuration ? Math.min(100, Math.max(0, mediaPosition / mediaDuration * 100)) : 0}%` }} /></span>
+                    {mediaDuration ? <span className="now-playing-preview-times"><small>{mediaTime(mediaPosition)}</small><small>{mediaTime(mediaDuration)}</small></span> : null}
+                    {mediaLayout === 'standard' || mediaLayout === 'expanded' ? <span className="now-playing-preview-controls"><i><SkipBack size={mediaLayout === 'expanded' ? 18 : 15} /></i><i className="primary">{mediaState.playbackState === 'playing' ? <Pause size={mediaLayout === 'expanded' ? 24 : 19} /> : <Play size={mediaLayout === 'expanded' ? 24 : 19} />}</i><i><SkipForward size={mediaLayout === 'expanded' ? 18 : 15} /></i></span> : null}
+                    {mediaLayout === 'expanded' ? <span className="now-playing-preview-volume"><Volume1 size={17} /><i><i style={{ width: `${mediaState.volumePercent ?? 0}%` }} /></i><Volume2 size={17} /><small>{mediaState.volumePercent == null ? '—' : `${mediaState.volumePercent}%`}</small></span> : null}
+                  </div>
+                </div> : item.widget.renderType === 'text' ? <><span className="clock-widget-icon"><Package size={18} /></span><strong>{item.widget.values.title || item.widget.widgetId}</strong><small>{item.widget.values.body || 'Text widget'}</small></> : <><span className="clock-widget-icon"><Package size={18} /></span><strong>Unavailable widget</strong><small>{item.widget.renderType}</small></>}
                 <span className="deck-button-size">{preview ? `${shown.columnSpan}×${shown.rowSpan}` : placement.rowSpan > 1 || placement.columnSpan > 1 ? `${placement.columnSpan}×${placement.rowSpan}` : null}</span>
                 <span className="deck-resize-handle" aria-hidden="true" onPointerDown={(event) => item.type === 'button' ? startResize(event, item.button, 'widgets', 'button') : startResize(event, item.widget, 'widgets', 'widget')} onPointerMove={moveResize} onPointerUp={finishResize} onPointerCancel={cancelResize} onLostPointerCapture={cancelResize} />
               </button>;
@@ -1163,7 +1346,7 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
         </div>
       </section>
       </div>
-      <div className="button-properties"><div className="properties-heading"><div><h2>{selectedWidget ? 'Widget settings' : 'Button settings'}</h2><p>{selectedWidget ? 'Clock · uses this PC’s local time' : selected ? 'Edit the selected control' : 'Select an item from either grid'}</p></div>{selected || selectedWidget ? <button className="icon-button" aria-label={selectedWidget ? 'Remove widget' : 'Remove button'} onClick={() => {
+      <div className="button-properties"><div className="properties-heading"><div><h2>{selectedWidget ? 'Widget settings' : 'Button settings'}</h2><p>{selectedWidget?.type === 'clock' ? 'Clock · uses this PC’s local time' : selectedWidget?.type === 'now_playing' ? 'Now Playing · system media from this PC' : selectedWidget?.type === 'plugin' ? `${plugins.find((plugin) => plugin.id === selectedWidget.pluginId)?.name ?? 'Plugin'} · ${selectedWidgetDefinition?.name ?? selectedWidget.widgetId}` : selected ? 'Edit the selected control' : 'Select an item from either grid'}</p></div>{selected || selectedWidget ? <button className="icon-button" aria-label={selectedWidget ? 'Remove widget' : 'Remove button'} onClick={() => {
         if (selectedWidget) { deleteSelectedWidget(); return; }
         if (!selected) return;
         setButtonId('');
@@ -1171,11 +1354,29 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, isMaco
         else replaceWidgetScreen({ ...widgetScreen, buttons: widgetScreen.buttons.filter((item) => item.id !== selected.id) });
       }}><Trash2 size={15} /></button> : null}</div>
         {selected && !selectedWidget ? <button className="secondary-button widget-transfer-button" onClick={moveSelectedButtonToOtherSurface} disabled={busy}>{page.buttons.some((button) => button.id === selected.id) ? 'Move to widget area' : 'Move to button grid'}</button> : null}
-        {selectedWidget ? <div className="widget-properties"><Clock size={22} /><strong>Clock</strong><span>Displays the phone’s local time and date.</span></div> : selected ? <ButtonProperties key={selected.id} button={selected} busy={busy} isMacos={isMacos} profiles={deck.profiles} pages={profile.pages} onChange={updateButton} /> : <div className="properties-empty">Select a button or widget from either grid.</div>}
+        {selectedWidget?.type === 'clock' ? <div className="widget-properties"><Clock size={22} /><strong>Clock</strong><span>Displays the phone’s local time and date.</span></div> : selectedWidget?.type === 'now_playing' ? <div className="widget-properties"><Music size={22} /><strong>Now Playing</strong><span>Shows the active media session, artwork and playback progress from this PC.</span></div> : selectedWidget?.type === 'plugin' ? <PluginWidgetProperties widget={selectedWidget} definition={selectedWidgetDefinition} busy={busy} onChange={updateSelectedPluginWidgetValue} /> : selected ? <ButtonProperties key={selected.id} button={selected} busy={busy} isMacos={isMacos} profiles={deck.profiles} pages={profile.pages} plugins={plugins} onChange={updateButton} /> : <div className="properties-empty">Select an item from either grid.</div>}
         {selected || selectedWidget ? <button className="primary-button save-button" onClick={() => void save(deck)} disabled={busy}><Save size={14} /> {busy ? 'Saving…' : 'Save deck'}</button> : null}
       </div>
     </section>
   </>;
+}
+
+function PluginWidgetProperties({ widget, definition, busy, onChange }: {
+  widget: Extract<DeckWidget, { type: 'plugin' }>;
+  definition: FreezePluginWidget | null;
+  busy: boolean;
+  onChange: (inputId: string, value: string) => void;
+}) {
+  if (!definition) return <div className="widget-properties"><Package size={22} /><strong>Plugin widget unavailable</strong><span>The plugin or widget definition is not installed. Its saved preview can still be shown on the phone.</span></div>;
+  return <div className="property-fields plugin-widget-fields">
+    <div className="widget-properties plugin-widget-summary"><Package size={22} /><strong>{definition.name}</strong>{definition.description ? <span>{definition.description}</span> : null}</div>
+    {definition.inputs.map((input) => {
+      const value = widget.values[input.id] ?? input.default;
+      return <label key={input.id}>{input.label}{input.type === 'select'
+        ? <DeckSelect value={value} disabled={busy} options={input.options.map((option, index) => ({ value: option, label: input.optionLabels?.[index] || option }))} onChange={(next) => onChange(input.id, next)} />
+        : <input type={input.type === 'number' ? 'number' : 'text'} value={value} disabled={busy} onChange={(event) => onChange(input.id, event.target.value)} />}</label>;
+    })}
+  </div>;
 }
 
 function buttonLabel(button: DeckButton, playback: PlaybackState) {
@@ -1197,6 +1398,8 @@ function autoIcon(action: DeckAction, playback: PlaybackState) {
   if (action.type === 'launch_app') return AppWindow;
   if (action.type === 'launch_file') return File;
   if (action.type === 'launch_folder') return FolderOpen;
+  if (action.type === 'plugin_action') return Package;
+  if (action.type === 'run_script') return File;
   if (action.type === 'sequence') return ListOrdered;
   if (action.type === 'select_profile') return Layers2;
   if (action.type === 'select_page') return PanelsTopLeft;
@@ -1304,16 +1507,18 @@ function IconPicker({ value, disabled, onChange }: { value: string; disabled: bo
   </div>;
 }
 
-function ButtonProperties({ button, busy, isMacos, profiles, pages, onChange }: { button: DeckButton; busy: boolean; isMacos: boolean; profiles: DeckProfile[]; pages: DeckPage[]; onChange: (patch: Partial<DeckButton>) => void }) {
+function ButtonProperties({ button, busy, isMacos, profiles, pages, plugins, onChange }: { button: DeckButton; busy: boolean; isMacos: boolean; profiles: DeckProfile[]; pages: DeckPage[]; plugins: FreezePlugin[]; onChange: (patch: Partial<DeckButton>) => void }) {
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
   const action = button.action;
-  const kind = action.type === 'sequence' ? 'sequence' : action.type;
+  const kind = action.type === 'plugin_action' ? `plugin:${action.pluginId}:${action.actionId}` : action.type === 'sequence' ? 'sequence' : action.type;
   const keys = action.type === 'hotkey' ? action.keys.join('+') : '';
   const app = action.type === 'launch_app' ? action.app : '';
   const filePath = action.type === 'launch_file' ? action.path : '';
   const folderPath = action.type === 'launch_folder' ? action.path : '';
+  const scriptPath = action.type === 'run_script' ? action.path : '';
   const media = action.type === 'media' ? action.command : 'play_pause';
+  const pluginAction = action.type === 'plugin_action' ? plugins.find((plugin) => plugin.id === action.pluginId)?.actions.find((item) => item.id === action.actionId) : undefined;
   const [iconError, setIconError] = useState('');
   const [extractingIcon, setExtractingIcon] = useState(false);
   const [extractingThumbnail, setExtractingThumbnail] = useState(false);
@@ -1347,6 +1552,15 @@ function ButtonProperties({ button, busy, isMacos, profiles, pages, onChange }: 
     } catch (error) {
       setIconError(`Could not open the application picker: ${String(error)}`);
     }
+  }
+  async function browseScript() {
+    try {
+      const path = await openFileDialog({
+        title: 'Choose a local script', multiple: false, directory: false,
+        filters: [isMacos ? { name: 'Scripts', extensions: ['sh', 'py'] } : { name: 'Scripts', extensions: ['ps1', 'py'] }],
+      });
+      if (typeof path === 'string') onChange({ action: { type: 'run_script', path, allowOnPc: action.type === 'run_script' && action.allowOnPc } });
+    } catch (error) { setIconError(`Could not open the script picker: ${String(error)}`); }
   }
   function setFileTarget(path: string) {
     if (action.type !== 'launch_file') return;
@@ -1389,16 +1603,22 @@ function ButtonProperties({ button, busy, isMacos, profiles, pages, onChange }: 
     }
   }
   const isWindowsShortcut = !isMacos && app.toLowerCase().endsWith('.lnk');
+  const actionOptions = [['media', 'Media'], ['hotkey', 'Keyboard shortcut'], ['launch_app', 'Launch app'], ['launch_file', 'Launch file'], ['launch_folder', 'Launch folder'], ['run_script', 'Run local script'], ['sequence', 'Sequence'], ['select_profile', 'Select profile'], ['select_page', 'Select page']].map(([value, label]) => ({ value, label }));
+  actionOptions.push(...plugins.flatMap((plugin) => plugin.actions.map((pluginAction) => ({ value: `plugin:${plugin.id}:${pluginAction.id}`, label: `${plugin.name} / ${pluginAction.name}` }))));
   const setKind = (value: string) => {
     thumbnailRequestRef.current += 1;
     setExtractingThumbnail(false);
-    const next: DeckAction = value === 'media' ? { type: 'media', command: 'play_pause' } : value === 'launch_app' ? { type: 'launch_app', app: '' } : value === 'launch_file' ? { type: 'launch_file', path: '' } : value === 'launch_folder' ? { type: 'launch_folder', path: '' } : value === 'sequence' ? { type: 'sequence', steps: [{ type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] }, { type: 'hotkey', keys: ['CTRL', 'S'] }] } : value === 'select_profile' ? { type: 'select_profile', profileId: profiles[0]?.id ?? '' } : value === 'select_page' ? { type: 'select_page', pageId: pages[0]?.id ?? '' } : { type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] };
+    const pluginTarget = value.startsWith('plugin:') ? value.slice(7).split(':') : [];
+    const selectedPluginAction = pluginTarget.length === 2 ? plugins.find((plugin) => plugin.id === pluginTarget[0])?.actions.find((item) => item.id === pluginTarget[1]) : undefined;
+    const next: DeckAction = pluginTarget.length === 2 ? { type: 'plugin_action', pluginId: pluginTarget[0], actionId: pluginTarget[1], allowOnPc: false, inputs: Object.fromEntries((selectedPluginAction?.inputs ?? []).map((input) => [input.id, input.default || (input.type === 'select' ? input.options[0] ?? '' : '')])) } : value === 'media' ? { type: 'media', command: 'play_pause' } : value === 'launch_app' ? { type: 'launch_app', app: '' } : value === 'launch_file' ? { type: 'launch_file', path: '' } : value === 'launch_folder' ? { type: 'launch_folder', path: '' } : value === 'run_script' ? { type: 'run_script', path: '', allowOnPc: false } : value === 'sequence' ? { type: 'sequence', steps: [{ type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] }, { type: 'hotkey', keys: ['CTRL', 'S'] }] } : value === 'select_profile' ? { type: 'select_profile', profileId: profiles[0]?.id ?? '' } : value === 'select_page' ? { type: 'select_page', pageId: pages[0]?.id ?? '' } : { type: 'hotkey', keys: ['CTRL', 'SHIFT', 'M'] };
     onChange({ action: next, ...(value === 'launch_app' ? {} : { icon: 'auto', iconSvg: undefined, appIconData: undefined }) });
   };
   return <div className="property-fields">
     <label>Button label<input value={button.label} onChange={(event) => onChange({ label: event.target.value })} maxLength={24} disabled={busy} /></label>
     <label>Icon<IconPicker value={button.icon} disabled={busy} onChange={(name, svg) => { thumbnailRequestRef.current += 1; setExtractingThumbnail(false); onChange({ icon: name, iconSvg: svg, appIconData: undefined }); }} /></label>
-    <label>Action<DeckSelect value={kind} onChange={setKind} disabled={busy} options={[['media', 'Media'], ['hotkey', 'Keyboard shortcut'], ['launch_app', 'Launch app'], ['launch_file', 'Launch file'], ['launch_folder', 'Launch folder'], ['sequence', 'Sequence'], ['select_profile', 'Select profile'], ['select_page', 'Select page']].map(([value, label]) => ({ value, label }))} /></label>
+    <label>Action<DeckSelect value={kind} onChange={setKind} disabled={busy} options={actionOptions} /></label>
+    {action.type === 'plugin_action' ? <><label className="plugin-action-info">Plugin action<span>{pluginAction?.description || 'Runs the local script defined by this Freeze plugin.'}</span></label>{pluginAction?.inputs.map((input) => <label key={input.id}>{input.label}{input.type === 'select' ? <DeckSelect value={action.inputs?.[input.id] ?? input.default ?? input.options[0] ?? ''} disabled={busy} options={input.options.map((option, index) => ({ value: option, label: input.optionLabels?.[index] || option }))} onChange={(value) => onChange({ action: { ...action, inputs: { ...action.inputs, [input.id]: value } } })} /> : <input type={input.type} value={action.inputs?.[input.id] ?? input.default} onChange={(event) => onChange({ action: { ...action, inputs: { ...action.inputs, [input.id]: event.target.value } } })} disabled={busy} maxLength={512} />}</label>)}<label className="script-permission"><input type="checkbox" checked={action.allowOnPc} disabled={busy} onChange={(event) => onChange({ action: { ...action, allowOnPc: event.target.checked } })} /><span>Allow this plugin action to run on this PC from a paired phone</span></label></> : null}
+    {kind === 'run_script' && action.type === 'run_script' ? <><label>Local script<div className="app-path-picker"><input value={scriptPath} onChange={(event) => onChange({ action: { ...action, path: event.target.value } })} placeholder={isMacos ? 'Choose a .sh or .py script' : 'Choose a .ps1 or .py script'} disabled={busy} /><button type="button" className="app-browse-button" aria-label="Browse for a local script" title="Browse for a local script" disabled={busy} onClick={() => void browseScript()}><File size={15} /></button></div></label><label className="script-permission"><input type="checkbox" checked={action.allowOnPc} disabled={busy || !scriptPath.trim()} onChange={(event) => onChange({ action: { ...action, allowOnPc: event.target.checked } })} /><span>Allow this script to run on this PC when activated from a paired phone</span></label><small>Scripts run as your Windows or macOS user. Freeze follows the operating system’s script policy.</small>{iconError ? <small className="form-error">{iconError}</small> : null}</> : null}
     {kind === 'media' ? <label>Media command<DeckSelect value={media} onChange={(value) => onChange({ action: { type: 'media', command: value as MediaCommand } })} disabled={busy} options={[['play_pause', 'Play / Pause'], ['next_track', 'Next track'], ['previous_track', 'Previous track'], ['volume_up', 'Volume up'], ['volume_down', 'Volume down'], ['mute', 'Mute']].map(([value, label]) => ({ value, label }))} /></label> : null}
     {kind === 'hotkey' ? <label>Keys<input value={keys} onChange={(event) => onChange({ action: { type: 'hotkey', keys: event.target.value.toUpperCase().split('+').map((key) => key.trim()).filter(Boolean) } })} placeholder="CTRL+SHIFT+M" disabled={busy} /></label> : null}
     {kind === 'launch_app' && action.type === 'launch_app' ? <><label>App path or name<div className="app-path-picker"><input value={app} onChange={(event) => setAppTarget(event.target.value)} placeholder="Application, shortcut, or app name" disabled={busy} /><button type="button" className="app-browse-button" aria-label="Browse for an application" title="Browse for an application" disabled={busy} onClick={() => void browseApp()}><FolderOpen size={15} /></button></div></label><button type="button" className="secondary-button app-icon-button" disabled={busy || extractingIcon || !app.trim()} onClick={() => void extractIcon(true)}>{extractingIcon ? 'Reading icon…' : button.appIconData ? isWindowsShortcut ? 'Refresh shortcut icon' : 'Refresh app icon' : isWindowsShortcut ? 'Use shortcut icon' : 'Use original app icon'}</button>{isWindowsShortcut && button.appIconData ? <button type="button" className="secondary-button app-icon-button" disabled={busy || extractingIcon} onClick={() => void extractIcon(false)}>Reset to app icon</button> : null}{iconError ? <small className="form-error">{iconError}</small> : null}</> : null}

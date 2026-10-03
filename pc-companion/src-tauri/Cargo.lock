@@ -990,6 +990,7 @@ name = "freeze-pc"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "enigo",
  "local-ip-address",
  "objc2-app-kit",

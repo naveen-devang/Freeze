@@ -29,8 +29,12 @@ use tauri::{
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
+mod system_media;
+
 const PORT: u16 = 39421;
 const MAX_DECK_CONFIG_BYTES: usize = 1_048_576;
+const MAX_PLUGIN_MANIFEST_BYTES: usize = 65_536;
+const MAX_PLUGIN_SCRIPT_BYTES: u64 = 1_048_576;
 
 struct AppState {
     host: String,
@@ -39,6 +43,7 @@ struct AppState {
     config_dir: RwLock<Option<PathBuf>>,
     deck_config: RwLock<DeckConfig>,
     deck_updates: broadcast::Sender<DeckConfig>,
+    media_state: tokio::sync::watch::Sender<system_media::SystemMediaState>,
     independent_navigation: AtomicBool,
     navigation_updates: broadcast::Sender<bool>,
     auto_profile_updates: broadcast::Sender<String>,
@@ -144,12 +149,22 @@ struct DeckWidget {
     #[serde(rename = "type")]
     kind: DeckWidgetType,
     placement: DeckPlacement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plugin_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    widget_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    render_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    values: Option<HashMap<String, String>>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum DeckWidgetType {
     Clock,
+    NowPlaying,
+    Plugin,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -181,6 +196,78 @@ struct DeckButton {
     action: DeckAction,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FreezePluginManifest {
+    schema_version: u32,
+    id: String,
+    name: String,
+    version: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    widgets: Vec<FreezePluginWidget>,
+    actions: Vec<FreezePluginAction>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FreezePluginWidget {
+    id: String,
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    inputs: Vec<FreezePluginInput>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FreezePluginAction {
+    id: String,
+    name: String,
+    #[serde(default)]
+    description: String,
+    script: String,
+    #[serde(default)]
+    inputs: Vec<FreezePluginInput>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FreezePluginInput {
+    id: String,
+    label: String,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    default: String,
+    #[serde(default)]
+    options: Vec<String>,
+    #[serde(default)]
+    option_labels: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstalledFreezePlugin {
+    id: String,
+    name: String,
+    version: String,
+    description: String,
+    actions: Vec<FreezePluginAction>,
+    widgets: Vec<FreezePluginWidget>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FreezePluginListing {
+    plugins: Vec<InstalledFreezePlugin>,
+    warnings: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DeckPlacement {
@@ -193,14 +280,41 @@ struct DeckPlacement {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DeckAction {
-    Media { command: MediaCommand },
-    Hotkey { keys: Vec<String> },
-    LaunchApp { app: String },
-    LaunchFile { path: String },
-    LaunchFolder { path: String },
-    Sequence { steps: Vec<DeckStep> },
-    SelectProfile { profile_id: String },
-    SelectPage { page_id: String },
+    Media {
+        command: MediaCommand,
+    },
+    Hotkey {
+        keys: Vec<String>,
+    },
+    LaunchApp {
+        app: String,
+    },
+    LaunchFile {
+        path: String,
+    },
+    LaunchFolder {
+        path: String,
+    },
+    RunScript {
+        path: String,
+        allow_on_pc: bool,
+    },
+    PluginAction {
+        plugin_id: String,
+        action_id: String,
+        allow_on_pc: bool,
+        #[serde(default)]
+        inputs: HashMap<String, String>,
+    },
+    Sequence {
+        steps: Vec<DeckStep>,
+    },
+    SelectProfile {
+        profile_id: String,
+    },
+    SelectPage {
+        page_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -416,6 +530,7 @@ fn validate_deck_config(config: &DeckConfig) -> Result<(), String> {
                                 "Widget IDs must be valid and unique within a profile".into()
                             );
                         }
+                        validate_deck_widget(widget)?;
                         placements.push(widget.placement);
                     }
                     validate_layout(area.rows, area.columns, &placements)?;
@@ -452,6 +567,7 @@ fn validate_deck_config(config: &DeckConfig) -> Result<(), String> {
                 if !valid_id(&widget.id) || !button_ids.insert(widget.id.clone()) {
                     return Err("Widget IDs must be valid and unique within a profile".into());
                 }
+                validate_deck_widget(widget)?;
                 placements.push(widget.placement);
             }
             validate_layout(screen.rows, screen.columns, &placements)?;
@@ -519,6 +635,57 @@ fn validate_page_layout(page: &DeckPage) -> Result<(), String> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     validate_layout(page.rows, page.columns, &placements)
+}
+
+fn validate_deck_widget(widget: &DeckWidget) -> Result<(), String> {
+    match widget.kind {
+        DeckWidgetType::Clock
+            if widget.plugin_id.is_none()
+                && widget.widget_id.is_none()
+                && widget.render_type.is_none()
+                && widget.values.is_none() =>
+        {
+            Ok(())
+        }
+        DeckWidgetType::NowPlaying
+            if widget.plugin_id.is_none()
+                && widget.widget_id.is_none()
+                && widget.render_type.is_none()
+                && widget.values.is_none() =>
+        {
+            Ok(())
+        }
+        DeckWidgetType::Plugin => {
+            if !widget.plugin_id.as_deref().is_some_and(valid_plugin_id)
+                || !widget.widget_id.as_deref().is_some_and(valid_plugin_id)
+                || !widget.render_type.as_deref().is_some_and(valid_plugin_id)
+            {
+                return Err("Plugin widgets need valid widget and renderer ids".into());
+            }
+            let values = widget
+                .values
+                .as_ref()
+                .ok_or_else(|| "Plugin widgets need a values map".to_owned())?;
+            if values.len() > 16 {
+                return Err("Plugin widgets can contain at most 16 values".into());
+            }
+            let mut total = 0usize;
+            for (id, value) in values {
+                if !valid_plugin_id(id) || value.len() > 1024 || value.chars().any(char::is_control)
+                {
+                    return Err("Plugin widget values must be valid text under 1 KiB".into());
+                }
+                total += value.len();
+            }
+            if total > 8192 {
+                return Err("Plugin widget values exceed the 8 KiB limit".into());
+            }
+            Ok(())
+        }
+        DeckWidgetType::Clock | DeckWidgetType::NowPlaying => {
+            Err("Built-in widgets cannot contain plugin metadata".into())
+        }
+    }
 }
 
 fn validate_layout(rows: u8, columns: u8, placements: &[DeckPlacement]) -> Result<(), String> {
@@ -800,6 +967,18 @@ fn validate_action(action: &DeckAction) -> Result<(), String> {
         DeckAction::LaunchApp { app } => validate_app_target(app),
         DeckAction::LaunchFile { path } => validate_file_target(path),
         DeckAction::LaunchFolder { path } => validate_file_target(path),
+        DeckAction::RunScript { path, .. } => validate_script_target(path),
+        DeckAction::PluginAction {
+            plugin_id,
+            action_id,
+            ..
+        } => {
+            if valid_plugin_id(plugin_id) && valid_plugin_id(action_id) {
+                Ok(())
+            } else {
+                Err("This plugin action has an invalid identifier".into())
+            }
+        }
         DeckAction::Sequence { steps } => {
             if steps.is_empty() || steps.len() > 10 {
                 return Err("A sequence must contain 1–10 steps".into());
@@ -848,6 +1027,242 @@ fn validate_file_target(path: &str) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+fn validate_script_target(path: &str) -> Result<(), String> {
+    validate_file_target(path)?;
+    let supported = Path::new(path.trim())
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            #[cfg(windows)]
+            {
+                ["ps1", "py"]
+                    .iter()
+                    .any(|allowed| extension.eq_ignore_ascii_case(allowed))
+            }
+            #[cfg(not(windows))]
+            {
+                ["sh", "py"]
+                    .iter()
+                    .any(|allowed| extension.eq_ignore_ascii_case(allowed))
+            }
+        });
+    if supported {
+        Ok(())
+    } else {
+        #[cfg(windows)]
+        {
+            Err("Choose a PowerShell (.ps1) or Python (.py) script".into())
+        }
+        #[cfg(not(windows))]
+        {
+            Err("Choose a shell (.sh) or Python (.py) script".into())
+        }
+    }
+}
+
+fn valid_plugin_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+}
+
+fn validate_plugin_manifest(manifest: &FreezePluginManifest) -> Result<(), String> {
+    if manifest.schema_version != 1
+        || !valid_plugin_id(&manifest.id)
+        || !valid_label(&manifest.name, 80)
+        || manifest.version.trim().is_empty()
+        || manifest.version.len() > 32
+        || manifest.version.chars().any(char::is_control)
+        || manifest.description.len() > 256
+        || manifest.description.chars().any(char::is_control)
+        || manifest.actions.len() > 32
+        || manifest.widgets.len() > 32
+        || (manifest.actions.is_empty() && manifest.widgets.is_empty())
+    {
+        return Err("The Freeze plugin manifest has invalid metadata".into());
+    }
+    let mut ids = std::collections::HashSet::new();
+    for action in &manifest.actions {
+        if !valid_plugin_id(&action.id)
+            || !ids.insert(&action.id)
+            || !valid_label(&action.name, 80)
+            || action.description.len() > 256
+            || action.description.chars().any(char::is_control)
+            || !action.script.starts_with("scripts/")
+            || action.script[8..].is_empty()
+            || action.script[8..].contains(['/', '\\', ':'])
+            || action.script[8..].starts_with('.')
+        {
+            return Err("The Freeze plugin contains an invalid action".into());
+        }
+        validate_plugin_inputs(&action.inputs)?;
+        validate_script_target(&action.script[8..])?;
+    }
+    let mut widget_ids = std::collections::HashSet::new();
+    for widget in &manifest.widgets {
+        if !valid_plugin_id(&widget.id)
+            || !widget_ids.insert(&widget.id)
+            || !valid_label(&widget.name, 80)
+            || widget.description.len() > 256
+            || widget.description.chars().any(char::is_control)
+            || widget.kind != "text"
+        {
+            return Err("The Freeze plugin contains an invalid widget".into());
+        }
+        validate_plugin_inputs(&widget.inputs)?;
+    }
+    Ok(())
+}
+
+fn validate_plugin_inputs(inputs: &[FreezePluginInput]) -> Result<(), String> {
+    if inputs.len() > 16 {
+        return Err("A plugin action or widget can define at most 16 inputs".into());
+    }
+    let mut input_ids = std::collections::HashSet::new();
+    for input in inputs {
+        if !valid_plugin_id(&input.id)
+            || !input_ids.insert(&input.id)
+            || !valid_label(&input.label, 64)
+            || input.default.len() > 512
+            || input.default.chars().any(char::is_control)
+        {
+            return Err("The Freeze plugin contains an invalid input".into());
+        }
+        match input.kind.as_str() {
+            "text" if input.options.is_empty() && input.option_labels.is_empty() => (),
+            "number"
+                if input.options.is_empty()
+                    && input.option_labels.is_empty()
+                    && (input.default.is_empty()
+                        || input.default.parse::<f64>().is_ok_and(f64::is_finite)) =>
+            {
+                ()
+            }
+            "select" => {
+                let mut options = std::collections::HashSet::new();
+                if input.options.is_empty()
+                    || input.options.len() > 32
+                    || (!input.option_labels.is_empty()
+                        && input.option_labels.len() != input.options.len())
+                    || input
+                        .option_labels
+                        .iter()
+                        .any(|label| !valid_label(label, 80))
+                    || input.options.iter().any(|option| {
+                        option.is_empty()
+                            || option.len() > 128
+                            || option.chars().any(char::is_control)
+                            || !options.insert(option)
+                    })
+                    || (!input.default.is_empty() && !options.contains(&input.default))
+                {
+                    return Err("The Freeze plugin contains an invalid select input".into());
+                }
+            }
+            "text" => return Err("Text inputs cannot define options".into()),
+            "number" => return Err("The Freeze plugin contains an invalid number input".into()),
+            _ => return Err("Freeze plugin inputs must be text, number, or select".into()),
+        }
+    }
+    Ok(())
+}
+
+fn read_freeze_plugin_manifest(
+    directory: &Path,
+) -> Result<(FreezePluginManifest, Vec<u8>), String> {
+    let directory_metadata = fs::symlink_metadata(directory)
+        .map_err(|_| "Could not access the plugin folder".to_owned())?;
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        return Err("Plugin folders must be regular directories".into());
+    }
+    let manifest_path = directory.join("manifest.json");
+    let metadata = fs::symlink_metadata(&manifest_path)
+        .map_err(|_| "Plugin folder must contain a manifest.json file".to_owned())?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_PLUGIN_MANIFEST_BYTES as u64
+    {
+        return Err("The plugin manifest must be a regular JSON file under 64 KiB".into());
+    }
+    let bytes =
+        fs::read(&manifest_path).map_err(|_| "Could not read the plugin manifest".to_owned())?;
+    let manifest: FreezePluginManifest = serde_json::from_slice(&bytes)
+        .map_err(|_| "The plugin manifest is not valid Freeze plugin JSON".to_owned())?;
+    validate_plugin_manifest(&manifest)?;
+    Ok((manifest, bytes))
+}
+
+fn plugin_scripts(
+    directory: &Path,
+    manifest: &FreezePluginManifest,
+) -> Result<Vec<(PathBuf, String)>, String> {
+    let root = directory
+        .canonicalize()
+        .map_err(|_| "Could not access the plugin folder".to_owned())?;
+    let mut scripts = Vec::with_capacity(manifest.actions.len());
+    let mut copied = std::collections::HashSet::new();
+    for action in &manifest.actions {
+        if !copied.insert(&action.script) {
+            continue;
+        }
+        let source = directory.join(&action.script);
+        let metadata = fs::symlink_metadata(&source)
+            .map_err(|_| format!("Plugin script is missing: {}", action.script))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() > MAX_PLUGIN_SCRIPT_BYTES
+        {
+            return Err(format!(
+                "Plugin script must be a regular file under 1 MiB: {}",
+                action.script
+            ));
+        }
+        let canonical = source
+            .canonicalize()
+            .map_err(|_| "Could not resolve a plugin script".to_owned())?;
+        if !canonical.starts_with(&root) {
+            return Err("Plugin scripts must remain inside their package folder".into());
+        }
+        let file_name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or("Invalid plugin script filename")?
+            .to_owned();
+        scripts.push((source, file_name));
+    }
+    Ok(scripts)
+}
+
+fn freeze_plugins_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("plugins")
+}
+
+fn plugin_is_used(config: &DeckConfig, plugin_id: &str) -> bool {
+    config.profiles.iter().any(|profile| {
+        let button_uses_plugin = |button: &DeckButton| {
+            matches!(&button.action, DeckAction::PluginAction { plugin_id: id, .. } if id == plugin_id)
+        };
+        let widget_uses_plugin = |widget: &DeckWidget| {
+            widget.kind == DeckWidgetType::Plugin
+                && widget.plugin_id.as_deref() == Some(plugin_id)
+        };
+        profile.widget_screen.as_ref().is_some_and(|screen| {
+            screen.buttons.iter().any(button_uses_plugin)
+                || screen.widgets.iter().any(widget_uses_plugin)
+        }) || profile.pages.iter().any(|page| {
+            page.buttons.iter().any(button_uses_plugin)
+                || page.widget_area.as_ref().is_some_and(|area| {
+                    area.pages.iter().any(|widget_page| {
+                        widget_page.buttons.iter().any(button_uses_plugin)
+                            || widget_page.widgets.iter().any(widget_uses_plugin)
+                    })
+                })
+        })
+    })
 }
 
 fn save_deck_config_file(path: &Path, config: &DeckConfig) -> Result<(), String> {
@@ -1087,6 +1502,17 @@ enum ClientMessage {
         #[serde(rename = "buttonId")]
         button_id: String,
     },
+    InvokeMediaCommand {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        command: MediaCommand,
+    },
+    SetSystemVolume {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "volumePercent")]
+        volume_percent: u8,
+    },
     SelectProfile {
         #[serde(rename = "requestId")]
         request_id: String,
@@ -1149,6 +1575,158 @@ fn deck_config(state: tauri::State<'_, Arc<AppState>>) -> Result<DeckConfig, Str
         .read()
         .map(|config| config.clone())
         .map_err(|_| "Freeze deck config is unavailable".to_owned())
+}
+
+#[tauri::command]
+fn list_freeze_plugins(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<FreezePluginListing, String> {
+    let config_dir = state
+        .config_dir
+        .read()
+        .map_err(|_| "Freeze settings are unavailable".to_owned())?
+        .clone()
+        .ok_or_else(|| "Freeze settings are still starting".to_owned())?;
+    let root = freeze_plugins_path(&config_dir);
+    if !root.exists() {
+        return Ok(FreezePluginListing {
+            plugins: Vec::new(),
+            warnings: Vec::new(),
+        });
+    }
+    let mut plugins = Vec::new();
+    let mut warnings = Vec::new();
+    for entry in fs::read_dir(root).map_err(|_| "Could not list Freeze plugins".to_owned())? {
+        let Ok(entry) = entry else {
+            warnings.push("Could not read one entry in Freeze's plugin folder.".to_owned());
+            continue;
+        };
+        let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+            warnings.push(format!(
+                "Could not inspect plugin folder '{}'.",
+                entry.file_name().to_string_lossy()
+            ));
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let (manifest, _) = match read_freeze_plugin_manifest(&entry.path()) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                warnings.push(format!(
+                    "Plugin '{}': {error}",
+                    entry.file_name().to_string_lossy()
+                ));
+                continue;
+            }
+        };
+        if entry.file_name().to_string_lossy() != manifest.id {
+            warnings.push(format!(
+                "Plugin '{}': folder name does not match its manifest id.",
+                manifest.name
+            ));
+            continue;
+        }
+        if let Err(error) = plugin_scripts(&entry.path(), &manifest) {
+            warnings.push(format!("Plugin '{}': {error}", manifest.name));
+            continue;
+        }
+        plugins.push(InstalledFreezePlugin {
+            id: manifest.id,
+            name: manifest.name,
+            version: manifest.version,
+            description: manifest.description,
+            actions: manifest.actions,
+            widgets: manifest.widgets,
+        });
+    }
+    plugins.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(FreezePluginListing { plugins, warnings })
+}
+
+#[tauri::command]
+fn install_freeze_plugin(
+    source_path: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<InstalledFreezePlugin, String> {
+    let source = PathBuf::from(source_path)
+        .canonicalize()
+        .map_err(|_| "Choose an existing Freeze plugin folder".to_owned())?;
+    if !source.is_dir() {
+        return Err("Choose a folder containing manifest.json and scripts/".into());
+    }
+    let (manifest, manifest_bytes) = read_freeze_plugin_manifest(&source)?;
+    let scripts = plugin_scripts(&source, &manifest)?;
+    let config_dir = state
+        .config_dir
+        .read()
+        .map_err(|_| "Freeze settings are unavailable".to_owned())?
+        .clone()
+        .ok_or_else(|| "Freeze settings are still starting".to_owned())?;
+    let plugins_dir = freeze_plugins_path(&config_dir);
+    fs::create_dir_all(&plugins_dir)
+        .map_err(|_| "Could not prepare Freeze's plugin folder".to_owned())?;
+    let target = plugins_dir.join(&manifest.id);
+    if target.exists() {
+        return Err(
+            "A Freeze plugin with this id is already installed. Remove it before reinstalling."
+                .into(),
+        );
+    }
+    fs::create_dir_all(target.join("scripts"))
+        .map_err(|_| "Could not create the installed plugin folder".to_owned())?;
+    let install_result = (|| {
+        for (source, file_name) in scripts {
+            fs::copy(source, target.join("scripts").join(file_name))
+                .map_err(|_| "Could not install a plugin script".to_owned())?;
+        }
+        fs::write(target.join("manifest.json"), manifest_bytes)
+            .map_err(|_| "Could not install the plugin manifest".to_owned())
+    })();
+    if let Err(error) = install_result {
+        let _ = fs::remove_dir_all(&target);
+        return Err(error);
+    }
+    Ok(InstalledFreezePlugin {
+        id: manifest.id,
+        name: manifest.name,
+        version: manifest.version,
+        description: manifest.description,
+        actions: manifest.actions,
+        widgets: manifest.widgets,
+    })
+}
+
+#[tauri::command]
+fn uninstall_freeze_plugin(
+    plugin_id: String,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    if !valid_plugin_id(&plugin_id) {
+        return Err("Invalid Freeze plugin id".into());
+    }
+    let config = state
+        .deck_config
+        .read()
+        .map_err(|_| "Freeze deck config is unavailable".to_owned())?;
+    if plugin_is_used(&config, &plugin_id) {
+        return Err(
+            "Change or remove this plugin's deck buttons or widgets before uninstalling it".into(),
+        );
+    }
+    drop(config);
+    let config_dir = state
+        .config_dir
+        .read()
+        .map_err(|_| "Freeze settings are unavailable".to_owned())?
+        .clone()
+        .ok_or_else(|| "Freeze settings are still starting".to_owned())?;
+    let target = freeze_plugins_path(&config_dir).join(plugin_id);
+    if target.exists() {
+        fs::remove_dir_all(target).map_err(|_| "Could not remove the Freeze plugin".to_owned())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1834,7 +2412,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let mut selected_profile_id = String::new();
     let mut selected_page_id = String::new();
     let mut session_epoch = 0;
+    let mut last_media_content: Option<system_media::SystemMediaState> = None;
     let mut deck_updates = state.deck_updates.subscribe();
+    let mut media_updates = state.media_state.subscribe();
     let mut navigation_updates = state.navigation_updates.subscribe();
     let mut auto_profile_updates = state.auto_profile_updates.subscribe();
     let mut legacy_requests = state.legacy_requests.subscribe();
@@ -1938,6 +2518,23 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                         break;
                     }
                     last_playback_state = Some(playback_state);
+                }
+                continue;
+            }
+            changed = media_updates.changed(), if authenticated => {
+                if changed.is_err() { break; }
+                let media = media_updates.borrow().clone();
+                let content_changed = last_media_content
+                    .as_ref()
+                    .is_none_or(|previous| !previous.same_content(&media));
+                let message = if content_changed {
+                    last_media_content = Some(media.clone());
+                    serde_json::json!({ "type": "media_state", "state": media })
+                } else {
+                    serde_json::json!({ "type": "media_progress", "playbackState": media.playback_state, "positionMs": media.position_ms, "durationMs": media.duration_ms, "volumePercent": media.volume_percent })
+                };
+                if socket.send(Message::Text(message.to_string().into())).await.is_err() {
+                    break;
                 }
                 continue;
             }
@@ -2091,6 +2688,16 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 {
                     break;
                 }
+                let media = state.media_state.borrow().clone();
+                last_media_content = Some(media.clone());
+                let message = serde_json::json!({ "type": "media_state", "state": media });
+                if socket
+                    .send(Message::Text(message.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
             }
             ClientMessage::InvokeButton {
                 request_id,
@@ -2168,6 +2775,56 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                             break;
                         }
                     }
+                }
+            }
+            ClientMessage::InvokeMediaCommand {
+                request_id,
+                command,
+            } if authenticated => {
+                let result = if valid_id(&request_id) {
+                    run_action(ClientAction::Media { command })
+                } else {
+                    Err("invalid_request".to_owned())
+                };
+                let reply = match result {
+                    Ok(()) => {
+                        serde_json::json!({ "type": "action_result", "requestId": request_id, "ok": true })
+                    }
+                    Err(_) => {
+                        serde_json::json!({ "type": "action_result", "requestId": request_id, "ok": false, "reason": "control_failed" })
+                    }
+                };
+                if socket
+                    .send(Message::Text(reply.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            ClientMessage::SetSystemVolume {
+                request_id,
+                volume_percent,
+            } if authenticated => {
+                let result = if valid_id(&request_id) && volume_percent <= 100 {
+                    system_media::set_system_volume(volume_percent)
+                } else {
+                    Err("invalid_request".to_owned())
+                };
+                let reply = match result {
+                    Ok(()) => {
+                        serde_json::json!({ "type": "action_result", "requestId": request_id, "ok": true })
+                    }
+                    Err(_) => {
+                        serde_json::json!({ "type": "action_result", "requestId": request_id, "ok": false, "reason": "control_failed" })
+                    }
+                };
+                if socket
+                    .send(Message::Text(reply.to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
                 }
             }
             ClientMessage::SelectProfile {
@@ -2508,6 +3165,31 @@ fn run_deck_action(
         DeckAction::LaunchFolder { path } => {
             run_action(ClientAction::LaunchFolder { path: path.clone() })
         }
+        DeckAction::RunScript { path, allow_on_pc } => {
+            if !allow_on_pc {
+                return Err("Allow this script to run on this PC in its button settings".into());
+            }
+            run_script(path, &[])
+        }
+        DeckAction::PluginAction {
+            plugin_id,
+            action_id,
+            allow_on_pc,
+            inputs,
+        } => {
+            if !allow_on_pc {
+                return Err(
+                    "Allow this plugin action to run on this PC in its button settings".into(),
+                );
+            }
+            let config_dir = state
+                .config_dir
+                .read()
+                .map_err(|_| "Freeze settings are unavailable".to_owned())?
+                .clone()
+                .ok_or_else(|| "Freeze settings are still starting".to_owned())?;
+            run_freeze_plugin_action(&config_dir, plugin_id, action_id, inputs)
+        }
         DeckAction::Sequence { steps } => {
             let mut actions = Vec::with_capacity(steps.len());
             for step in steps {
@@ -2593,6 +3275,13 @@ async fn get_playback_state() -> PlaybackState {
     current_playback_state().await
 }
 
+#[tauri::command]
+fn get_system_media_state(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> system_media::SystemMediaState {
+    state.media_state.borrow().clone()
+}
+
 fn run_action(action: ClientAction) -> Result<(), String> {
     match action {
         ClientAction::Hotkey { keys } => {
@@ -2665,6 +3354,110 @@ fn run_action(action: ClientAction) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn run_script(path: &str, args: &[String]) -> Result<(), String> {
+    validate_script_target(path)?;
+    let path = Path::new(path.trim());
+    if !path.is_file() {
+        return Err("The selected script does not exist".into());
+    }
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    #[cfg(windows)]
+    let mut command = if extension.eq_ignore_ascii_case("ps1") {
+        let mut command = Command::new("powershell.exe");
+        command
+            .args(["-NoProfile", "-NonInteractive", "-File"])
+            .arg(path);
+        command
+    } else {
+        let mut command = Command::new("py.exe");
+        command.args(["-3"]).arg(path);
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = if extension.eq_ignore_ascii_case("sh") {
+        let mut command = Command::new("/bin/sh");
+        command.arg(path);
+        command
+    } else {
+        let mut command = Command::new("python3");
+        command.arg(path);
+        command
+    };
+    command
+        .args(args)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Could not start script: {error}"))
+}
+
+fn run_freeze_plugin_action(
+    config_dir: &Path,
+    plugin_id: &str,
+    action_id: &str,
+    inputs: &HashMap<String, String>,
+) -> Result<(), String> {
+    if !valid_plugin_id(plugin_id) || !valid_plugin_id(action_id) {
+        return Err("This plugin action has an invalid identifier".into());
+    }
+    let plugin_dir = freeze_plugins_path(config_dir).join(plugin_id);
+    let (manifest, _) = read_freeze_plugin_manifest(&plugin_dir)?;
+    if manifest.id != plugin_id {
+        return Err("Installed plugin id does not match its manifest".into());
+    }
+    let action = manifest
+        .actions
+        .iter()
+        .find(|action| action.id == action_id)
+        .ok_or_else(|| "This plugin action is no longer installed".to_owned())?;
+    if inputs
+        .keys()
+        .any(|id| !action.inputs.iter().any(|input| input.id == *id))
+    {
+        return Err("This plugin action has an unknown input".into());
+    }
+    let mut args = Vec::with_capacity(action.inputs.len());
+    let mut total_bytes = 0usize;
+    for input in &action.inputs {
+        let value = inputs.get(&input.id).unwrap_or(&input.default);
+        if value.len() > 1024 || value.chars().any(char::is_control) {
+            return Err(format!(
+                "{} is too long or contains invalid characters",
+                input.label
+            ));
+        }
+        match input.kind.as_str() {
+            "number" if value.parse::<f64>().is_err_and(|_| !value.is_empty()) => {
+                return Err(format!("Enter a number for {}", input.label));
+            }
+            "number" if !value.is_empty() && !value.parse::<f64>().is_ok_and(f64::is_finite) => {
+                return Err(format!("Enter a valid number for {}", input.label));
+            }
+            "select" if !input.options.contains(value) => {
+                return Err(format!("Choose a valid option for {}", input.label));
+            }
+            _ => (),
+        }
+        total_bytes += value.len();
+        if total_bytes > 8192 {
+            return Err("Plugin action inputs exceed the size limit".into());
+        }
+        args.push(value.clone());
+    }
+    let scripts = plugin_scripts(&plugin_dir, &manifest)?;
+    let filename = Path::new(&action.script)
+        .file_name()
+        .ok_or_else(|| "Invalid plugin script".to_owned())?;
+    let script = scripts
+        .iter()
+        .find(|(_, name)| Path::new(name) == Path::new(filename))
+        .map(|(path, _)| path.as_path())
+        .ok_or_else(|| "The plugin script is unavailable".to_owned())?;
+    run_script(script.to_string_lossy().as_ref(), &args)
 }
 
 fn launch_app(app: &str) -> Result<(), String> {
@@ -2890,6 +3683,8 @@ pub fn run() {
         .map(|address| address.to_string())
         .unwrap_or_else(|_| "127.0.0.1".to_owned());
     let (deck_updates, _) = broadcast::channel(16);
+    let (media_state, _) =
+        tokio::sync::watch::channel(system_media::SystemMediaState::unavailable());
     let (legacy_requests, _) = broadcast::channel(16);
     let (navigation_updates, _) = broadcast::channel(16);
     let (auto_profile_updates, _) = broadcast::channel(16);
@@ -2900,6 +3695,7 @@ pub fn run() {
         config_dir: RwLock::new(None),
         deck_config: RwLock::new(default_deck_config()),
         deck_updates,
+        media_state,
         independent_navigation: AtomicBool::new(false),
         navigation_updates,
         auto_profile_updates,
@@ -2918,10 +3714,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             connection_info,
             deck_config,
+            list_freeze_plugins,
+            install_freeze_plugin,
+            uninstall_freeze_plugin,
             get_independent_navigation,
             set_independent_navigation,
             save_deck_config,
             get_playback_state,
+            get_system_media_state,
             extract_app_icon,
             extract_file_thumbnail,
             pending_legacy_imports,
@@ -2990,6 +3790,11 @@ pub fn run() {
                 }
                 thread::sleep(Duration::from_millis(700));
             });
+
+            system_media::spawn_system_media_monitor(
+                state.media_state.clone(),
+                app.handle().clone(),
+            );
 
             tauri::async_runtime::spawn(serve(state));
             let open = MenuItem::with_id(app, "open", "Open Freeze", true, None::<&str>)?;
