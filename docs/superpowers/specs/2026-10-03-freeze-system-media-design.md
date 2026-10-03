@@ -47,6 +47,13 @@ The first approach is selected. Windows chooses the session it considers most li
 - The phone renders the built-in type directly; no separate installation is required on the phone.
 - Multiple Now Playing instances may display the same current session. They do not create multiple provider subscriptions.
 
+### Visual direction
+
+- Make the widget feel like part of Freeze: use the existing dark neutral surfaces, restrained borders, typography and spacing, with Freeze's cool accent for playback/progress details. Do not use Spotify branding/green or reproduce Elgato's artwork/layout.
+- Let artwork be the visual anchor in roomy cells. Pair it with a clear title/artist hierarchy, quiet album/source details, and a compact playback progress treatment when timeline data exists.
+- Adapt the layout to widget aspect ratio and available size: wide cells can place artwork beside text and progress; narrow/small cells must prioritize legible artwork and a short title/artist without overflow. Keep all labels and progress optional when space is tight.
+- Preserve the same visual language in standard, widget-only, and immersive landscape modes, including stable empty/missing-art states.
+
 ### Spotify starter removal
 
 - Remove the bundled `freeze.spotify-controls` sample package and its Spotify-specific documentation/references.
@@ -78,4 +85,3 @@ The first approach is selected. Windows chooses the session it considers most li
 - macOS media-session provider.
 - Per-service search, library, saved-track, playlist, queue and account features.
 - Third-party executable widget providers, Marketplace, Elgato protocol compatibility, and arbitrary plugin UI/code.
-
