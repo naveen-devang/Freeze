@@ -12,7 +12,8 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { runInThisContext } from 'node:vm';
 
-const source = readFileSync(new URL('../pc-companion/src/pc-stats/pc-stats.js', import.meta.url), 'utf8');
+// Line endings depend on the checkout (core.autocrlf), so the phone copy always uses LF.
+const source = readFileSync(new URL('../pc-companion/src/pc-stats/pc-stats.js', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const phone = readFileSync(new URL('../phone-app/src/pc-stats-source.ts', import.meta.url), 'utf8');
 assert.ok(phone.includes(JSON.stringify(source)), 'phone-app/src/pc-stats-source.ts is stale: run node scripts/sync-pc-stats.ts');
 

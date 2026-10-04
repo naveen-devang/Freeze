@@ -4,7 +4,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { runInThisContext } from 'node:vm';
 
-const source = readFileSync(new URL('../pc-companion/src/clock-faces/clock-faces.js', import.meta.url), 'utf8');
+// Line endings depend on the checkout (core.autocrlf), so the phone copy always uses LF.
+const source = readFileSync(new URL('../pc-companion/src/clock-faces/clock-faces.js', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const phone = readFileSync(new URL('../phone-app/src/clock-faces-source.ts', import.meta.url), 'utf8');
 assert.ok(phone.includes(JSON.stringify(source)), 'phone-app/src/clock-faces-source.ts is stale: run node scripts/sync-clock-faces.ts');
 
