@@ -6,6 +6,9 @@ import { useElementSize } from './useElementSize';
 type PreviewMedia = { title?: string | null; artist?: string | null; album?: string | null; playbackState: string; positionMs?: number | null; durationMs?: number | null; playbackRate?: number | null };
 
 const LEAD_MS = 250;
+// Match the phone: wait through the PC's 1 s media polling cycle after track details change.
+const SETTLE_MS = 1200;
+const MISSING_DURATION_WAIT_MS = 1500;
 
 // The phone's Lyrics widget drawn with CSS at the phone's block size, then scaled into the editor cell.
 export function LyricsPreview({ media, surface, columns, rows, columnSpan, rowSpan }: { media: PreviewMedia; surface: WidgetSurface; columns: number; rows: number; columnSpan: number; rowSpan: number }) {
@@ -19,8 +22,10 @@ export function LyricsPreview({ media, surface, columns, rows, columnSpan, rowSp
   useEffect(() => {
     if (!key) return;
     let alive = true;
-    void fetchLyrics(track).then((lyrics) => { if (alive) setResult({ key, lyrics }); });
-    return () => { alive = false; };
+    const timer = setTimeout(() => {
+      void fetchLyrics(track).then((lyrics) => { if (alive) setResult({ key, lyrics }); });
+    }, track.durationMs ? SETTLE_MS : MISSING_DURATION_WAIT_MS);
+    return () => { alive = false; clearTimeout(timer); };
   }, [key, track]);
   const lyrics: Lyrics | 'loading' = !key ? { kind: 'none' } : result?.key === key ? result.lyrics : 'loading';
   const lines = useMemo(() => lyrics !== 'loading' && lyrics.kind === 'synced' ? withIntroGap(lyrics.lines) : null, [lyrics]);

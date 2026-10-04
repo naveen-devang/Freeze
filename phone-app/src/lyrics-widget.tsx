@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AccessibilityInfo, Animated, Easing, PanResponder, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { AccessibilityInfo, Animated, Easing, KeyboardAvoidingView, Modal, PanResponder, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import Storage from 'expo-sqlite/kv-store';
 import type { SystemMediaState } from './connection';
 import { activeLineAt, fetchLyrics, isGapLine, lyricLineOpacity, lyricsLayout, lyricsTrace, lyricsTrackKey, withIntroGap, type LyricLine, type Lyrics, type TimingVersion } from './lyrics';
-import { Minus, Plus, RefreshCw } from 'lucide-react-native';
+import { Minus, Plus, RefreshCw, X } from 'lucide-react-native';
 import { colors } from './theme';
 
 // ponytail: one fixed lead for every setup; make it a setting if lines feel early or late on some PCs.
@@ -18,8 +19,9 @@ const EMPHASIS_MS = 450;
 const DOT_BREATH_MS = 1000;
 const DOT_EXIT_MS = 300;
 const NEUTRAL_GAP_MS = 4000;
-// Players publish a new title before its other details, so the lookup waits for them to settle.
-const SETTLE_MS = 700;
+// Players publish a new title before its timeline. Wait through the PC's 1 s media polling cycle
+// so the previous song's duration cannot immediately select a loose timing for the new title.
+const SETTLE_MS = 1200;
 // Some players publish the duration late or never: wait this long for it, then look up by name alone.
 const MISSING_DURATION_WAIT_MS = 1500;
 // Browsing: a vertical drag scrolls the lyrics, and they stop following the song until this long after the
@@ -588,38 +590,54 @@ function LyricsDebug({ media, status, onClose, sync, onPickVersion, onResetOffse
     ...trace.steps,
   ].filter(Boolean);
   const same = (a?: number, b?: number) => a !== undefined && b !== undefined && Math.abs(a - b) <= SAME_VERSION_MS;
-  return <Pressable onPress={onClose} accessibilityRole="button" accessibilityLabel="Close lyrics details" style={styles.debug}>
-    <ScrollView nestedScrollEnabled contentContainerStyle={styles.debugContent}>
-      <Text allowFontScaling={false} style={styles.debugHeading}>Sync</Text>
-      <View style={styles.debugRow}>
-        <Text allowFontScaling={false} style={styles.debugText}>offset: {sync.offsetMs === 0 ? 'none' : `${signedSeconds(sync.offsetMs)} (${sync.offsetMs < 0 ? 'lyrics later' : 'lyrics earlier'})`}</Text>
-        {sync.offsetMs !== 0 ? <Pressable onPress={onResetOffset} hitSlop={6} accessibilityRole="button" accessibilityLabel="Reset the lyrics offset" style={styles.debugChip}><Text allowFontScaling={false} style={styles.debugChipText}>Reset</Text></Pressable> : null}
-      </View>
-      {sync.versions.length > 0 ? <>
-        <Text allowFontScaling={false} style={styles.debugText}>timings found ({sync.picked ? 'picked by you' : sync.autoFirstMs === undefined ? 'none used: the lengths differ, so shown unsynced' : sync.reason ? `automatic: ${sync.reason}` : 'automatic'}):</Text>
-        {sync.versions.map((version) => {
-          const shown = same(version.firstMs, sync.shownFirstMs);
-          return <Pressable key={version.firstMs} onPress={() => onPickVersion(version.firstMs)} accessibilityRole="button" accessibilityState={{ selected: shown }} accessibilityLabel={`Use the timing starting at ${(version.firstMs / 1000).toFixed(1)} seconds`} style={[styles.debugChip, shown && styles.debugChipSelected]}>
-            <Text allowFontScaling={false} style={styles.debugChipText}>{shown ? '✓ ' : ''}starts {(version.firstMs / 1000).toFixed(1)} s · {version.entries} {version.entries === 1 ? 'entry' : 'entries'}{same(version.firstMs, sync.autoFirstMs) ? ' · automatic' : ''}</Text>
-          </Pressable>;
-        })}
-        {sync.picked ? <Pressable onPress={() => onPickVersion(undefined)} accessibilityRole="button" accessibilityLabel="Go back to the automatic timing" style={styles.debugChip}><Text allowFontScaling={false} style={styles.debugChipText}>Back to automatic</Text></Pressable> : null}
-      </> : null}
-      <Text allowFontScaling={false} style={styles.debugHeading}>Song name</Text>
-      <Text allowFontScaling={false} style={styles.debugText}>{typedTitle ? `searching with "${typedTitle}" instead of the PC's title` : 'Lyrics missing or wrong? Type the song name as LRCLIB lists it, e.g. in English.'}</Text>
-      <View style={styles.debugRow}>
-        <TextInput value={draft} onChangeText={setDraft} onSubmitEditing={() => onSearchTitle(draft)} placeholder="Song name" placeholderTextColor={colors.faint} returnKeyType="search" autoCorrect={false} maxLength={MAX_TYPED_TITLE} accessibilityLabel="Song name to search lyrics with" style={styles.debugInput} />
-        <Pressable onPress={() => onSearchTitle(draft)} disabled={!draft.trim()} hitSlop={6} accessibilityRole="button" accessibilityLabel="Search lyrics with this song name" style={[styles.debugChip, !draft.trim() && styles.debugChipDisabled]}><Text allowFontScaling={false} style={styles.debugChipText}>Search</Text></Pressable>
-        {typedTitle ? <Pressable onPress={() => {
-          setDraft('');
-          onSearchTitle(undefined);
-        }} hitSlop={6} accessibilityRole="button" accessibilityLabel="Use the PC's title again" style={styles.debugChip}><Text allowFontScaling={false} style={styles.debugChipText}>Use PC title</Text></Pressable> : null}
-      </View>
-      <Text allowFontScaling={false} style={styles.debugHeading}>Details</Text>
-      {rows.map((row, index) => <Text key={index} allowFontScaling={false} selectable style={styles.debugText}>{row}</Text>)}
-      <Text allowFontScaling={false} style={styles.debugHint}>Tap to close</Text>
-    </ScrollView>
-  </Pressable>;
+  // A native modal keeps the deck's scroll/swipe responders out of these touches.
+  // Dismissal lives outside the scroll content, so a drag cannot become a close tap.
+  return <Modal transparent animationType="fade" onRequestClose={onClose} supportedOrientations={['portrait', 'landscape-left', 'landscape-right']}>
+    <SafeAreaProvider style={styles.debugOverlay}>
+      <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : 'height'} style={styles.debugKeyboard}>
+        <Pressable onPress={onClose} accessible={false} importantForAccessibility="no" style={StyleSheet.absoluteFill} />
+        <SafeAreaView pointerEvents="box-none" style={styles.debugSafeArea}>
+          <View accessibilityViewIsModal style={styles.debug}>
+            <View style={styles.debugHeader}>
+              <Text accessibilityRole="header" style={styles.debugTitle}>Lyrics details</Text>
+              <Pressable onPress={onClose} accessibilityRole="button" accessibilityLabel="Close lyrics details" style={styles.debugClose}>
+                <X size={20} color={colors.text} />
+              </Pressable>
+            </View>
+            <ScrollView style={styles.debugScroll} contentContainerStyle={styles.debugContent} keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag" contentInsetAdjustmentBehavior="never" directionalLockEnabled bounces={false} overScrollMode="never" indicatorStyle="white">
+              <Text allowFontScaling={false} style={styles.debugHeading}>Sync</Text>
+              <View style={styles.debugRow}>
+                <Text allowFontScaling={false} style={styles.debugText}>offset: {sync.offsetMs === 0 ? 'none' : `${signedSeconds(sync.offsetMs)} (${sync.offsetMs < 0 ? 'lyrics later' : 'lyrics earlier'})`}</Text>
+                {sync.offsetMs !== 0 ? <Pressable onPress={onResetOffset} hitSlop={6} accessibilityRole="button" accessibilityLabel="Reset the lyrics offset" style={styles.debugChip}><Text allowFontScaling={false} style={styles.debugChipText}>Reset</Text></Pressable> : null}
+              </View>
+              {sync.versions.length > 0 ? <>
+                <Text allowFontScaling={false} style={styles.debugText}>timings found ({sync.picked ? 'picked by you' : sync.autoFirstMs === undefined ? 'none used: the lengths differ, so shown unsynced' : sync.reason ? `automatic: ${sync.reason}` : 'automatic'}):</Text>
+                {sync.versions.map((version) => {
+                  const shown = same(version.firstMs, sync.shownFirstMs);
+                  return <Pressable key={version.firstMs} onPress={() => onPickVersion(version.firstMs)} accessibilityRole="button" accessibilityState={{ selected: shown }} accessibilityLabel={`Use the timing starting at ${(version.firstMs / 1000).toFixed(1)} seconds`} style={[styles.debugChip, shown && styles.debugChipSelected]}>
+                    <Text allowFontScaling={false} style={styles.debugChipText}>{shown ? '✓ ' : ''}starts {(version.firstMs / 1000).toFixed(1)} s · {version.entries} {version.entries === 1 ? 'entry' : 'entries'}{same(version.firstMs, sync.autoFirstMs) ? ' · automatic' : ''}</Text>
+                  </Pressable>;
+                })}
+                {sync.picked ? <Pressable onPress={() => onPickVersion(undefined)} accessibilityRole="button" accessibilityLabel="Go back to the automatic timing" style={styles.debugChip}><Text allowFontScaling={false} style={styles.debugChipText}>Back to automatic</Text></Pressable> : null}
+              </> : null}
+              <Text allowFontScaling={false} style={styles.debugHeading}>Song name</Text>
+              <Text allowFontScaling={false} style={styles.debugText}>{typedTitle ? `searching with "${typedTitle}" instead of the PC's title` : 'Lyrics missing or wrong? Type the song name as LRCLIB lists it, e.g. in English.'}</Text>
+              <View style={styles.debugRow}>
+                <TextInput value={draft} onChangeText={setDraft} onSubmitEditing={() => onSearchTitle(draft)} placeholder="Song name" placeholderTextColor={colors.faint} returnKeyType="search" autoCorrect={false} maxLength={MAX_TYPED_TITLE} accessibilityLabel="Song name to search lyrics with" style={styles.debugInput} />
+                <Pressable onPress={() => onSearchTitle(draft)} disabled={!draft.trim()} hitSlop={6} accessibilityRole="button" accessibilityLabel="Search lyrics with this song name" style={[styles.debugChip, !draft.trim() && styles.debugChipDisabled]}><Text allowFontScaling={false} style={styles.debugChipText}>Search</Text></Pressable>
+                {typedTitle ? <Pressable onPress={() => {
+                  setDraft('');
+                  onSearchTitle(undefined);
+                }} hitSlop={6} accessibilityRole="button" accessibilityLabel="Use the PC's title again" style={styles.debugChip}><Text allowFontScaling={false} style={styles.debugChipText}>Use PC title</Text></Pressable> : null}
+              </View>
+              <Text allowFontScaling={false} style={styles.debugHeading}>Details</Text>
+              {rows.map((row, index) => <Text key={index} allowFontScaling={false} selectable style={styles.debugText}>{row}</Text>)}
+            </ScrollView>
+          </View>
+        </SafeAreaView>
+      </KeyboardAvoidingView>
+    </SafeAreaProvider>
+  </Modal>;
 }
 
 const styles = StyleSheet.create({
@@ -634,10 +652,16 @@ const styles = StyleSheet.create({
   syncRow: { flexDirection: 'row', gap: 4 },
   syncButton: { alignItems: 'center', justifyContent: 'center', borderRadius: 999, backgroundColor: 'rgba(24, 24, 27, 0.7)' },
   offsetLabel: { color: colors.muted, fontWeight: '600', paddingHorizontal: 4, borderRadius: 6, backgroundColor: 'rgba(24, 24, 27, 0.7)', overflow: 'hidden' },
-  debug: { ...StyleSheet.absoluteFill, backgroundColor: 'rgba(9, 9, 11, 0.95)' },
-  debugContent: { padding: 10, gap: 4 },
+  debugOverlay: { flex: 1, backgroundColor: 'rgba(0, 0, 0, 0.65)' },
+  debugKeyboard: { flex: 1 },
+  debugSafeArea: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 16 },
+  debug: { flex: 1, width: '100%', maxWidth: 560, maxHeight: '90%', minHeight: 0, borderRadius: 16, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.bg, overflow: 'hidden' },
+  debugHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 8, paddingLeft: 16, paddingRight: 8, borderBottomWidth: 1, borderBottomColor: colors.border },
+  debugTitle: { color: colors.text, fontSize: 16, fontWeight: '600' },
+  debugClose: { width: 40, height: 40, alignItems: 'center', justifyContent: 'center', borderRadius: 8 },
+  debugScroll: { flex: 1, minHeight: 0 },
+  debugContent: { padding: 16, gap: 8 },
   debugText: { color: colors.text, fontSize: 11, lineHeight: 15, fontFamily: Platform.select({ ios: 'Menlo', default: 'monospace' }) },
-  debugHint: { color: colors.faint, fontSize: 11, marginTop: 6 },
   debugHeading: { color: colors.muted, fontSize: 11, fontWeight: '700', marginTop: 4, textTransform: 'uppercase' },
   debugRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
   debugChip: { alignSelf: 'flex-start', paddingHorizontal: 8, paddingVertical: 5, borderRadius: 8, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panelRaised },

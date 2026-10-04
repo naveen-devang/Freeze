@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { activeLineAt, withoutSong, artistMatches, cleanArtist, cleanTitle, isGapLine, latinArtist, latinPart, lyricsTrackKey, matchAlias, matchContext, nativePart, nativeSongTitle, normalizeText, parseLrc, pickLooseResult, pickSearchResult, quotedSong, romanize, searchQueries, soundKey, timingVersions, titleMatches, withIntroGap } from '../phone-app/src/lyrics.ts';
+import { fetchLyrics, lyricsTrace, setLyricsUserAgent } from '../phone-app/src/lyrics.ts';
 
 assert.equal(
   readFileSync(new URL('../phone-app/src/lyrics.ts', import.meta.url), 'utf8'),
@@ -211,6 +212,47 @@ assert.equal(firstLine(pick(kissEntries.slice(0, 11), { title: "aespa 'KISS N TE
 // A timing starting over a minute late is someone's mistake, not an intro.
 assert.equal(firstLine(pick([...kissEntries.slice(0, 11), kissNTell(166, 75, 100)], { title: "aespa 'KISS N TELL' MV", artist: 'SMTOWN', durationMs: 190_000 })), 8000);
 
+// A large consensus can sync a track even when the listed durations differ.
+const consensusTrack = { title: 'Song', artist: 'Artist', durationMs: 200_000 };
+const consensusEntry = (firstS: number, lastS = 180, duration = 210) =>
+  ({ trackName: 'Song', artistName: 'Artist', duration, syncedLyrics: timed(firstS, lastS) });
+const consensusEntries = (count: number, firstS: number) =>
+  Array.from({ length: count }, () => consensusEntry(firstS));
+const dominantEntries = [...consensusEntries(19, 8), consensusEntry(2)];
+const dominant = pick(dominantEntries, consensusTrack);
+assert.equal(firstLine(dominant), 8000, '19 matching entries should sync automatically instead of requiring a manual pick');
+assert.equal(dominant?.kind === 'synced' && dominant.reason, 'dominant matching entries (19 of 20)');
+assert.deepEqual(dominant?.kind === 'synced' && dominant.versions?.map(({ firstMs, entries }) => [firstMs, entries]), [[8000, 19], [2000, 1]]);
+assert.equal(firstLine(pick([...dominantEntries].reverse(), consensusTrack)), 8000);
+assert.equal(firstLine(pick([...consensusEntries(5, 8), consensusEntry(2)], consensusTrack)), 8000);
+assert.equal(firstLine(pick([...consensusEntries(20, 8), ...consensusEntries(5, 2)], consensusTrack)), 8000);
+for (const entries of [
+  consensusEntries(4, 8), // not enough supporting entries, even with no rival
+  [...consensusEntries(19, 8), ...consensusEntries(5, 2)], // below 80% and 4x
+  [...consensusEntries(20, 8), ...consensusEntries(5, 2), consensusEntry(4)], // 4x the runner-up, but below 80% overall
+  [...consensusEntries(10, 8), ...consensusEntries(10, 2)], // tied
+]) {
+  assert.equal(pick(entries, consensusTrack), null, 'weak consensus must retain the unsynced fallback');
+  assert.equal(loosePick(entries, consensusTrack)?.kind, 'plain');
+}
+// Strict synced and instrumental matches retain priority over this fallback.
+assert.equal(firstLine(pick([...dominantEntries, consensusEntry(2, 180, 200)], consensusTrack)), 2000);
+assert.equal(pick([...dominantEntries, { trackName: 'Song', artistName: 'Artist', duration: 200, instrumental: true }], consensusTrack)?.kind, 'instrumental');
+const invalidConsensus = [
+  consensusEntries(19, 8).map((entry) => ({ ...entry, artistName: 'Someone Else' })),
+  consensusEntries(19, 8).map((entry) => ({ ...entry, trackName: 'Other Song' })),
+  consensusEntries(19, 8).map((entry) => ({ ...entry, syncedLyrics: '[00:01.00] probe' })),
+  consensusEntries(19, 8).map((entry) => ({ ...entry, duration: 291 })), // outside the 90 s bound
+  consensusEntries(19, 8).map((entry) => ({ ...entry, duration: null })), // unknown listed length
+  consensusEntries(19, 8).map((entry) => ({ ...entry, syncedLyrics: timed(8, 201) })), // even a 1 s overrun is excluded
+  consensusEntries(19, 8).map((entry) => ({ ...entry, syncedLyrics: timed(8, 220) })),
+];
+for (const entries of invalidConsensus) {
+  assert.equal(pick([...entries, consensusEntry(2)], consensusTrack), null, 'invalid or unrelated records must not supply consensus votes');
+}
+assert.equal(firstLine(pick(consensusEntries(5, 8).map((entry) => ({ ...entry, duration: 290 })), consensusTrack)), 8000);
+assert.equal(firstLine(pick(consensusEntries(5, 8).map((entry) => ({ ...entry, syncedLyrics: timed(8, 200) })), consensusTrack)), 8000);
+
 // Song names in another script. Loanword titles are compared by sound: Hangul, kana and Devanagari are
 // spelled out in Latin letters, then reduced to a consonant key both sides share.
 assert.equal(romanize('캐치 캐치'), 'kaechi kaechi');
@@ -285,4 +327,97 @@ const pathaanText = loosePick([pathaan('Arijit Singh'), pathaan('Kumaar')], path
 assert.equal(pathaanText?.kind === 'plain' && pathaanText.text.split('\n')[0], 'Tumne mohabbat karni hai');
 assert.equal(pathaanText?.kind === 'plain' && pathaanText.versions?.[0].entries, 2);
 
-console.log('lyrics checks passed');
+// Reproduce LRCLIB rejecting Android's generic OkHttp identity, through the real lookup and retries.
+const originalFetch = globalThis.fetch;
+const clientUserAgent = 'Freeze/1.0 (https://github.com/naveen-devang/Freeze)';
+let transportUserAgent = 'okhttp/4.9.2';
+const requests: { path: string; headers: Headers }[] = [];
+globalThis.fetch = async (input, init) => {
+  const url = new URL(String(input));
+  assert.equal(url.origin, 'https://lrclib.net');
+  const headers = new Headers(init?.headers);
+  requests.push({ path: url.pathname, headers });
+  if ((headers.get('User-Agent') ?? transportUserAgent).startsWith('okhttp/')) {
+    return new Response('Upstream request rejected', { status: 520, headers: { 'Retry-After': '0.001' } });
+  }
+  const record = {
+    id: 1,
+    trackName: url.searchParams.get('track_name'),
+    artistName: url.searchParams.get('artist_name'),
+    duration: 200,
+    syncedLyrics: '[00:13.00] First line\n[00:30.00] Second line\n[01:00.00] Third line\n[02:00.00] Fourth line',
+  };
+  return new Response(JSON.stringify(url.pathname === '/api/search' ? [record] : record), {
+    headers: { 'Content-Type': 'application/json' },
+  });
+};
+try {
+  const track = { title: 'Android request regression', artist: 'Freeze test', durationMs: 200_000 };
+  const rejected = await fetchLyrics(track);
+  assert.equal(rejected.kind, 'error');
+  assert.equal(requests.length, 3, 'the generic Android identity must reproduce the three failed attempts');
+
+  requests.length = 0;
+  setLyricsUserAgent(clientUserAgent);
+  const recovered = await fetchLyrics(track);
+  assert.equal(recovered.kind, 'synced', 'identifying Freeze must recover the failed Android lookup');
+  assert.deepEqual(requests.map((request) => request.path), ['/api/get', '/api/search']);
+  for (const { headers } of requests) {
+    assert.equal(headers.get('User-Agent'), clientUserAgent);
+    assert.equal(headers.get('Lrclib-Client'), 'Freeze (https://github.com/naveen-devang/Freeze)');
+  }
+
+  // Without the Android opt-in, iOS and browser requests retain their transport's own User-Agent.
+  setLyricsUserAgent(undefined);
+  for (const platform of ['ios', 'desktop']) {
+    requests.length = 0;
+    transportUserAgent = platform === 'ios' ? 'CFNetwork' : 'Mozilla/5.0';
+    const result = await fetchLyrics({ ...track, title: `${platform} request regression` });
+    assert.equal(result.kind, 'synced');
+    assert.equal(requests.length, 2);
+    assert.ok(requests.every(({ headers }) => !headers.has('User-Agent')));
+  }
+} finally {
+  setLyricsUserAgent(undefined);
+  globalThis.fetch = originalFetch;
+}
+
+// Exercise the real lookup path: exact-match miss, search consensus, trace, and manual alternatives.
+const consensusRequests: string[] = [];
+globalThis.fetch = async (input) => {
+  const url = new URL(String(input));
+  assert.equal(url.origin, 'https://lrclib.net');
+  consensusRequests.push(url.pathname);
+  if (url.pathname === '/api/get') return new Response('', { status: 404 });
+  assert.equal(url.pathname, '/api/search');
+  return new Response(JSON.stringify(dominantEntries), { headers: { 'Content-Type': 'application/json' } });
+};
+try {
+  const result = await fetchLyrics(consensusTrack);
+  assert.equal(firstLine(result), 8000, 'lookup must return the dominant timing without asking for a manual selection');
+  assert.equal(result.kind === 'synced' && result.versions?.length, 2, 'long-press must still have both alternatives');
+  assert.ok(lyricsTrace(consensusTrack).steps.some((step) => step.includes('dominant matching entries (19 of 20)')));
+  assert.deepEqual(consensusRequests, ['/api/get', '/api/get', '/api/search', '/api/search', '/api/search']);
+} finally {
+  globalThis.fetch = originalFetch;
+}
+
+// A first-search consensus must not hide a duration match returned by a later query.
+let laterSearches = 0;
+globalThis.fetch = async (input) => {
+  const url = new URL(String(input));
+  assert.equal(url.origin, 'https://lrclib.net');
+  if (url.pathname === '/api/get') return new Response('', { status: 404 });
+  laterSearches += 1;
+  const records = laterSearches === 1 ? dominantEntries : [consensusEntry(2, 180, 200)];
+  return new Response(JSON.stringify(records), { headers: { 'Content-Type': 'application/json' } });
+};
+try {
+  const result = await fetchLyrics({ ...consensusTrack, album: 'later duration match regression' });
+  assert.equal(firstLine(result), 2000, 'a later correct-duration match must beat the earlier loose consensus');
+  assert.equal(laterSearches, 2);
+} finally {
+  globalThis.fetch = originalFetch;
+}
+
+console.log('lyrics checks passed (including dominant timing fallback, Android request recovery and unchanged iOS/desktop headers)');

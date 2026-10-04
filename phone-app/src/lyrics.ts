@@ -22,13 +22,23 @@ type LrclibRecord = { id?: unknown; trackName?: unknown; artistName?: unknown; d
 const API = 'https://lrclib.net/api';
 // LRCLIB asks clients to identify themselves. Browsers can't set User-Agent, so use its alternative header.
 const HEADERS = { 'Lrclib-Client': 'Freeze (https://github.com/naveen-devang/Freeze)' };
+let lrclibUserAgent: string | undefined;
+// Android opts in at app startup: LRCLIB rejects OkHttp's generic User-Agent.
+// Other platforms retain their existing headers; this never changes global fetch.
+export function setLyricsUserAgent(userAgent: string | undefined) {
+  lrclibUserAgent = userAgent;
+}
 const TIMEOUT_MS = 8000;
 // Waits before the 2nd and 3rd attempt. A Retry-After from LRCLIB wins, up to MAX_RETRY_WAIT_MS.
 const RETRY_DELAYS_MS = [1000, 3000];
 const MAX_RETRY_WAIT_MS = 10_000;
 const DURATION_TOLERANCE_S = 3;
-// The same title and artist this far off in length is another cut of the song (music videos run long): shown unsynced.
+// The same title and artist this far off in length can supply a fallback (music videos run long).
 const LOOSE_DURATION_TOLERANCE_S = 90;
+// Relax the duration match only when enough matching entries agree overwhelmingly.
+const DOMINANT_MIN_ENTRIES = 5;
+const DOMINANT_SHARE = 0.8;
+const DOMINANT_RATIO = 4;
 const CACHE_SIZE = 20;
 // LRCLIB is crowd-sourced and holds test entries (e.g. one line of "probe"); fewer real lines than this is junk.
 const MIN_LYRIC_LINES = 3;
@@ -449,7 +459,8 @@ function isVideo(context: MatchContext, matching: Rated[]) {
 // - A music video with several timings takes the latest-starting one: its intro delays the singing, and
 //   listed lengths can't tell (people upload the album's timing under the video's length).
 // - Otherwise the timing most accepted entries share wins, so one odd entry can't outvote the rest.
-export function pickSearchResult(results: LrclibRecord[], context: MatchContext): Lyrics | null {
+// - If no timing was accepted, a dominant group of nearby title-and-artist matches can supply one.
+export function pickSearchResult(results: LrclibRecord[], context: MatchContext, options: { allowDominant?: boolean } = {}): Lyrics | null {
   const rated = rate(results, context);
   const strict = rated.filter((entry) => !entry.overruns && (context.durationMs
     ? entry.gap <= DURATION_TOLERANCE_S && (entry.title || entry.artist)
@@ -473,6 +484,21 @@ export function pickSearchResult(results: LrclibRecord[], context: MatchContext)
     return { kind: 'synced', lines: chosen.lines, versions, reason };
   }
   const best = strict[0]?.lyrics;
+  if (best?.kind === 'instrumental') return best;
+  // Lookup defers consensus until all search queries have had a chance to find a stronger match.
+  if (options.allowDominant === false) return best?.kind === 'plain' && versions.length > 0 ? { ...best, versions } : best ?? null;
+  // Existing matches win. For a fallback, require both names, a nearby listed length, and all
+  // timestamps within playback; the usual 5 s overrun allowance does not apply to this guess.
+  const eligible = strong.filter((entry) => entry.gap <= LOOSE_DURATION_TOLERANCE_S &&
+    entry.lyrics.kind === 'synced' && !entry.overruns &&
+    (!context.durationMs || entry.lyrics.lines[entry.lyrics.lines.length - 1].timeMs <= context.durationMs));
+  const dominantVersions = timingVersions(syncedLines(eligible));
+  const dominant = dominantVersions[0];
+  const total = dominantVersions.reduce((count, version) => count + version.entries, 0);
+  if (dominant && dominant.entries >= DOMINANT_MIN_ENTRIES && dominant.entries >= total * DOMINANT_SHARE &&
+    dominant.entries >= (dominantVersions[1]?.entries ?? 0) * DOMINANT_RATIO) {
+    return { kind: 'synced', lines: dominant.lines, versions, reason: `dominant matching entries (${dominant.entries} of ${total})` };
+  }
   if (!best) return null;
   return best.kind === 'plain' && versions.length > 0 ? { ...best, versions } : best;
 }
@@ -546,7 +572,11 @@ async function getJsonOnce(url: string, headers: Record<string, string>): Promis
   }
 }
 
-const lrclib = (path: string, params: Record<string, string>, steps: string[]) => getJson(`${API}${path}?${queryString(params)}`, steps);
+const lrclib = (path: string, params: Record<string, string>, steps: string[]) => getJson(
+  `${API}${path}?${queryString(params)}`,
+  steps,
+  lrclibUserAgent ? { ...HEADERS, 'User-Agent': lrclibUserAgent } : HEADERS,
+);
 const describe = (params: Record<string, string>) => Object.entries(params).map(([key, value]) => `${key}="${value}"`).join(' ');
 const records = (value: unknown) => Array.isArray(value) ? value as LrclibRecord[] : [];
 // Deezer reports errors (quota, unknown query) inside a 200 response, so anything without `data` is empty.
@@ -646,6 +676,7 @@ async function lookup(track: LyricsTrack, steps: string[], typedTitle?: string):
   // Fallbacks, best first: plain lyrics from a close match, then unsynced text from a looser one.
   let plain: Lyrics | null = null;
   let loosePlain: Lyrics | null = null;
+  let dominant: Lyrics | null = null;
   const accept = (label: string, lyrics: Lyrics | null): Lyrics | null => {
     if (lyrics && lyrics.kind !== 'plain') {
       steps.push(`matched: ${label} (${lyrics.kind})`);
@@ -662,10 +693,16 @@ async function lookup(track: LyricsTrack, steps: string[], typedTitle?: string):
     for (const [index, query] of queries.entries()) {
       const found = records(await lrclib('/search', query.params, steps));
       const list = exact && index === 0 ? [exact, ...found.filter((record) => record.id === undefined || record.id !== exact.id)] : found;
-      const lyrics = pickSearchResult(list, context);
+      const lyrics = pickSearchResult(list, context, { allowDominant: false });
       steps.push(`search ${query.label}: ${describe(query.params)} -> ${found.length} results${list === found ? '' : ' + the exact match'}, ${lyrics?.kind ?? 'none usable'}`);
       const accepted = accept(query.label, lyrics);
       if (accepted) return accepted;
+      // Keep a consensus candidate private while later queries (including aliases) look for
+      // the actual duration. Do not publish a provisional timing and then replace it.
+      if (!dominant) {
+        const candidate = pickSearchResult(list, context);
+        if (candidate?.kind === 'synced') dominant = candidate;
+      }
       loosePlain ??= pickLooseResult(list, context);
     }
     return null;
@@ -708,6 +745,7 @@ async function lookup(track: LyricsTrack, steps: string[], typedTitle?: string):
     const found = await searchAll(searchQueries(aliasTrack), matchContext(track, { title: alias.title, artist: latinName }), null);
     if (found) return found;
   }
+  if (dominant) return accept('dominant fallback after all searches', dominant) ?? dominant;
   const fallback: Lyrics = plain ?? loosePlain ?? { kind: 'none' };
   steps.push(`result: ${fallback.kind}${fallback === loosePlain ? ' (unsynced: length or version uncertain)' : ''}`);
   return fallback;
