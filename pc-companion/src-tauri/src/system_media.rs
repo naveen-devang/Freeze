@@ -54,6 +54,55 @@ impl SystemMediaState {
 
 /// Polls the system media session once a second, and every 150 ms for 2 s after `refresh` fires
 /// (a control was just sent), so play/pause and track changes show up quickly.
+/// What a phone last heard about playback, to decide whether a newer reading is worth sending.
+#[derive(Clone, Debug)]
+pub(super) struct ProgressSent {
+    at: std::time::Instant,
+    state: PlaybackState,
+    position_ms: Option<u64>,
+    duration_ms: Option<u64>,
+    volume_percent: Option<u8>,
+    playback_rate: Option<f64>,
+}
+
+impl ProgressSent {
+    pub(super) fn new(media: &SystemMediaState, at: std::time::Instant) -> Self {
+        Self {
+            at,
+            state: media.playback_state,
+            position_ms: media.position_ms,
+            duration_ms: media.duration_ms,
+            volume_percent: media.volume_percent,
+            playback_rate: media.playback_rate,
+        }
+    }
+}
+
+/// How far the position may stray from where the phone thinks it is before it counts as a seek.
+const SEEK_JUMP_MS: i64 = 1500;
+/// A correction this often keeps the phone's counted-forward position from drifting.
+const PROGRESS_CORRECTION: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The phone counts the play position forward on its own, so a progress message is only worth its
+/// radio wake-up when something else changed, the position jumped (a seek), or a correction is due.
+pub(super) fn progress_worth_sending(last: Option<&ProgressSent>, media: &SystemMediaState, now: std::time::Instant) -> bool {
+    let Some(last) = last else { return true };
+    if last.state != media.playback_state
+        || last.duration_ms != media.duration_ms
+        || last.volume_percent != media.volume_percent
+        || last.playback_rate != media.playback_rate
+        || now.duration_since(last.at) >= PROGRESS_CORRECTION
+    {
+        return true;
+    }
+    let (Some(then), Some(position)) = (last.position_ms, media.position_ms) else {
+        return last.position_ms != media.position_ms;
+    };
+    let rate = if last.state == PlaybackState::Playing { last.playback_rate.unwrap_or(1.0) } else { 0.0 };
+    let expected = then as f64 + now.duration_since(last.at).as_millis() as f64 * rate;
+    (position as f64 - expected).abs() as i64 > SEEK_JUMP_MS
+}
+
 pub(super) fn spawn_system_media_monitor(
     updates: watch::Sender<SystemMediaState>,
     refresh: std::sync::Arc<tokio::sync::Notify>,
@@ -491,5 +540,44 @@ async fn read_system_media_state() -> SystemMediaState {
     SystemMediaState {
         volume_percent: read_system_volume(),
         ..SystemMediaState::unavailable()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn playing(position_ms: u64) -> SystemMediaState {
+        SystemMediaState {
+            playback_state: PlaybackState::Playing,
+            position_ms: Some(position_ms),
+            duration_ms: Some(240_000),
+            volume_percent: Some(50),
+            playback_rate: None,
+            ..SystemMediaState::unavailable()
+        }
+    }
+
+    #[test]
+    fn sends_progress_only_when_the_phone_cannot_work_it_out() {
+        let start = Instant::now();
+        let first = playing(10_000);
+        assert!(progress_worth_sending(None, &first, start), "the first report always goes");
+        let sent = ProgressSent::new(&first, start);
+        // Playing steadily: 3 s later the position is 3 s on, which the phone counts itself.
+        assert!(!progress_worth_sending(Some(&sent), &playing(13_000), start + Duration::from_secs(3)));
+        // A seek: the position jumped.
+        assert!(progress_worth_sending(Some(&sent), &playing(60_000), start + Duration::from_secs(3)));
+        // Paused: the state changed.
+        let paused = SystemMediaState { playback_state: PlaybackState::Paused, ..playing(13_000) };
+        assert!(progress_worth_sending(Some(&sent), &paused, start + Duration::from_secs(3)));
+        // Volume changed.
+        assert!(progress_worth_sending(Some(&sent), &SystemMediaState { volume_percent: Some(60), ..playing(13_000) }, start + Duration::from_secs(3)));
+        // A correction every 10 s even when nothing else changed.
+        assert!(progress_worth_sending(Some(&sent), &playing(20_000), start + Duration::from_secs(10)));
+        // Paused and still: nothing to send.
+        let still = ProgressSent::new(&paused, start);
+        assert!(!progress_worth_sending(Some(&still), &paused, start + Duration::from_secs(5)));
     }
 }

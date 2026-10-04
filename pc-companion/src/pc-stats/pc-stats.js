@@ -630,6 +630,7 @@ const CSS = `.ps-root{--fg:#ececef;--muted:#a1a1aa;--faint:#63636d;--line:#24252
 .ps-root .hcell{border-radius:3px;background:var(--track)}
 .ps-root .cbar{position:relative;background:var(--track);border-radius:4px;overflow:hidden}
 .ps-root .cbar i{position:absolute;inset:0;border-radius:4px;background:var(--accent);transform:translateY(100%);transition:transform .8s cubic-bezier(.2,.8,.2,1)}
+.ps-root.ps-still *{transition:none!important}
 @media (prefers-reduced-motion:reduce){.ps-root *{transition:none!important}}`;
 function injectCss() {
   if (typeof document === 'undefined' || document.getElementById('freeze-pc-stats-css')) return;
@@ -637,12 +638,14 @@ function injectCss() {
 }
 
 // Draws a style into `host` at width × height px. columns/rows are the widget's grid span, used to pick a fitting style.
+// `still` jumps readings to their new value instead of gliding there: with a reading every second a
+// 0.8 s glide keeps the widget animating most of the time, which a phone pays for in battery and heat.
 // `background` paints the tile colour behind the widget. The phone passes it: Android's WebView
 // composites translucent pixels onto the app poorly, so fades and tints must blend inside the page.
-function mount(host, { style, metric, color, gpu, background, width, height, columns = 1, rows = 1 }) {
+function mount(host, { style, metric, color, gpu, background, still = false, width, height, columns = 1, rows = 1 }) {
   injectCss();
   const root = document.createElement('div');
-  root.className = 'ps-root';
+  root.className = still ? 'ps-root ps-still' : 'ps-root';
   root.style.cssText = `width:${width}px;height:${height}px;--accent:${color || '#93c5fd'}${background ? `;background:${background}` : ''}`;
   host.replaceChildren(root);
   const draw = resolve(style, columns, rows).build(root, width, height, M[metric] ? metric : 'cpu');

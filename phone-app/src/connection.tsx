@@ -2,9 +2,11 @@ import * as SecureStore from 'expo-secure-store';
 import Storage from 'expo-sqlite/kv-store';
 import { loadDeckPages } from './deck';
 import { validDeckPageLayout, validDeckWidgetAreaLayout } from './deck-layout';
-import { createContext, PropsWithChildren, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { createContext, PropsWithChildren, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { AppState } from 'react-native';
 import type { WidgetSurface } from './now-playing-layout';
-import { clearPcStats, receivePcStats, setPcStatsSender } from './pc-stats-widget';
+import { clearPcStats, receivePcStats, setPcStatsSender } from './pc-stats-feed';
+import { countMessage } from './perf-overlay';
 
 export type PcConnection = { host: string; port: number; token: string; deviceName?: string; transport?: 'wifi' | 'usb' };
 export type DeckMediaCommand = 'play_pause' | 'next_track' | 'previous_track' | 'volume_up' | 'volume_down' | 'mute';
@@ -20,7 +22,9 @@ export type DeckProfile = { id: string; name: string; pages: DeckPage[]; activeP
 export type DeckConfig = { schemaVersion: number; revision: number; profiles: DeckProfile[]; activeProfileId: string };
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 export type PlaybackState = 'playing' | 'paused' | 'stopped' | 'unavailable';
-export type SystemMediaState = { sourceAppId?: string; title?: string; artist?: string; album?: string; playbackState: PlaybackState; positionMs?: number; durationMs?: number; artworkDataUrl?: string; volumePercent?: number; canSeek?: boolean; playbackRate?: number };
+export type SystemMediaState = { sourceAppId?: string; title?: string; artist?: string; album?: string; playbackState: PlaybackState; positionMs?: number; durationMs?: number; artworkDataUrl?: string; volumePercent?: number; canSeek?: boolean; playbackRate?: number;
+  /** When positionMs was reported (Date.now()); while playing, the position has moved on since. */
+  receivedAt?: number };
 export type ActionError = 'accessibility_permission_required' | 'app_launch_failed' | 'stale_revision' | 'unknown_button' | 'control_failed';
 
 type ConnectionContextValue = {
@@ -29,7 +33,6 @@ type ConnectionContextValue = {
   status: ConnectionStatus;
   protocolError: string | null;
   playbackState: PlaybackState;
-  mediaState: SystemMediaState;
   deckConfig: DeckConfig | null;
   independentNavigation: boolean;
   selectedProfileId: string | null;
@@ -174,6 +177,28 @@ function isPlayPauseButton(config: DeckConfig, buttonId: string): boolean {
   return visit(config.profiles);
 }
 
+/** The play position now: the last report, counted forward while playing. */
+export function livePositionMs(media: SystemMediaState, now = Date.now()): number {
+  const rate = media.playbackState === 'playing' ? media.playbackRate ?? 1 : 0;
+  return Math.max(0, (media.positionMs ?? 0) + Math.max(0, now - (media.receivedAt ?? now)) * rate);
+}
+
+// Media state lives outside the connection context: the play position changes it every few seconds,
+// and only Now Playing and Lyrics show it. In the context, each change re-rendered the whole deck.
+let mediaSnapshot: SystemMediaState = EMPTY_MEDIA_STATE;
+const mediaListeners = new Set<() => void>();
+function setMediaState(next: SystemMediaState | ((current: SystemMediaState) => SystemMediaState)) {
+  const value = typeof next === 'function' ? next(mediaSnapshot) : next;
+  if (value === mediaSnapshot) return;
+  mediaSnapshot = value;
+  mediaListeners.forEach((listener) => listener());
+}
+const subscribeMedia = (listener: () => void) => { mediaListeners.add(listener); return () => { mediaListeners.delete(listener); }; };
+/** The PC's media session (title, artwork, position...). Re-renders only the component that calls it. */
+export function useMediaState(): SystemMediaState {
+  return useSyncExternalStore(subscribeMedia, () => mediaSnapshot);
+}
+
 export function ConnectionProvider({ children }: PropsWithChildren) {
   const socketRef = useRef<WebSocket | null>(null);
   const widgetSurfaceRef = useRef<WidgetSurface | null>(null);
@@ -189,7 +214,6 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
   const [protocolError, setProtocolError] = useState<string | null>(null);
   const [playbackState, setPlaybackState] = useState<PlaybackState>('unavailable');
-  const [mediaState, setMediaState] = useState<SystemMediaState>(EMPTY_MEDIA_STATE);
   // Play/pause shows its new state the moment it's pressed. For 1.5 s after, reports of the old state
   // were sent before the press took effect and are ignored; the PC confirms within ~300 ms.
   const playbackRef = useRef<PlaybackState>('unavailable');
@@ -201,6 +225,15 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
   const [actionError, setActionError] = useState<ConnectionContextValue['actionError']>(null);
 
   useEffect(() => { playbackRef.current = playbackState; }, [playbackState]);
+  // In the background the PC stops sending media and playback updates, so the phone's radio and
+  // JavaScript can rest; coming back fetches one fresh snapshot.
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (state) => {
+      const socket = socketRef.current;
+      if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'set_streaming', active: state === 'active' }));
+    });
+    return () => subscription.remove();
+  }, []);
   // The playback state to show for a report from the PC, or null to keep the pressed state.
   const settlePlayback = (reported: PlaybackState): PlaybackState | null => {
     const expected = expectedPlaybackRef.current;
@@ -286,10 +319,13 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
         if (socketRef.current !== socket || typeof event.data !== 'string') return;
         try {
           const message = JSON.parse(event.data) as { type?: string; message?: string; state?: unknown; ok?: boolean; reason?: string; requestId?: string; sourceId?: string; volumePercent?: unknown };
+          countMessage(message.type ?? 'unknown');
           if (message.type === 'ready') {
             reconnectAttemptRef.current = 0;
             setStatus('connected');
             if (widgetSurfaceRef.current) socket.send(JSON.stringify({ type: 'widget_surface', surface: widgetSurfaceRef.current }));
+            // In the background the PC sends nothing (see the AppState effect in this provider).
+            if (AppState.currentState !== 'active') socket.send(JSON.stringify({ type: 'set_streaming', active: false }));
             // The PC samples only the readings the stats widgets on screen show.
             setPcStatsSender((needs) => { if (socketRef.current === socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'pc_stats_subscribe', needs })); });
           }
@@ -325,6 +361,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
                 volumePercent: typeof value.volumePercent === 'number' && Number.isFinite(value.volumePercent) && value.volumePercent >= 0 && value.volumePercent <= 100 ? Math.round(value.volumePercent) : undefined,
                 canSeek: value.canSeek === true,
                 playbackRate: playbackRate(value.playbackRate),
+                receivedAt: Date.now(),
                 artworkDataUrl: artwork && /^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/]+=*$/.test(artwork) ? artwork : undefined,
               }));
             }
@@ -339,6 +376,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
               positionMs: finiteTime(progress.positionMs),
               durationMs: finiteTime(progress.durationMs),
               playbackRate: playbackRate(progress.playbackRate),
+              receivedAt: Date.now(),
               volumePercent: typeof progress.volumePercent === 'number' && Number.isFinite(progress.volumePercent) && progress.volumePercent >= 0 && progress.volumePercent <= 100 ? Math.round(progress.volumePercent) : current.volumePercent,
             }));
           }
@@ -521,7 +559,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
     const next: PlaybackState = now === 'playing' ? 'paused' : 'playing';
     expectedPlaybackRef.current = { state: next, until: Date.now() + 1500 };
     setPlaybackState(next);
-    setMediaState((current) => ({ ...current, playbackState: next }));
+    setMediaState((current) => ({ ...current, playbackState: next, positionMs: livePositionMs(current), receivedAt: Date.now() }));
   }, []);
   const sendButton = useCallback((buttonId: string) => {
     const sent = sendRequest('invoke_button', 'buttonId', buttonId);
@@ -548,7 +586,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
   }, [status]);
 
   return (
-    <ConnectionContext.Provider value={{ connection, pairedDevices, status, protocolError, playbackState, mediaState, deckConfig, independentNavigation, selectedProfileId, selectedPageId, actionError, connect, disconnect, removePairedDevice, sendButton, sendMediaCommand, sendSystemVolume, seekMedia, selectProfile, selectPage, reportWidgetSurface }}>
+    <ConnectionContext.Provider value={{ connection, pairedDevices, status, protocolError, playbackState, deckConfig, independentNavigation, selectedProfileId, selectedPageId, actionError, connect, disconnect, removePairedDevice, sendButton, sendMediaCommand, sendSystemVolume, seekMedia, selectProfile, selectPage, reportWidgetSurface }}>
       {children}
     </ConnectionContext.Provider>
   );

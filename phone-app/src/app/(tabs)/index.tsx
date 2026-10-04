@@ -7,11 +7,12 @@ import { StatusBar } from 'expo-status-bar';
 import * as ScreenOrientation from 'expo-screen-orientation';
 import { NavigationBar } from 'expo-navigation-bar';
 import { SvgXml } from 'react-native-svg';
-import { DeckButton, DeckMediaCommand, DeckWidget, PlaybackState, SystemMediaState, usePcConnection } from '../../connection';
+import { DeckButton, DeckMediaCommand, DeckPlacement, DeckWidget, PlaybackState, SystemMediaState, livePositionMs, useMediaState, usePcConnection } from '../../connection';
 import { nowPlayingLayout, NowPlayingRow } from '../../now-playing-layout';
-import { ClockFaceWidget } from '../../clock-face-widget';
 import { LyricsWidget } from '../../lyrics-widget';
-import { PcStatsWidget } from '../../pc-stats-widget';
+import { WebWidgetLayer, type WebWidget } from '../../web-widgets';
+import { countRender, PerfOverlay } from '../../perf-overlay';
+import { useDeckScreenPower } from '../../screen-power';
 import { buttonPlacement, deckOccupancy, widgetPageOccupancy, WidgetScreenItem } from '../../deck-layout';
 import { colors } from '../../theme';
 import { TabBarHiddenContext } from '../../navigation/tab-bar-context';
@@ -187,6 +188,21 @@ function SystemVolumeSlider({ value, disabled, height, controlSize, labelSize, o
   </View>;
 }
 
+// The PC sends the play position when it changes (play/pause, seek, track) and as a correction every
+// ~10 s; in between, this counts it forward locally, re-rendering only Now Playing once a second.
+function useLivePosition(media: SystemMediaState) {
+  const playing = media.playbackState === 'playing';
+  // A clock that only the timer moves; each report carries its own arrival time (receivedAt).
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!playing) return;
+    const interval = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, [playing]);
+  // Right after a report `now` can be older than it; livePositionMs then shows the report as is.
+  return livePositionMs(media, now);
+}
+
 function NowPlayingWidget({ media, connected, sendCommand, sendVolume, seekMedia }: { media: SystemMediaState; connected: boolean; sendCommand: (command: DeckMediaCommand) => boolean; sendVolume: (volumePercent: number) => boolean; seekMedia: (positionMs: number) => boolean }) {
   const [size, setSize] = useState({ width: 0, height: 0 });
   const [scrubPosition, setScrubPosition] = useState<number | null>(null);
@@ -213,7 +229,8 @@ function NowPlayingWidget({ media, connected, sendCommand, sendVolume, seekMedia
   const hasTrack = Boolean(media.title || media.artist || media.album);
   const supportingText = media.artist || media.album || (media.playbackState === 'unavailable' ? 'Waiting for media' : media.playbackState === 'paused' ? 'Paused' : 'System media');
   const duration = media.durationMs && media.durationMs > 0 ? media.durationMs : 0;
-  const currentPosition = duration ? Math.max(0, Math.min(duration, media.positionMs ?? 0)) : Math.max(0, media.positionMs ?? 0);
+  const livePosition = useLivePosition(media);
+  const currentPosition = duration ? Math.max(0, Math.min(duration, livePosition)) : livePosition;
   const progress = duration ? currentPosition / duration : 0;
   const canSeek = connected && Boolean(media.canSeek) && duration > 0;
   const artRadius = Math.max(5, layout.artSize * 0.13);
@@ -265,10 +282,22 @@ function NowPlayingWidget({ media, connected, sendCommand, sendVolume, seekMedia
   </View>;
 }
 
+// These subscribe to media state directly, so a position update re-renders them and nothing else.
+function LiveNowPlaying(props: Omit<Parameters<typeof NowPlayingWidget>[0], 'media'>) {
+  countRender('nowPlaying');
+  return <NowPlayingWidget media={useMediaState()} {...props} />;
+}
+function LiveLyrics(props: Omit<Parameters<typeof LyricsWidget>[0], 'media'>) {
+  countRender('lyrics');
+  return <LyricsWidget media={useMediaState()} {...props} />;
+}
+
 export default function DeckScreen() {
+  countRender('deck');
+  const power = useDeckScreenPower();
   const router = useRouter();
   const setTabBarHidden = useContext(TabBarHiddenContext);
-  const { connection, status, playbackState, mediaState, actionError, deckConfig, independentNavigation, selectedProfileId, selectedPageId, sendButton, sendMediaCommand, sendSystemVolume, seekMedia, selectPage, reportWidgetSurface } = usePcConnection();
+  const { connection, status, playbackState, actionError, deckConfig, independentNavigation, selectedProfileId, selectedPageId, sendButton, sendMediaCommand, sendSystemVolume, seekMedia, selectPage, reportWidgetSurface } = usePcConnection();
   const [feedback, setFeedback] = useState('');
   const [immersive, setImmersive] = useState(false);
   const [showImmersiveTools, setShowImmersiveTools] = useState(false);
@@ -463,10 +492,22 @@ export default function DeckScreen() {
     height: cellHeight * rowSpan + gap * (rowSpan - 1),
   });
 
+  // Clock and PC stats widgets are drawn by one WebView layer over the widget area (web-widgets.tsx);
+  // their tiles provide only the border and background. Each rectangle is a tile's content area.
+  const webWidgets = (frame: (placement: DeckPlacement) => { left: number; top: number; width: number; height: number }): WebWidget[] =>
+    (widgetScreen?.widgets ?? []).flatMap((widget): WebWidget[] => {
+      if (widget.type !== 'clock' && widget.type !== 'pc_stats') return [];
+      const box = frame(widget.placement);
+      const rect = { id: widget.id, x: box.left + widgetKeyInset, y: box.top + widgetKeyInset, width: Math.max(1, box.width - 2 * widgetKeyInset), height: Math.max(1, box.height - 2 * widgetKeyInset) };
+      return widget.type === 'clock'
+        ? [{ ...rect, kind: 'clock', face: widget.face, color: widget.color }]
+        : [{ ...rect, kind: 'stats', face: widget.face, metric: widget.metric, color: widget.color, gpu: widget.gpu, columns: widget.placement.columnSpan, rows: widget.placement.rowSpan }];
+    });
+
   if (immersive) {
     return <>
       <StatusBar hidden style="light" />
-      <SafeAreaView style={styles.immersiveSafe} edges={['top', 'right', 'bottom', 'left']} onLayout={(event) => {
+      <SafeAreaView {...power.touchProps} style={styles.immersiveSafe} edges={['top', 'right', 'bottom', 'left']} onLayout={(event) => {
         const { width, height } = event.nativeEvent.layout;
         setImmersiveSize((current) => current.width === width && current.height === height ? current : { width, height });
       }}>
@@ -500,7 +541,7 @@ export default function DeckScreen() {
               if (item.type === 'widget') {
                 const placement = item.widget.placement;
                 if (placement.row !== sourceRow || placement.column !== sourceColumn) return null;
-                return <View key={item.widget.id} style={[styles.immersiveKey, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12, 0)]}>{item.widget.type === 'clock' ? <ClockFaceWidget face={item.widget.face} color={item.widget.color} /> : item.widget.type === 'pc_stats' ? <PcStatsWidget face={item.widget.face} metric={item.widget.metric} color={item.widget.color} gpu={item.widget.gpu} columns={placement.columnSpan} rows={placement.rowSpan} /> : item.widget.type === 'now_playing' ? <NowPlayingWidget media={mediaState} connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} seekMedia={seekMedia} /> : item.widget.type === 'lyrics' ? <LyricsWidget media={mediaState} connected={connected} seekMedia={seekMedia} /> : <PluginTextWidget widget={item.widget} immersive />}</View>;
+                return <View key={item.widget.id} style={[styles.immersiveKey, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12, 0)]}>{item.widget.type === 'clock' || item.widget.type === 'pc_stats' ? null : item.widget.type === 'now_playing' ? <LiveNowPlaying connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} seekMedia={seekMedia} /> : item.widget.type === 'lyrics' ? <LiveLyrics connected={connected} seekMedia={seekMedia} /> : <PluginTextWidget widget={item.widget} immersive />}</View>;
               }
               const button = item.button;
               const placement = buttonPlacement({ id: widgetScreen.id, name: widgetScreen.name, rows: widgetRows, columns: widgetColumns, buttons: widgetScreen.buttons }, button);
@@ -511,6 +552,7 @@ export default function DeckScreen() {
                 {button.appIconData ? <Image source={{ uri: button.appIconData }} style={{ width: immersiveWidgetIconSize, height: immersiveWidgetIconSize }} resizeMode="contain" /> : button.iconSvg && button.icon !== 'auto' ? <SvgXml xml={button.iconSvg} width={immersiveWidgetIconSize} height={immersiveWidgetIconSize} /> : <Icon size={immersiveWidgetIconSize} color={colors.text} strokeWidth={1.7} />}
               </Pressable>;
             })}
+            <WebWidgetLayer widgets={webWidgets((p) => cellFrame(p.row - widgetTopRow, p.column - widgetLeftColumn, p.rowSpan, p.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12, 0))} />
             {(widgetArea.pages.length > 1) ? <View style={styles.immersiveWidgetPageIndicator} pointerEvents="none"><Text style={styles.pageTabText}>{widgetPageIndex + 1} / {widgetArea.pages.length}</Text></View> : null}
           </View> : null}
         </View>
@@ -523,11 +565,13 @@ export default function DeckScreen() {
           <Pressable style={styles.immersiveExit} onPress={() => { setImmersive(false); setShowImmersiveTools(false); }} accessibilityRole="button" accessibilityLabel="Exit immersive mode"><Minimize2 size={19} color={colors.text} /></Pressable>
         </View> : null}
       </SafeAreaView>
+      <PerfOverlay />
+      {power.overlay}
     </>;
   }
 
   return (
-    <SafeAreaView style={styles.safe} edges={['top']}>
+    <SafeAreaView {...power.touchProps} style={styles.safe} edges={['top']}>
       <StatusBar style="light" />
       <ScrollView contentContainerStyle={[styles.content, widgetOnlyMode && styles.widgetOnlyContent]} showsVerticalScrollIndicator={false}>
         <View style={styles.header}>
@@ -604,7 +648,7 @@ export default function DeckScreen() {
               if (item.type === 'widget') {
                 const placement = item.widget.placement;
                 if (placement.row !== sourceRow || placement.column !== sourceColumn) return null;
-                return <View key={item.widget.id} style={[styles.key, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, widgetCellWidth, widgetCellHeight)]}>{item.widget.type === 'clock' ? <ClockFaceWidget face={item.widget.face} color={item.widget.color} /> : item.widget.type === 'pc_stats' ? <PcStatsWidget face={item.widget.face} metric={item.widget.metric} color={item.widget.color} gpu={item.widget.gpu} columns={placement.columnSpan} rows={placement.rowSpan} /> : item.widget.type === 'now_playing' ? <NowPlayingWidget media={mediaState} connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} seekMedia={seekMedia} /> : item.widget.type === 'lyrics' ? <LyricsWidget media={mediaState} connected={connected} seekMedia={seekMedia} /> : <PluginTextWidget widget={item.widget} />}</View>;
+                return <View key={item.widget.id} style={[styles.key, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, widgetCellWidth, widgetCellHeight)]}>{item.widget.type === 'clock' || item.widget.type === 'pc_stats' ? null : item.widget.type === 'now_playing' ? <LiveNowPlaying connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} seekMedia={seekMedia} /> : item.widget.type === 'lyrics' ? <LiveLyrics connected={connected} seekMedia={seekMedia} /> : <PluginTextWidget widget={item.widget} />}</View>;
               }
               const button = item.button;
               const placement = buttonPlacement({ id: widgetScreen.id, name: widgetScreen.name, rows: widgetRows, columns: widgetColumns, buttons: widgetScreen.buttons }, button);
@@ -616,6 +660,7 @@ export default function DeckScreen() {
                 <Text style={styles.keyLabel} numberOfLines={2}>{label}</Text>
               </Pressable>;
             })}
+            <WebWidgetLayer widgets={webWidgets((p) => cellFrame(p.row - widgetTopRow, p.column - widgetLeftColumn, p.rowSpan, p.columnSpan, widgetCellWidth, 100))} />
           </View>
         </View> : null}
 
@@ -623,6 +668,8 @@ export default function DeckScreen() {
           {actionError ? <><Wifi size={13} color={colors.faint} /><Text style={styles.feedbackText}>{actionErrorText}</Text></> : feedback ? <><View style={styles.feedbackDot} /><Text style={styles.feedbackText}>{feedback}</Text></> : <><Wifi size={13} color={colors.faint} /><Text style={styles.feedbackText}>{connected ? 'Ready to send controls' : 'Connect to enable controls'}</Text></>}
         </View>
       </ScrollView>
+      <PerfOverlay />
+      {power.overlay}
     </SafeAreaView>
   );
 }

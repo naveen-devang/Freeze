@@ -1628,6 +1628,10 @@ enum ClientMessage {
     PcStatsSubscribe {
         needs: Vec<String>,
     },
+    /// The phone app went to the background (false) or came back (true).
+    SetStreaming {
+        active: bool,
+    },
     SeekMedia {
         #[serde(rename = "requestId")]
         request_id: String,
@@ -2551,6 +2555,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let mut next_playback_check = tokio::time::Instant::now();
     let mut fast_checks_until = tokio::time::Instant::now();
     let mut last_playback_state = None;
+    // The last playback position this phone was sent; positions in between it counts forward itself.
+    let mut progress_sent: Option<system_media::ProgressSent> = None;
+    // False while the phone app is in the background (it sends set_streaming): nothing is sent and
+    // playback isn't checked, so the phone's radio and the PC both rest.
+    let mut streaming = true;
     let mut pc_stats_updates = state.pc_stats.subscribe();
     // The readings this phone's visible stats widgets show (it sends pc_stats_subscribe), and whether
     // it has had the whole minute since asking.
@@ -2645,9 +2654,12 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             }
             _ = tokio::time::sleep_until(next_playback_check), if authenticated => {
                 let now = tokio::time::Instant::now();
-                next_playback_check = now + if now < fast_checks_until { Duration::from_millis(100) } else { Duration::from_millis(500) };
+                next_playback_check = now + if !streaming { Duration::from_secs(5) } else if now < fast_checks_until { Duration::from_millis(100) } else { Duration::from_millis(500) };
                 if state.session_epoch.load(Ordering::Relaxed) != session_epoch {
                     break;
+                }
+                if !streaming {
+                    continue;
                 }
                 let playback_state = current_playback_state().await;
                 if last_playback_state != Some(playback_state) {
@@ -2678,16 +2690,23 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             }
             changed = media_updates.changed(), if authenticated => {
                 if changed.is_err() { break; }
+                if !streaming {
+                    continue;
+                }
                 let media = media_updates.borrow().clone();
                 let content_changed = last_media_content
                     .as_ref()
                     .is_none_or(|previous| !previous.same_content(&media));
+                let now = std::time::Instant::now();
                 let message = if content_changed {
                     last_media_content = Some(media.clone());
                     serde_json::json!({ "type": "media_state", "state": media })
-                } else {
+                } else if system_media::progress_worth_sending(progress_sent.as_ref(), &media, now) {
                     serde_json::json!({ "type": "media_progress", "playbackState": media.playback_state, "positionMs": media.position_ms, "durationMs": media.duration_ms, "volumePercent": media.volume_percent, "playbackRate": media.playback_rate })
+                } else {
+                    continue;
                 };
+                progress_sent = Some(system_media::ProgressSent::new(&media, now));
                 if socket.send(Message::Text(message.to_string().into())).await.is_err() {
                     break;
                 }
@@ -3163,6 +3182,23 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     .is_err()
                 {
                     break;
+                }
+            }
+            ClientMessage::SetStreaming { active } if authenticated => {
+                let resuming = active && !streaming;
+                streaming = active;
+                if resuming {
+                    // Back in the foreground: one fresh snapshot of everything.
+                    last_playback_state = None;
+                    progress_sent = Some(system_media::ProgressSent::new(&state.media_state.borrow(), std::time::Instant::now()));
+                    pc_stats_history_sent = false;
+                    next_playback_check = tokio::time::Instant::now();
+                    let media = state.media_state.borrow().clone();
+                    last_media_content = Some(media.clone());
+                    let message = serde_json::json!({ "type": "media_state", "state": media });
+                    if socket.send(Message::Text(message.to_string().into())).await.is_err() {
+                        break;
+                    }
                 }
             }
             ClientMessage::PcStatsSubscribe { needs } if authenticated => {
