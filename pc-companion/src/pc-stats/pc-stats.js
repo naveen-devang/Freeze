@@ -131,7 +131,9 @@ const line = (p) => p.map(([a, b], i) => `${i ? 'L' : 'M'}${a.toFixed(1)},${b.to
 const area = (p, y, h) => (p.length ? `${line(p)}L${p[p.length - 1][0]},${y + h}L${p[0][0]},${y + h}Z` : '');
 const polar = (cx, cy, r, a) => [cx + r * Math.sin((a * Math.PI) / 180), cy - r * Math.cos((a * Math.PI) / 180)];
 const arc = (cx, cy, r, a0, a1) => { const [x0, y0] = polar(cx, cy, r, a0), [x1, y1] = polar(cx, cy, r, a1); return `M${x0.toFixed(2)},${y0.toFixed(2)}A${r},${r} 0 ${a1 - a0 > 180 ? 1 : 0} 1 ${x1.toFixed(2)},${y1.toFixed(2)}`; };
-const grad = (id) => `<defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="currentColor" stop-opacity=".32"/><stop offset="1" stop-color="currentColor" stop-opacity="0"/></linearGradient></defs>`;
+// The fade under a graph. Its colour is set on each stop per update (graph()) rather than inherited,
+// which some Android WebViews resolve differently in gradient stops.
+const grad = (id) => `<defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1"><stop class="g0" offset="0" stop-opacity=".32"/><stop class="g1" offset="1" stop-opacity="0"/></linearGradient></defs>`;
 const setArc = (node, k) => { node.style.strokeDasharray = `${frac(k) > 0 ? Math.max(0.01, frac(k) * 100) : 0} 100`; node.style.stroke = tone(k); };
 
 // --- Layout helpers -------------------------------------------------------
@@ -223,10 +225,10 @@ function graph(root, k, x, y, w, h, o = {}) {
   const lines = o.grid || o.labels ? [0, 0.5, 1].map((f) => `<line x1="0" x2="${gw}" y1="${(1 - f) * h}" y2="${(1 - f) * h}" stroke="var(--line)"/>`).join('') : '';
   const labels = o.labels ? [0, 0.5, 1].map((f) => `<text class="gl" data-f="${f}" x="${gw + 4}" y="${clamp((1 - f) * h + 3, 8, h)}" fill="var(--faint)" font-size="9" font-family="IBM Plex Mono, monospace"></text>`).join('') : '';
   svg.innerHTML = `<svg class="abs" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}">${grad(id)}<rect class="zone" x="0" y="0" width="${gw}" height="${h}" fill="none"/>${lines}${labels}<path class="ar" fill="url(#${id})"/><path class="ln" fill="none" stroke-width="2" stroke-linejoin="round"/>${o.dot ? '<circle class="dot" r="3"/>' : ''}</svg>`;
-  const el = svg.firstChild, ar = q('.ar', el), ln = q('.ln', el), dot = q('.dot', el), gl = qa('.gl', el);
+  const el = svg.firstChild, ar = q('.ar', el), ln = q('.ln', el), dot = q('.dot', el), gl = qa('.gl', el), stops = qa('stop', el);
   return () => {
     const max = maxOf(k), p = pts(series(k), 0, 2, gw, h - 4, max), c = tone(k), end = p[p.length - 1];
-    el.style.color = c; ar.setAttribute('d', area(p, 2, h - 4)); ln.setAttribute('d', line(p)); ln.setAttribute('stroke', c);
+    stops.forEach((stop) => { stop.style.stopColor = c; }); ar.setAttribute('d', area(p, 2, h - 4)); ln.setAttribute('d', line(p)); ln.setAttribute('stroke', c);
     if (dot) { dot.style.display = end ? '' : 'none'; if (end) { dot.setAttribute('cx', end[0]); dot.setAttribute('cy', end[1]); dot.setAttribute('fill', c); } }
     gl.forEach((t) => { const v = Number(t.dataset.f) * max; put(t, !M[k].rate ? Math.round(v) : v === 0 ? '0' : `${rateText(v)}${kilo(v) ? 'K' : 'M'}`); });
   };
@@ -464,7 +466,8 @@ const STYLES = [
     const cells = qa('.hcell', grid);
     return () => {
       const a = series(k), off = N - a.length;
-      cells.forEach((c, i) => { const v = a[i - off]; c.style.background = has(v) ? `color-mix(in srgb, ${tone(k, v)} ${Math.round(8 + frac(k, v) * 92)}%, var(--track))` : ''; });
+      // Brighter means higher: the reading's colour at 8–100% opacity; empty seconds keep the track colour.
+      cells.forEach((c, i) => { const v = a[i - off]; c.style.background = has(v) ? tone(k, v) : ''; c.style.opacity = has(v) ? (0.08 + frac(k, v) * 0.92).toFixed(2) : ''; });
       text.update();
     };
   } },
@@ -539,6 +542,7 @@ const STYLES = [
       const chart = el.appendChild(ce('div', '', at(gx, gy, gw, gh)));
       chart.innerHTML = `<svg class="abs" viewBox="0 0 ${gw} ${gh}" width="${gw}" height="${gh}" style="color:var(--accent)">${grad(id)}<rect class="zone" width="${cw}" height="${gh}" fill="none"/>${[0, 0.5, 1].map((f) => `<line x1="0" x2="${cw}" y1="${(1 - f) * gh}" y2="${(1 - f) * gh}" stroke="var(--line)"/>${axis ? `<text x="${cw + 4}" y="${clamp((1 - f) * gh + 3, 8, gh)}" fill="var(--faint)" font-size="9" font-family="IBM Plex Mono, monospace">${f * 100}</text>` : ''}`).join('')}<path class="ar" fill="url(#${id})"/><path class="l2" fill="none" stroke="var(--muted)" stroke-width="2" stroke-dasharray="4 3"/><path class="l1" fill="none" stroke="var(--accent)" stroke-width="2"/></svg>`;
       const ar = q('.ar', chart), l1 = q('.l1', chart), l2 = q('.l2', chart);
+      qa('stop', chart).forEach((stop) => { stop.style.stopColor = 'var(--accent)'; });
       parts.push(() => { const a = pts(series('cpu'), 0, 2, cw, gh - 4, 100), b = pts(series('gpu'), 0, 2, cw, gh - 4, 100); ar.setAttribute('d', area(a, 2, gh - 4)); l1.setAttribute('d', line(a)); l2.setAttribute('d', line(b)); });
     }
     // Side panel: four readings stacked when wide, a 2 × 2 grid under the graph when tall.
@@ -619,7 +623,8 @@ const CSS = `.ps-root{--fg:#ececef;--muted:#a1a1aa;--faint:#63636d;--line:#24252
 .ps-root .bar i{display:block;height:100%;width:100%;border-radius:inherit;transform:translateX(-100%);transition:transform .8s cubic-bezier(.2,.8,.2,1)}
 .ps-root .arcv,.ps-root .ringv{transition:stroke-dasharray .8s cubic-bezier(.2,.8,.2,1),stroke .4s}
 .ps-root .needle{transition:transform .8s cubic-bezier(.2,.8,.2,1)}
-.ps-root .liq{position:absolute;inset:0;background:color-mix(in srgb,var(--c) 20%,transparent);border-top:2px solid var(--c);transform:translateY(100%);transition:transform .8s cubic-bezier(.2,.8,.2,1)}
+.ps-root .liq::before{content:"";position:absolute;inset:0;background:var(--c);opacity:.2}
+.ps-root .liq{position:absolute;inset:0;border-top:2px solid var(--c);transform:translateY(100%);transition:transform .8s cubic-bezier(.2,.8,.2,1)}
 .ps-root .seg{display:flex;gap:2px}
 .ps-root .seg i{flex:1;border-radius:2px;background:var(--track)}
 .ps-root .hcell{border-radius:3px;background:var(--track)}
@@ -632,11 +637,13 @@ function injectCss() {
 }
 
 // Draws a style into `host` at width × height px. columns/rows are the widget's grid span, used to pick a fitting style.
-function mount(host, { style, metric, color, gpu, width, height, columns = 1, rows = 1 }) {
+// `background` paints the tile colour behind the widget. The phone passes it: Android's WebView
+// composites translucent pixels onto the app poorly, so fades and tints must blend inside the page.
+function mount(host, { style, metric, color, gpu, background, width, height, columns = 1, rows = 1 }) {
   injectCss();
   const root = document.createElement('div');
   root.className = 'ps-root';
-  root.style.cssText = `width:${width}px;height:${height}px;--accent:${color || '#93c5fd'}`;
+  root.style.cssText = `width:${width}px;height:${height}px;--accent:${color || '#93c5fd'}${background ? `;background:${background}` : ''}`;
   host.replaceChildren(root);
   const draw = resolve(style, columns, rows).build(root, width, height, M[metric] ? metric : 'cpu');
   const update = () => { CTX.gpu = gpu || 'auto'; draw(); };

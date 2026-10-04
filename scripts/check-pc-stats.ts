@@ -16,6 +16,10 @@ const source = readFileSync(new URL('../pc-companion/src/pc-stats/pc-stats.js', 
 const phone = readFileSync(new URL('../phone-app/src/pc-stats-source.ts', import.meta.url), 'utf8');
 assert.ok(phone.includes(JSON.stringify(source)), 'phone-app/src/pc-stats-source.ts is stale: run node scripts/sync-pc-stats.ts');
 
+// Android WebViews (older ones especially) lack color-mix() and resolve currentColor in gradient
+// stops differently; the widgets avoid both so they look the same on every phone.
+assert.ok(!/color-mix|currentColor/.test(source), 'pc-stats.js uses color-mix() or currentColor, which break on some Android WebViews');
+
 runInThisContext(source);
 type Style = { id: string; span: [number, number] };
 const api = (globalThis as unknown as { FreezeStats: { styles: Style[]; metrics: { id: string }[]; resolve(id: string, columns: number, rows: number): string } }).FreezeStats;

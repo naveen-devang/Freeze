@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { AppState, StyleSheet, View } from 'react-native';
 import { WebView, type WebViewMessageEvent } from 'react-native-webview';
 import { PC_STATS_SOURCE } from './pc-stats-source';
+import { colors } from './theme';
 
 // The last minute of PC stats samples. It lives outside the connection context so a sample each
 // second only redraws the stats widgets, not the whole deck.
@@ -60,8 +61,9 @@ const validNeeds = (value: unknown): value is string[] => Array.isArray(value) &
 // the app which readings it shows.
 const HTML = `<!doctype html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="color-scheme" content="dark">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500&display=swap">
-<style>html,body{margin:0;height:100%;overflow:hidden;background:transparent}#host{width:100vw;height:100vh}</style>
+<style>html,body{margin:0;height:100%;overflow:hidden;background:transparent;color-scheme:dark}#host{width:100vw;height:100vh}</style>
 </head><body><div id="host"></div><script>
 ${PC_STATS_SOURCE.replace(/<\/script/gi, '<\\/script')}
 var current = null, options = null;
@@ -83,7 +85,7 @@ export function PcStatsWidget({ face, metric, color, gpu, columns, rows }: { fac
   const webView = useRef<WebView>(null);
   const widget = useRef(nextWidget++);
   const [loaded, setLoaded] = useState(false);
-  const options = JSON.stringify({ style: face ?? 'ring', metric: metric ?? 'cpu', color: color ?? null, gpu: gpu ?? 'auto', columns, rows });
+  const options = JSON.stringify({ style: face ?? 'ring', metric: metric ?? 'cpu', color: color ?? null, gpu: gpu ?? 'auto', background: colors.panel, columns, rows });
   useEffect(() => {
     if (loaded) webView.current?.injectJavaScript(`window.freezeStatsUpdate(${options});true;`);
   }, [loaded, options]);
@@ -111,7 +113,7 @@ export function PcStatsWidget({ face, metric, color, gpu, columns, rows }: { fac
     } catch { /* not a needs message */ }
   };
   return <View pointerEvents="none" style={styles.frame}>
-    <WebView ref={webView} originWhitelist={['*']} source={{ html: HTML }} onLoadEnd={() => setLoaded(true)} onMessage={onMessage} scrollEnabled={false} bounces={false} overScrollMode="never" showsHorizontalScrollIndicator={false} showsVerticalScrollIndicator={false} setSupportMultipleWindows={false} style={styles.webView} containerStyle={styles.webView} />
+    <WebView ref={webView} originWhitelist={['*']} source={{ html: HTML }} onLoadEnd={() => setLoaded(true)} onMessage={onMessage} textZoom={100} scrollEnabled={false} bounces={false} overScrollMode="never" showsHorizontalScrollIndicator={false} showsVerticalScrollIndicator={false} setSupportMultipleWindows={false} style={styles.webView} containerStyle={styles.webView} />
   </View>;
 }
 

@@ -39,7 +39,7 @@ export function ClockFaceWidget({ face, color }: { face?: string; color?: string
     return () => subscription.remove();
   }, []);
   return <View pointerEvents="none" style={styles.frame}>
-    <WebView ref={webView} originWhitelist={['*']} source={{ html: HTML }} onLoadEnd={() => setLoaded(true)} scrollEnabled={false} bounces={false} overScrollMode="never" showsHorizontalScrollIndicator={false} showsVerticalScrollIndicator={false} setSupportMultipleWindows={false} style={styles.webView} containerStyle={styles.webView} />
+    <WebView ref={webView} originWhitelist={['*']} source={{ html: HTML }} onLoadEnd={() => setLoaded(true)} textZoom={100} scrollEnabled={false} bounces={false} overScrollMode="never" showsHorizontalScrollIndicator={false} showsVerticalScrollIndicator={false} setSupportMultipleWindows={false} style={styles.webView} containerStyle={styles.webView} />
   </View>;
 }
 
