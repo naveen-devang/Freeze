@@ -378,6 +378,16 @@ button:focus-visible { outline: 2px solid #d4d4d8; outline-offset: 2px; }
 .clock-recent { display: flex; align-items: center; gap: 6px; color: var(--subtle); font-size: 11px; }
 .clock-recent span { margin-right: 2px; }
 .clock-settings-note { margin: 0; color: var(--subtle); font-size: 12px; }
+.pc-sources { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 12px; }
+.pc-sources summary { cursor: pointer; color: var(--muted); }
+.pc-sources dl { margin: 6px 0 0; display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; }
+.pc-sources dl > div { display: contents; }
+.pc-sources dt { color: var(--subtle); }
+.pc-sources dd { margin: 0; color: var(--foreground); min-width: 0; }
+.pc-sources dd.missing { color: var(--subtle); }
+.pc-sources-gpu { margin-top: 10px; }
+.pc-sources-gpu strong { font-size: 12px; font-weight: 600; }
+.clock-settings-color select { width: 100%; min-height: 34px; padding: 0 10px; border: 1px solid var(--border); border-radius: 6px; background: #0c0c0e; color: var(--foreground); font: inherit; font-size: 13px; }
 
 .clock-browser-backdrop { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center; padding: 28px; background: rgb(0 0 0 / 62%); backdrop-filter: blur(3px); }
 .clock-browser { width: min(1080px, 100%); max-height: min(820px, 100%); display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 12px; background: var(--card); box-shadow: 0 30px 80px rgb(0 0 0 / 55%); overflow: hidden; }

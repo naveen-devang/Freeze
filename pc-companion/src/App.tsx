@@ -1,8 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { createElement } from "react";
-import { renderToStaticMarkup } from "react-dom/server";
 import {
   AppWindow,
   ChevronUp,
@@ -49,6 +47,8 @@ import { NowPlayingPreview, REFERENCE_WIDGET_SURFACE } from "./NowPlayingPreview
 import { LyricsPreview } from "./LyricsPreview";
 import { ClockFacePreview } from "./clock-faces/ClockFacePreview";
 import { ClockWidgetSettings } from "./clock-faces/ClockSettings";
+import { PcStatsPreview } from "./pc-stats/PcStatsPreview";
+import { PcStatsSettings } from "./pc-stats/PcStatsSettings";
 import { AddWidgetMenu, type WidgetChoice } from "./AddWidgetMenu";
 import { widgetBlockSize, type WidgetSurface } from "./now-playing-layout";
 
@@ -73,7 +73,7 @@ type FreezePlugin = { id: string; name: string; version: string; description: st
 type FreezePluginListing = { plugins: FreezePlugin[]; warnings: string[] };
 type DeckPlacement = { row: number; column: number; rowSpan: number; columnSpan: number };
 type DeckButton = { id: string; label: string; icon: string; placement?: DeckPlacement; iconSvg?: string; appIconData?: string; action: DeckAction };
-type DeckWidget = { id: string; type: 'clock'; placement: DeckPlacement; face?: string; color?: string } | { id: string; type: 'now_playing'; placement: DeckPlacement } | { id: string; type: 'lyrics'; placement: DeckPlacement } | { id: string; type: 'plugin'; pluginId: string; widgetId: string; renderType: string; values: Record<string, string>; placement: DeckPlacement };
+type DeckWidget = { id: string; type: 'clock'; placement: DeckPlacement; face?: string; color?: string } | { id: string; type: 'now_playing'; placement: DeckPlacement } | { id: string; type: 'lyrics'; placement: DeckPlacement } | { id: string; type: 'pc_stats'; placement: DeckPlacement; face?: string; metric?: string; color?: string; gpu?: string } | { id: string; type: 'plugin'; pluginId: string; widgetId: string; renderType: string; values: Record<string, string>; placement: DeckPlacement };
 type WidgetScreen = { enabled: boolean; rows: number; columns: number; buttons: DeckButton[]; widgets: DeckWidget[] };
 type WidgetPage = { id: string; name: string; buttons: DeckButton[]; widgets: DeckWidget[] };
 type WidgetArea = { enabled: boolean; rows: number; columns: number; pages: WidgetPage[] };
@@ -1173,6 +1173,13 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
       : widget) }, profile, false);
   }
 
+  function updateSelectedPcStatsWidget(patch: { face?: string; metric?: string; color?: string; gpu?: string }) {
+    if (selectedWidget?.type !== 'pc_stats') return;
+    replaceWidgetScreen({ ...widgetScreen, widgets: widgetScreen.widgets.map((widget) => widget.id === selectedWidget.id && widget.type === 'pc_stats'
+      ? { ...widget, ...patch }
+      : widget) }, profile, false);
+  }
+
   function updateSelectedPluginWidgetValue(inputId: string, value: string) {
     if (selectedWidget?.type !== 'plugin' || !selectedWidgetDefinition?.inputs.some((input) => input.id === inputId)) return;
     const values = Object.fromEntries(selectedWidgetDefinition.inputs.map((input) => [input.id, selectedWidget.values[input.id] ?? input.default]));
@@ -1329,8 +1336,8 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
               const previewRows = Math.min(shown.rowSpan, widgetScreen.rows - placement.row);
               const previewColumns = Math.min(shown.columnSpan, widgetScreen.columns - placement.column);
               const phoneGrid = phoneWidgetGrid(page.buttons.length > 0, widgetScreen, itemId, shown);
-              return <button key={itemId} type="button" data-deck-item={itemId} data-deck-cell="true" data-surface="widgets" data-row={placement.row} data-column={placement.column} className={`deck-button ${item.type === 'widget' ? 'clock-widget' : ''} ${item.type === 'widget' && (item.widget.type === 'now_playing' || item.widget.type === 'lyrics' || item.widget.type === 'clock') ? 'now-playing-widget-preview' : ''} ${item.type === 'button' && selected?.id === itemId ? 'selected' : ''} ${item.type === 'widget' && selectedWidget?.id === itemId ? 'selected' : ''} ${dragOverButtonId === itemId ? 'drop-target' : ''} ${draggingButtonId === itemId ? 'dragging' : ''} ${preview && !preview.valid ? 'resize-invalid' : ''}`} style={{ gridColumn: `${placement.column + 1} / span ${Math.min(shown.columnSpan, widgetScreen.columns - placement.column)}`, gridRow: `${placement.row + 1} / span ${Math.min(shown.rowSpan, widgetScreen.rows - placement.row)}` }} onClick={() => item.type === 'button' ? (setWidgetId(''), setButtonId(item.button.id)) : (setButtonId(''), setWidgetId(item.widget.id))} onPointerDown={(event) => item.type === 'button' ? startButtonDrag(event, item.button.id, 'widgets') : startWidgetDrag(event, item.widget.id)} onPointerMove={moveButtonDrag} onPointerUp={finishButtonDrag} onPointerCancel={cancelButtonDrag} onLostPointerCapture={cancelButtonDrag}>
-                {item.type === 'button' ? <><span>{iconForButton(item.button, playbackState)}</span><strong>{buttonLabel(item.button, playbackState)}</strong></> : item.widget.type === 'clock' ? (() => { const block = widgetBlockSize(widgetSurface ?? REFERENCE_WIDGET_SURFACE, phoneGrid.columns, phoneGrid.rows, previewColumns, previewRows); return <ClockFacePreview face={item.widget.face ?? 'digital'} color={item.widget.color} width={block.width} height={block.height} />; })() : item.widget.type === 'now_playing' ? <NowPlayingPreview media={mediaState} surface={widgetSurface ?? REFERENCE_WIDGET_SURFACE} columns={phoneGrid.columns} rows={phoneGrid.rows} columnSpan={previewColumns} rowSpan={previewRows} /> : item.widget.type === 'lyrics' ? <LyricsPreview media={mediaState} surface={widgetSurface ?? REFERENCE_WIDGET_SURFACE} columns={phoneGrid.columns} rows={phoneGrid.rows} columnSpan={previewColumns} rowSpan={previewRows} /> : item.widget.renderType === 'text' ? <><span className="clock-widget-icon"><Package size={18} /></span><strong>{item.widget.values.title || item.widget.widgetId}</strong><small>{item.widget.values.body || 'Text widget'}</small></> : <><span className="clock-widget-icon"><Package size={18} /></span><strong>Unavailable widget</strong><small>{item.widget.renderType}</small></>}
+              return <button key={itemId} type="button" data-deck-item={itemId} data-deck-cell="true" data-surface="widgets" data-row={placement.row} data-column={placement.column} className={`deck-button ${item.type === 'widget' ? 'clock-widget' : ''} ${item.type === 'widget' && (item.widget.type === 'now_playing' || item.widget.type === 'lyrics' || item.widget.type === 'clock' || item.widget.type === 'pc_stats') ? 'now-playing-widget-preview' : ''} ${item.type === 'button' && selected?.id === itemId ? 'selected' : ''} ${item.type === 'widget' && selectedWidget?.id === itemId ? 'selected' : ''} ${dragOverButtonId === itemId ? 'drop-target' : ''} ${draggingButtonId === itemId ? 'dragging' : ''} ${preview && !preview.valid ? 'resize-invalid' : ''}`} style={{ gridColumn: `${placement.column + 1} / span ${Math.min(shown.columnSpan, widgetScreen.columns - placement.column)}`, gridRow: `${placement.row + 1} / span ${Math.min(shown.rowSpan, widgetScreen.rows - placement.row)}` }} onClick={() => item.type === 'button' ? (setWidgetId(''), setButtonId(item.button.id)) : (setButtonId(''), setWidgetId(item.widget.id))} onPointerDown={(event) => item.type === 'button' ? startButtonDrag(event, item.button.id, 'widgets') : startWidgetDrag(event, item.widget.id)} onPointerMove={moveButtonDrag} onPointerUp={finishButtonDrag} onPointerCancel={cancelButtonDrag} onLostPointerCapture={cancelButtonDrag}>
+                {item.type === 'button' ? <><span>{iconForButton(item.button, playbackState)}</span><strong>{buttonLabel(item.button, playbackState)}</strong></> : item.widget.type === 'clock' ? (() => { const block = widgetBlockSize(widgetSurface ?? REFERENCE_WIDGET_SURFACE, phoneGrid.columns, phoneGrid.rows, previewColumns, previewRows); return <ClockFacePreview face={item.widget.face ?? 'digital'} color={item.widget.color} width={block.width} height={block.height} />; })() : item.widget.type === 'pc_stats' ? (() => { const block = widgetBlockSize(widgetSurface ?? REFERENCE_WIDGET_SURFACE, phoneGrid.columns, phoneGrid.rows, previewColumns, previewRows); return <PcStatsPreview style={item.widget.face ?? 'ring'} metric={item.widget.metric} color={item.widget.color} gpu={item.widget.gpu} width={block.width} height={block.height} columns={previewColumns} rows={previewRows} />; })() : item.widget.type === 'now_playing' ? <NowPlayingPreview media={mediaState} surface={widgetSurface ?? REFERENCE_WIDGET_SURFACE} columns={phoneGrid.columns} rows={phoneGrid.rows} columnSpan={previewColumns} rowSpan={previewRows} /> : item.widget.type === 'lyrics' ? <LyricsPreview media={mediaState} surface={widgetSurface ?? REFERENCE_WIDGET_SURFACE} columns={phoneGrid.columns} rows={phoneGrid.rows} columnSpan={previewColumns} rowSpan={previewRows} /> : item.widget.renderType === 'text' ? <><span className="clock-widget-icon"><Package size={18} /></span><strong>{item.widget.values.title || item.widget.widgetId}</strong><small>{item.widget.values.body || 'Text widget'}</small></> : <><span className="clock-widget-icon"><Package size={18} /></span><strong>Unavailable widget</strong><small>{item.widget.renderType}</small></>}
                 <span className="deck-button-size">{preview ? `${shown.columnSpan}×${shown.rowSpan}` : placement.rowSpan > 1 || placement.columnSpan > 1 ? `${placement.columnSpan}×${placement.rowSpan}` : null}</span>
                 <span className="deck-resize-handle" aria-hidden="true" onPointerDown={(event) => item.type === 'button' ? startResize(event, item.button, 'widgets', 'button') : startResize(event, item.widget, 'widgets', 'widget')} onPointerMove={moveResize} onPointerUp={finishResize} onPointerCancel={cancelResize} onLostPointerCapture={cancelResize} />
               </button>;
@@ -1340,7 +1347,7 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
         </div>
       </section>
       </div>
-      <div className="button-properties"><div className="properties-heading"><div><h2>{selectedWidget ? 'Widget settings' : 'Button settings'}</h2><p>{selectedWidget?.type === 'clock' ? 'Clock · shows the phone’s local time' : selectedWidget?.type === 'now_playing' ? 'Now Playing · system media from this PC' : selectedWidget?.type === 'lyrics' ? 'Lyrics · synced lyrics for what this PC is playing' : selectedWidget?.type === 'plugin' ? `${plugins.find((plugin) => plugin.id === selectedWidget.pluginId)?.name ?? 'Plugin'} · ${selectedWidgetDefinition?.name ?? selectedWidget.widgetId}` : selected ? 'Edit the selected control' : 'Select an item from either grid'}</p></div>{selected || selectedWidget ? <button className="icon-button" aria-label={selectedWidget ? 'Remove widget' : 'Remove button'} onClick={() => {
+      <div className="button-properties"><div className="properties-heading"><div><h2>{selectedWidget ? 'Widget settings' : 'Button settings'}</h2><p>{selectedWidget?.type === 'clock' ? 'Clock · shows the phone’s local time' : selectedWidget?.type === 'pc_stats' ? 'PC stats · live readings from this PC' : selectedWidget?.type === 'now_playing' ? 'Now Playing · system media from this PC' : selectedWidget?.type === 'lyrics' ? 'Lyrics · synced lyrics for what this PC is playing' : selectedWidget?.type === 'plugin' ? `${plugins.find((plugin) => plugin.id === selectedWidget.pluginId)?.name ?? 'Plugin'} · ${selectedWidgetDefinition?.name ?? selectedWidget.widgetId}` : selected ? 'Edit the selected control' : 'Select an item from either grid'}</p></div>{selected || selectedWidget ? <button className="icon-button" aria-label={selectedWidget ? 'Remove widget' : 'Remove button'} onClick={() => {
         if (selectedWidget) { deleteSelectedWidget(); return; }
         if (!selected) return;
         setButtonId('');
@@ -1348,7 +1355,7 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
         else replaceWidgetScreen({ ...widgetScreen, buttons: widgetScreen.buttons.filter((item) => item.id !== selected.id) });
       }}><Trash2 size={15} /></button> : null}</div>
         {selected && !selectedWidget ? <button className="secondary-button widget-transfer-button" onClick={moveSelectedButtonToOtherSurface} disabled={busy}>{page.buttons.some((button) => button.id === selected.id) ? 'Move to widget area' : 'Move to button grid'}</button> : null}
-        {selectedWidget?.type === 'clock' ? <ClockWidgetSettings key={selectedWidget.id} face={selectedWidget.face} color={selectedWidget.color} busy={busy} block={(() => { const grid = phoneWidgetGrid(page.buttons.length > 0, widgetScreen, selectedWidget.id, selectedWidget.placement); return widgetBlockSize(widgetSurface ?? REFERENCE_WIDGET_SURFACE, grid.columns, grid.rows, selectedWidget.placement.columnSpan, selectedWidget.placement.rowSpan); })()} onChange={updateSelectedClockWidget} /> : selectedWidget?.type === 'now_playing' ? <div className="widget-properties"><Music size={22} /><strong>Now Playing</strong><span>Shows the active media session, artwork and playback progress from this PC.</span></div> : selectedWidget?.type === 'lyrics' ? <div className="widget-properties"><MicVocal size={22} /><strong>Lyrics</strong><span>Shows time-synced lyrics from LRCLIB for the song playing on this PC. Videos and tracks LRCLIB doesn’t know show “No lyrics found”. Each phone fetches lyrics over its own internet connection.</span></div> : selectedWidget?.type === 'plugin' ? <PluginWidgetProperties widget={selectedWidget} definition={selectedWidgetDefinition} busy={busy} onChange={updateSelectedPluginWidgetValue} /> : selected ? <ButtonProperties key={selected.id} button={selected} busy={busy} isMacos={isMacos} profiles={deck.profiles} pages={profile.pages} plugins={plugins} onChange={updateButton} /> : <div className="properties-empty">Select an item from either grid.</div>}
+        {selectedWidget?.type === 'clock' ? <ClockWidgetSettings key={selectedWidget.id} face={selectedWidget.face} color={selectedWidget.color} busy={busy} block={(() => { const grid = phoneWidgetGrid(page.buttons.length > 0, widgetScreen, selectedWidget.id, selectedWidget.placement); return widgetBlockSize(widgetSurface ?? REFERENCE_WIDGET_SURFACE, grid.columns, grid.rows, selectedWidget.placement.columnSpan, selectedWidget.placement.rowSpan); })()} onChange={updateSelectedClockWidget} /> : selectedWidget?.type === 'pc_stats' ? <PcStatsSettings key={selectedWidget.id} style={selectedWidget.face} metric={selectedWidget.metric} color={selectedWidget.color} gpu={selectedWidget.gpu} busy={busy} columns={selectedWidget.placement.columnSpan} rows={selectedWidget.placement.rowSpan} block={(() => { const grid = phoneWidgetGrid(page.buttons.length > 0, widgetScreen, selectedWidget.id, selectedWidget.placement); return widgetBlockSize(widgetSurface ?? REFERENCE_WIDGET_SURFACE, grid.columns, grid.rows, selectedWidget.placement.columnSpan, selectedWidget.placement.rowSpan); })()} onChange={updateSelectedPcStatsWidget} /> : selectedWidget?.type === 'now_playing' ? <div className="widget-properties"><Music size={22} /><strong>Now Playing</strong><span>Shows the active media session, artwork and playback progress from this PC.</span></div> : selectedWidget?.type === 'lyrics' ? <div className="widget-properties"><MicVocal size={22} /><strong>Lyrics</strong><span>Shows time-synced lyrics from LRCLIB for the song playing on this PC. Videos and tracks LRCLIB doesn’t know show “No lyrics found”. Each phone fetches lyrics over its own internet connection.</span></div> : selectedWidget?.type === 'plugin' ? <PluginWidgetProperties widget={selectedWidget} definition={selectedWidgetDefinition} busy={busy} onChange={updateSelectedPluginWidgetValue} /> : selected ? <ButtonProperties key={selected.id} button={selected} busy={busy} isMacos={isMacos} profiles={deck.profiles} pages={profile.pages} plugins={plugins} onChange={updateButton} /> : <div className="properties-empty">Select an item from either grid.</div>}
         {selected || selectedWidget ? <button className="primary-button save-button" onClick={() => void save(deck)} disabled={busy}><Save size={14} /> {busy ? 'Saving…' : 'Save deck'}</button> : null}
       </div>
       {addMenu ? <AddWidgetMenu anchor={addMenu.anchor} plugins={pluginWidgetOptions.map((option) => ({ pluginId: option.plugin.id, widgetId: option.widget.id, label: option.label }))} onPick={(choice) => addWidget(choice, addMenu.row, addMenu.column)} onClose={() => setAddMenu(null)} /> : null}
@@ -1470,6 +1477,17 @@ function DeckSelect({ value, options, onChange, disabled = false }: {
   </div>;
 }
 
+// The picked icon as standalone SVG markup at 24 px in the deck's light ink. The picker button has
+// already drawn it, so copy that instead of rendering it again (which needed react-dom/server).
+function iconMarkup(button: HTMLElement) {
+  const svg = button.querySelector('svg')!.cloneNode(true) as SVGSVGElement;
+  svg.setAttribute('width', '24');
+  svg.setAttribute('height', '24');
+  svg.setAttribute('stroke', '#f4f4f5');
+  svg.setAttribute('stroke-width', '2');
+  return svg.outerHTML;
+}
+
 function IconPicker({ value, disabled, onChange }: { value: string; disabled: boolean; onChange: (name: string, svg?: string) => void }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -1495,7 +1513,7 @@ function IconPicker({ value, disabled, onChange }: { value: string; disabled: bo
       <button type="button" className={`icon-picker-auto ${value === 'auto' ? 'selected' : ''}`} onClick={() => { onChange('auto'); setOpen(false); }}><Zap size={16} /> Automatic by action</button>
       <div className="icon-picker-grid">{visible.map((name) => {
         const Icon = registry![name as keyof LucideRegistry];
-        return <button type="button" key={name} className={`icon-picker-option ${name === value ? 'selected' : ''}`} title={name} aria-label={name} onClick={() => { const svg = renderToStaticMarkup(createElement(Icon, { size: 24, color: '#f4f4f5', strokeWidth: 2 })).replace(/stroke="currentColor"/g, 'stroke="#f4f4f5"'); onChange(name, svg); setOpen(false); }}><Icon size={17} /><span>{name}</span></button>;
+        return <button type="button" key={name} className={`icon-picker-option ${name === value ? 'selected' : ''}`} title={name} aria-label={name} onClick={(event) => { onChange(name, iconMarkup(event.currentTarget)); setOpen(false); }}><Icon size={17} /><span>{name}</span></button>;
       })}</div>
       {matches.length > visible.length ? <button type="button" className="icon-picker-more" onClick={() => setLimit((current) => current + 72)}>Show more ({matches.length - visible.length} remaining)</button> : null}
     </div> : null}

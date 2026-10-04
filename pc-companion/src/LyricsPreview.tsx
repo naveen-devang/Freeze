@@ -33,11 +33,15 @@ export function LyricsPreview({ media, surface, columns, rows, columnSpan, rowSp
   useEffect(() => {
     setClock({ positionMs: media.positionMs ?? 0, at: performance.now() });
   }, [media.positionMs, rate]);
+  // Re-render only when the next line is due, not on a fixed tick: the view changes once per line.
   useEffect(() => {
     if (rate <= 0 || !lines) return;
-    const interval = setInterval(() => setNow(performance.now()), 100);
-    return () => clearInterval(interval);
-  }, [rate, lines]);
+    const position = clock.positionMs + Math.max(0, performance.now() - clock.at) * rate + LEAD_MS;
+    const next = lines.find((line) => line.timeMs > position);
+    if (!next) return;
+    const timeout = setTimeout(() => setNow(performance.now()), (next.timeMs - position) / rate + 5);
+    return () => clearTimeout(timeout);
+  }, [rate, lines, clock, now]);
   const position = clock.positionMs + Math.max(0, now - clock.at) * rate + LEAD_MS;
   const active = lines ? activeLineAt(lines, position) : -1;
 

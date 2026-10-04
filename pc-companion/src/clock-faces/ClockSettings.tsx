@@ -21,35 +21,40 @@ export function ClockWidgetSettings({ face, color, block, busy, onChange }: { fa
   const info = clockFace(face);
   const current = color ?? DEFAULT_CLOCK_COLOR;
   const [browsing, setBrowsing] = useState(false);
-  const [hex, setHex] = useState(current);
-  const [recent, setRecent] = useState(readRecent);
-  useEffect(() => setHex(current), [current]);
-  const pick = (next: string, remember = false) => {
-    const value = next.toLowerCase();
-    if (!HEX.test(value)) return;
-    onChange({ color: value });
-    if (remember && !CLOCK_COLOR_PRESETS.includes(value)) {
-      const updated = [value, ...recent.filter((item) => item !== value)].slice(0, 6);
-      setRecent(updated);
-      try { localStorage.setItem(RECENT_KEY, JSON.stringify(updated)); } catch { /* recent colours are a convenience */ }
-    }
-  };
   return <div className="clock-settings">
     <div className="clock-settings-preview"><ClockFacePreview face={info.id} color={current} width={block.width} height={block.height} /></div>
     <div className="clock-settings-row">
       <div><span className="clock-settings-label">Face</span><strong>{info.name}</strong><small>{CLOCK_CATEGORIES.find(([id]) => id === info.category)?.[1]}</small></div>
       <button type="button" className="secondary-button" onClick={() => setBrowsing(true)} disabled={busy}>Change face…</button>
     </div>
-    {info.color ? <div className="clock-settings-color">
-      <span className="clock-settings-label">Color</span>
-      <div className="clock-swatches">{CLOCK_COLOR_PRESETS.map((swatch) => <button key={swatch} type="button" className={`clock-swatch ${swatch === current ? 'selected' : ''}`} style={{ background: swatch }} aria-label={`Use ${swatch}`} aria-pressed={swatch === current} disabled={busy} onClick={() => pick(swatch)} />)}</div>
-      <div className="clock-custom-color">
-        <input type="color" aria-label="Custom color" value={current} disabled={busy} onChange={(event) => pick(event.target.value)} onBlur={(event) => pick(event.target.value, true)} />
-        <input className="clock-hex" aria-label="Hex color" value={hex} spellCheck={false} disabled={busy} onChange={(event) => setHex(event.target.value)} onBlur={() => HEX.test(hex) ? pick(hex, true) : setHex(current)} onKeyDown={(event) => { if (event.key === 'Enter') (event.target as HTMLInputElement).blur(); }} />
-      </div>
-      {recent.length ? <div className="clock-recent"><span>Recent</span>{recent.map((swatch) => <button key={swatch} type="button" className={`clock-swatch small ${swatch === current ? 'selected' : ''}`} style={{ background: swatch }} aria-label={`Use ${swatch}`} disabled={busy} onClick={() => pick(swatch)} />)}</div> : null}
-    </div> : <p className="clock-settings-note">This face uses its own fixed colors.</p>}
+    {info.color ? <ColorField color={current} busy={busy} onPick={(value) => onChange({ color: value })} /> : <p className="clock-settings-note">This face uses its own fixed colors.</p>}
     {browsing ? <ClockFaceBrowser selected={info.id} color={current} block={block} onClose={() => setBrowsing(false)} onChoose={(id) => { onChange({ face: id }); setBrowsing(false); }} /> : null}
+  </div>;
+}
+
+// Preset swatches, a custom picker with hex entry, and recently used custom colours. Shared with the PC stats widget.
+export function ColorField({ color, busy, onPick }: { color: string; busy: boolean; onPick: (color: string) => void }) {
+  const [hex, setHex] = useState(color);
+  const [recent, setRecent] = useState(readRecent);
+  useEffect(() => setHex(color), [color]);
+  const pick = (next: string, remember = false) => {
+    const value = next.toLowerCase();
+    if (!HEX.test(value)) return;
+    onPick(value);
+    if (remember && !CLOCK_COLOR_PRESETS.includes(value)) {
+      const updated = [value, ...recent.filter((item) => item !== value)].slice(0, 6);
+      setRecent(updated);
+      try { localStorage.setItem(RECENT_KEY, JSON.stringify(updated)); } catch { /* recent colours are a convenience */ }
+    }
+  };
+  return <div className="clock-settings-color">
+    <span className="clock-settings-label">Color</span>
+    <div className="clock-swatches">{CLOCK_COLOR_PRESETS.map((swatch) => <button key={swatch} type="button" className={`clock-swatch ${swatch === color ? 'selected' : ''}`} style={{ background: swatch }} aria-label={`Use ${swatch}`} aria-pressed={swatch === color} disabled={busy} onClick={() => pick(swatch)} />)}</div>
+    <div className="clock-custom-color">
+      <input type="color" aria-label="Custom color" value={color} disabled={busy} onChange={(event) => pick(event.target.value)} onBlur={(event) => pick(event.target.value, true)} />
+      <input className="clock-hex" aria-label="Hex color" value={hex} spellCheck={false} disabled={busy} onChange={(event) => setHex(event.target.value)} onBlur={() => HEX.test(hex) ? pick(hex, true) : setHex(color)} onKeyDown={(event) => { if (event.key === 'Enter') (event.target as HTMLInputElement).blur(); }} />
+    </div>
+    {recent.length ? <div className="clock-recent"><span>Recent</span>{recent.map((swatch) => <button key={swatch} type="button" className={`clock-swatch small ${swatch === color ? 'selected' : ''}`} style={{ background: swatch }} aria-label={`Use ${swatch}`} disabled={busy} onClick={() => pick(swatch)} />)}</div> : null}
   </div>;
 }
 

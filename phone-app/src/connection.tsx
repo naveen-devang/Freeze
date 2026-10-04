@@ -4,6 +4,7 @@ import { loadDeckPages } from './deck';
 import { validDeckPageLayout, validDeckWidgetAreaLayout } from './deck-layout';
 import { createContext, PropsWithChildren, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import type { WidgetSurface } from './now-playing-layout';
+import { clearPcStats, receivePcStats, setPcStatsSender } from './pc-stats-widget';
 
 export type PcConnection = { host: string; port: number; token: string; deviceName?: string; transport?: 'wifi' | 'usb' };
 export type DeckMediaCommand = 'play_pause' | 'next_track' | 'previous_track' | 'volume_up' | 'volume_down' | 'mute';
@@ -11,7 +12,7 @@ export type DeckStep = { type: 'media'; command: DeckMediaCommand } | { type: 'h
 export type DeckAction = DeckStep | { type: 'run_script'; path: string; allowOnPc: boolean } | { type: 'plugin_action'; pluginId: string; actionId: string; allowOnPc: boolean; inputs?: Record<string, string> } | { type: 'sequence'; steps: DeckStep[] } | { type: 'select_profile'; profileId: string } | { type: 'select_page'; pageId: string };
 export type DeckPlacement = { row: number; column: number; rowSpan: number; columnSpan: number };
 export type DeckButton = { id: string; label: string; icon: string; placement?: DeckPlacement; iconSvg?: string; appIconData?: string; action: DeckAction };
-export type DeckWidget = { id: string; type: 'clock'; placement: DeckPlacement; face?: string; color?: string } | { id: string; type: 'now_playing'; placement: DeckPlacement } | { id: string; type: 'lyrics'; placement: DeckPlacement } | { id: string; type: 'plugin'; pluginId: string; widgetId: string; renderType: string; values: Record<string, string>; placement: DeckPlacement };
+export type DeckWidget = { id: string; type: 'clock'; placement: DeckPlacement; face?: string; color?: string } | { id: string; type: 'now_playing'; placement: DeckPlacement } | { id: string; type: 'lyrics'; placement: DeckPlacement } | { id: string; type: 'pc_stats'; placement: DeckPlacement; face?: string; metric?: string; color?: string; gpu?: string } | { id: string; type: 'plugin'; pluginId: string; widgetId: string; renderType: string; values: Record<string, string>; placement: DeckPlacement };
 export type DeckWidgetPage = { id: string; name: string; buttons: DeckButton[]; widgets: DeckWidget[] };
 export type DeckWidgetArea = { enabled: boolean; rows: number; columns: number; pages: DeckWidgetPage[] };
 export type DeckPage = { id: string; name: string; rows?: number; columns?: number; buttons: DeckButton[]; widgetArea?: DeckWidgetArea };
@@ -112,6 +113,12 @@ function validDeckWidget(value: unknown): value is DeckWidget {
     return (clock.face === undefined || (typeof clock.face === 'string' && /^[a-z]{1,24}$/.test(clock.face))) &&
       (clock.color === undefined || (typeof clock.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(clock.color)));
   }
+  if (widget.type === 'pc_stats') {
+    const stats = widget as Extract<DeckWidget, { type: 'pc_stats' }>;
+    return [stats.face, stats.metric].every((id) => id === undefined || (typeof id === 'string' && /^[a-z]{1,24}$/.test(id))) &&
+      (stats.color === undefined || (typeof stats.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(stats.color))) &&
+      (stats.gpu === undefined || (typeof stats.gpu === 'string' && /^[a-z0-9-]{1,48}$/.test(stats.gpu)));
+  }
   if (widget.type === 'now_playing' || widget.type === 'lyrics') return true;
   if (widget.type !== 'plugin' || !('pluginId' in widget) || !('widgetId' in widget) || !('renderType' in widget) || !('values' in widget)) return false;
   const pluginWidget = widget as Extract<DeckWidget, { type: 'plugin' }>;
@@ -152,6 +159,21 @@ function validDeckConfig(value: unknown): value is DeckConfig {
       profile.pages.every(validDeckPage));
 }
 
+// Whether a deck button (anywhere in the config) is a play/pause media key.
+function isPlayPauseButton(config: DeckConfig, buttonId: string): boolean {
+  const visit = (value: unknown): boolean => {
+    if (!value || typeof value !== 'object') return false;
+    if (Array.isArray(value)) return value.some(visit);
+    const record = value as Record<string, unknown>;
+    if (record.id === buttonId && record.action && typeof record.action === 'object') {
+      const action = record.action as { type?: string; command?: string };
+      if (action.type === 'media' && action.command === 'play_pause') return true;
+    }
+    return Object.values(record).some(visit);
+  };
+  return visit(config.profiles);
+}
+
 export function ConnectionProvider({ children }: PropsWithChildren) {
   const socketRef = useRef<WebSocket | null>(null);
   const widgetSurfaceRef = useRef<WidgetSurface | null>(null);
@@ -168,11 +190,24 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
   const [protocolError, setProtocolError] = useState<string | null>(null);
   const [playbackState, setPlaybackState] = useState<PlaybackState>('unavailable');
   const [mediaState, setMediaState] = useState<SystemMediaState>(EMPTY_MEDIA_STATE);
+  // Play/pause shows its new state the moment it's pressed. For 1.5 s after, reports of the old state
+  // were sent before the press took effect and are ignored; the PC confirms within ~300 ms.
+  const playbackRef = useRef<PlaybackState>('unavailable');
+  const expectedPlaybackRef = useRef<{ state: PlaybackState; until: number } | null>(null);
   const [deckConfig, setDeckConfig] = useState<DeckConfig | null>(null);
   const [independentNavigation, setIndependentNavigation] = useState(false);
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
   const [selectedPageId, setSelectedPageId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<ConnectionContextValue['actionError']>(null);
+
+  useEffect(() => { playbackRef.current = playbackState; }, [playbackState]);
+  // The playback state to show for a report from the PC, or null to keep the pressed state.
+  const settlePlayback = (reported: PlaybackState): PlaybackState | null => {
+    const expected = expectedPlaybackRef.current;
+    if (!expected) return reported;
+    if (Date.now() > expected.until) { expectedPlaybackRef.current = null; return reported; }
+    return reported === expected.state ? reported : null;
+  };
 
   const persistPairedDevices = useCallback((devices: PcConnection[]) => {
     pairedDevicesRef.current = devices;
@@ -203,6 +238,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
       setPlaybackState('unavailable');
       setMediaState(EMPTY_MEDIA_STATE);
       setActionError(null);
+      clearPcStats();
     }
 
     const retry = () => {
@@ -254,8 +290,18 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
             reconnectAttemptRef.current = 0;
             setStatus('connected');
             if (widgetSurfaceRef.current) socket.send(JSON.stringify({ type: 'widget_surface', surface: widgetSurfaceRef.current }));
+            // The PC samples only the readings the stats widgets on screen show.
+            setPcStatsSender((needs) => { if (socketRef.current === socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'pc_stats_subscribe', needs })); });
           }
-          if (message.type === 'playback_state' && typeof message.state === 'string' && ['playing', 'paused', 'stopped', 'unavailable'].includes(message.state)) setPlaybackState(message.state as PlaybackState);
+          if (message.type === 'playback_state' && typeof message.state === 'string' && ['playing', 'paused', 'stopped', 'unavailable'].includes(message.state)) {
+            // This check runs every 500 ms (100 ms after a control), faster than the media state, so
+            // it also updates Now Playing's play/pause.
+            const settled = settlePlayback(message.state as PlaybackState);
+            if (settled) {
+              setPlaybackState(settled);
+              setMediaState((current) => current.playbackState === settled || current.playbackState === 'unavailable' ? current : { ...current, playbackState: settled });
+            }
+          }
           if (message.type === 'media_state') {
             const state = message.state;
             if (!state || typeof state !== 'object' || Array.isArray(state)) {
@@ -266,27 +312,30 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
               const number = (key: string) => typeof value[key] === 'number' && Number.isFinite(value[key]) && (value[key] as number) >= 0 && (value[key] as number) <= 86_400_000 ? value[key] as number : undefined;
               const playback = value.playbackState;
               const artwork = text('artworkDataUrl', 2_800_000);
-              setMediaState({
+              const reported: PlaybackState = typeof playback === 'string' && ['playing', 'paused', 'stopped', 'unavailable'].includes(playback) ? playback as PlaybackState : 'unavailable';
+              const settled = settlePlayback(reported);
+              setMediaState((current) => ({
                 sourceAppId: text('sourceAppId', 256),
                 title: text('title', 512),
                 artist: text('artist', 512),
                 album: text('album', 512),
-                playbackState: typeof playback === 'string' && ['playing', 'paused', 'stopped', 'unavailable'].includes(playback) ? playback as PlaybackState : 'unavailable',
+                playbackState: settled ?? current.playbackState,
                 positionMs: number('positionMs'),
                 durationMs: number('durationMs'),
                 volumePercent: typeof value.volumePercent === 'number' && Number.isFinite(value.volumePercent) && value.volumePercent >= 0 && value.volumePercent <= 100 ? Math.round(value.volumePercent) : undefined,
                 canSeek: value.canSeek === true,
                 playbackRate: playbackRate(value.playbackRate),
                 artworkDataUrl: artwork && /^data:image\/(png|jpeg|webp|gif);base64,[A-Za-z0-9+/]+=*$/.test(artwork) ? artwork : undefined,
-              });
+              }));
             }
           }
+          if (message.type === 'pc_stats') receivePcStats(message as { history?: unknown; stats?: unknown });
           if (message.type === 'media_progress') {
             const progress = message as { playbackState?: unknown; positionMs?: unknown; durationMs?: unknown; volumePercent?: unknown; playbackRate?: unknown };
             const finiteTime = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 86_400_000 ? value : undefined;
             setMediaState((current) => ({
               ...current,
-              playbackState: typeof progress.playbackState === 'string' && ['playing', 'paused', 'stopped', 'unavailable'].includes(progress.playbackState) ? progress.playbackState as PlaybackState : current.playbackState,
+              playbackState: typeof progress.playbackState === 'string' && ['playing', 'paused', 'stopped', 'unavailable'].includes(progress.playbackState) ? settlePlayback(progress.playbackState as PlaybackState) ?? current.playbackState : current.playbackState,
               positionMs: finiteTime(progress.positionMs),
               durationMs: finiteTime(progress.durationMs),
               playbackRate: playbackRate(progress.playbackRate),
@@ -350,6 +399,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
       socket.onclose = () => {
         if (socketRef.current !== socket) return;
         socketRef.current = null;
+        setPcStatsSender(null);
         pendingRequestsRef.current.clear();
         if (shouldReconnectRef.current) retry();
         else if (!terminalErrorRef.current) setStatus('disconnected');
@@ -464,8 +514,25 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
     }
     return true;
   }, [deckConfig, status]);
-  const sendButton = useCallback((buttonId: string) => sendRequest('invoke_button', 'buttonId', buttonId), [sendRequest]);
-  const sendMediaCommand = useCallback((command: DeckMediaCommand) => sendRequest('invoke_media_command', 'command', command), [sendRequest]);
+  // Shows a play/pause press immediately; the PC's report confirms it (see settlePlayback).
+  const showPlayPausePressed = useCallback(() => {
+    const now = playbackRef.current;
+    if (now === 'unavailable') return;
+    const next: PlaybackState = now === 'playing' ? 'paused' : 'playing';
+    expectedPlaybackRef.current = { state: next, until: Date.now() + 1500 };
+    setPlaybackState(next);
+    setMediaState((current) => ({ ...current, playbackState: next }));
+  }, []);
+  const sendButton = useCallback((buttonId: string) => {
+    const sent = sendRequest('invoke_button', 'buttonId', buttonId);
+    if (sent && deckConfig && isPlayPauseButton(deckConfig, buttonId)) showPlayPausePressed();
+    return sent;
+  }, [sendRequest, deckConfig, showPlayPausePressed]);
+  const sendMediaCommand = useCallback((command: DeckMediaCommand) => {
+    const sent = sendRequest('invoke_media_command', 'command', command);
+    if (sent && command === 'play_pause') showPlayPausePressed();
+    return sent;
+  }, [sendRequest, showPlayPausePressed]);
   const sendSystemVolume = useCallback((volumePercent: number) => sendRequest('set_system_volume', 'volumePercent', Math.round(Math.max(0, Math.min(100, volumePercent)))), [sendRequest]);
   const seekMedia = useCallback((positionMs: number) => sendRequest('seek_media', 'positionMs', Math.round(Math.max(0, positionMs))), [sendRequest]);
   const selectProfile = useCallback((profileId: string) => sendRequest('select_profile', 'profileId', profileId), [sendRequest]);

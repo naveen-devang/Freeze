@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     Arc, RwLock,
 };
 use std::thread;
@@ -29,6 +29,7 @@ use tauri::{
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
+mod pc_stats;
 mod system_media;
 
 const PORT: u16 = 39421;
@@ -44,6 +45,14 @@ struct AppState {
     deck_config: RwLock<DeckConfig>,
     deck_updates: broadcast::Sender<DeckConfig>,
     media_state: tokio::sync::watch::Sender<system_media::SystemMediaState>,
+    /// Wakes the media monitor right after a control (play/pause, seek, volume) so the new state
+    /// reaches the phone in a few hundred ms instead of on the next 1 s poll.
+    media_refresh: Arc<tokio::sync::Notify>,
+    pc_stats: tokio::sync::watch::Sender<pc_stats::PcStatsHistory>,
+    /// Which readings each phone connection and the desktop editor want sampled.
+    pc_stats_demand: Arc<pc_stats::Demand>,
+    /// Ids for phone connections in `pc_stats_demand`.
+    next_connection: AtomicU64,
     independent_navigation: AtomicBool,
     navigation_updates: broadcast::Sender<bool>,
     auto_profile_updates: broadcast::Sender<String>,
@@ -184,12 +193,18 @@ struct DeckWidget {
     render_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     values: Option<HashMap<String, String>>,
-    /// Clock face id; one of CLOCK_FACES. Missing means the Digital face.
+    /// Clock face id (one of CLOCK_FACES; missing means Digital) or PC stats style id (one of PC_STATS_STYLES).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     face: Option<String>,
-    /// Clock face colour as #rrggbb, for faces that take one.
+    /// Clock face or PC stats colour as #rrggbb.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     color: Option<String>,
+    /// PC stats reading; one of PC_STATS_METRICS. Missing means CPU load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metric: Option<String>,
+    /// GPU a PC stats widget follows: an id from pc_stats (e.g. "10de-1f15-14421025-0"). Missing means automatic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gpu: Option<String>,
 }
 
 /// Face ids defined in pc-companion/src/clock-faces/clock-faces.js (scripts/check-clock-faces.ts keeps them in sync).
@@ -197,6 +212,13 @@ const CLOCK_FACES: &[&str] = &[
     "digital", "analog", "flip", "glow", "word", "poster", "nixie", "led", "crt", "pong", "slots", "tape", "tide", "sky",
     "aurora", "lava", "sand", "pendulum", "orbit", "clockclock", "ferro", "swarm", "rings", "radar", "fibonacci", "strips",
 ];
+
+/// Style and reading ids defined in pc-companion/src/pc-stats/pc-stats.js (scripts/check-pc-stats.ts keeps them in sync).
+const PC_STATS_STYLES: &[&str] = &[
+    "ring", "number", "fill", "dial", "spark", "segments", "area", "pair", "graph", "gauge", "columns", "heat", "strip",
+    "overview", "monitor", "cores",
+];
+const PC_STATS_METRICS: &[&str] = &["cpu", "cputemp", "gpu", "gputemp", "ram", "vram", "disk", "diskio", "net", "power"];
 
 fn valid_hex_color(value: &str) -> bool {
     value.len() == 7 && value.starts_with('#') && value[1..].chars().all(|c| c.is_ascii_hexdigit())
@@ -208,6 +230,7 @@ enum DeckWidgetType {
     Clock,
     NowPlaying,
     Lyrics,
+    PcStats,
     Plugin,
 }
 
@@ -682,25 +705,38 @@ fn validate_page_layout(page: &DeckPage) -> Result<(), String> {
 }
 
 fn validate_deck_widget(widget: &DeckWidget) -> Result<(), String> {
-    if widget.kind != DeckWidgetType::Clock && (widget.face.is_some() || widget.color.is_some()) {
-        return Err("Only clock widgets have a face or colour".into());
-    }
-    if widget.face.as_deref().is_some_and(|face| !CLOCK_FACES.contains(&face)) {
-        return Err("Unknown clock face".into());
+    let faces = match widget.kind {
+        DeckWidgetType::Clock => CLOCK_FACES,
+        DeckWidgetType::PcStats => PC_STATS_STYLES,
+        _ if widget.face.is_some() || widget.color.is_some() => {
+            return Err("Only clock and PC stats widgets have a style or colour".into());
+        }
+        _ => &[],
+    };
+    if widget.face.as_deref().is_some_and(|face| !faces.contains(&face)) {
+        return Err("Unknown widget style".into());
     }
     if widget.color.as_deref().is_some_and(|color| !valid_hex_color(color)) {
-        return Err("Clock colours must be #rrggbb".into());
+        return Err("Widget colours must be #rrggbb".into());
+    }
+    if widget.metric.as_deref().is_some_and(|metric| {
+        widget.kind != DeckWidgetType::PcStats || !PC_STATS_METRICS.contains(&metric)
+    }) {
+        return Err("Unknown PC stats reading".into());
+    }
+    if widget.gpu.as_deref().is_some_and(|gpu| {
+        widget.kind != DeckWidgetType::PcStats
+            || gpu.is_empty()
+            || gpu.len() > 48
+            || !gpu.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    }) {
+        return Err("Unknown PC stats GPU".into());
     }
     match widget.kind {
         DeckWidgetType::Clock
-            if widget.plugin_id.is_none()
-                && widget.widget_id.is_none()
-                && widget.render_type.is_none()
-                && widget.values.is_none() =>
-        {
-            Ok(())
-        }
-        DeckWidgetType::NowPlaying | DeckWidgetType::Lyrics
+        | DeckWidgetType::NowPlaying
+        | DeckWidgetType::Lyrics
+        | DeckWidgetType::PcStats
             if widget.plugin_id.is_none()
                 && widget.widget_id.is_none()
                 && widget.render_type.is_none()
@@ -735,9 +771,10 @@ fn validate_deck_widget(widget: &DeckWidget) -> Result<(), String> {
             }
             Ok(())
         }
-        DeckWidgetType::Clock | DeckWidgetType::NowPlaying | DeckWidgetType::Lyrics => {
-            Err("Built-in widgets cannot contain plugin metadata".into())
-        }
+        DeckWidgetType::Clock
+        | DeckWidgetType::NowPlaying
+        | DeckWidgetType::Lyrics
+        | DeckWidgetType::PcStats => Err("Built-in widgets cannot contain plugin metadata".into()),
     }
 }
 
@@ -1587,6 +1624,10 @@ enum ClientMessage {
     WidgetSurface {
         surface: WidgetSurface,
     },
+    /// The readings the PC stats widgets on the phone's current page show; empty stops them.
+    PcStatsSubscribe {
+        needs: Vec<String>,
+    },
     SeekMedia {
         #[serde(rename = "requestId")]
         request_id: String,
@@ -1610,6 +1651,29 @@ enum SequenceAction {
     LaunchApp { app: String },
     LaunchFile { path: String },
     LaunchFolder { path: String },
+}
+
+/// PC stats samples for the desktop previews, oldest first: the last minute, or only those after
+/// `since` (a sample's `seq`). `needs` lists the readings the previews on screen show; the request
+/// keeps them sampled for 3 seconds, so previews poll while visible and sampling stops when they go.
+#[tauri::command]
+fn pc_stats_history(
+    state: tauri::State<'_, Arc<AppState>>,
+    needs: Vec<String>,
+    since: Option<u64>,
+) -> Vec<pc_stats::PcStats> {
+    state.pc_stats_demand.set(
+        pc_stats::DESKTOP,
+        pc_stats::Needs::from_names(&needs[..needs.len().min(16)]),
+        Some(Duration::from_secs(3)),
+    );
+    let history = state.pc_stats.borrow();
+    // A gap (sampling stopped and restarted) means `since` no longer lines up: send it all.
+    let newest = history.back().map_or(0, |sample| sample.seq);
+    match since {
+        Some(since) if since <= newest => history.iter().filter(|sample| sample.seq > since).cloned().collect(),
+        _ => history.iter().cloned().collect(),
+    }
 }
 
 #[tauri::command]
@@ -2482,8 +2546,17 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let mut auto_profile_updates = state.auto_profile_updates.subscribe();
     let mut legacy_requests = state.legacy_requests.subscribe();
     let mut legacy_source_id: Option<String> = None;
-    let mut playback_updates = tokio::time::interval(Duration::from_millis(500));
+    // Playback state is checked every 500 ms, and every 100 ms for 2 s after this phone sends a
+    // control, so the play/pause button settles quickly.
+    let mut next_playback_check = tokio::time::Instant::now();
+    let mut fast_checks_until = tokio::time::Instant::now();
     let mut last_playback_state = None;
+    let mut pc_stats_updates = state.pc_stats.subscribe();
+    // The readings this phone's visible stats widgets show (it sends pc_stats_subscribe), and whether
+    // it has had the whole minute since asking.
+    let connection_id = state.next_connection.fetch_add(1, Ordering::Relaxed);
+    let mut pc_stats_needs = pc_stats::Needs::default();
+    let mut pc_stats_history_sent = false;
     loop {
         let incoming = tokio::select! {
             message = socket.recv() => message,
@@ -2570,7 +2643,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 }
                 continue;
             }
-            _ = playback_updates.tick(), if authenticated => {
+            _ = tokio::time::sleep_until(next_playback_check), if authenticated => {
+                let now = tokio::time::Instant::now();
+                next_playback_check = now + if now < fast_checks_until { Duration::from_millis(100) } else { Duration::from_millis(500) };
                 if state.session_epoch.load(Ordering::Relaxed) != session_epoch {
                     break;
                 }
@@ -2581,6 +2656,23 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                         break;
                     }
                     last_playback_state = Some(playback_state);
+                }
+                continue;
+            }
+            changed = pc_stats_updates.changed(), if authenticated => {
+                if changed.is_err() { break; }
+                let history = pc_stats_updates.borrow_and_update().clone();
+                if pc_stats_needs == pc_stats::Needs::default() || history.is_empty() {
+                    continue;
+                }
+                let message = if pc_stats_history_sent {
+                    serde_json::json!({ "type": "pc_stats", "stats": history.back().map(pc_stats::PcStats::for_phone) })
+                } else {
+                    serde_json::json!({ "type": "pc_stats", "history": history.iter().map(pc_stats::PcStats::for_phone).collect::<Vec<_>>() })
+                };
+                pc_stats_history_sent = true;
+                if socket.send(Message::Text(message.to_string().into())).await.is_err() {
+                    break;
                 }
                 continue;
             }
@@ -2781,6 +2873,12 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 };
                 let stale_revision = matches!(&result, Err(error) if error == "stale_revision");
                 let changed_selection = matches!(&result, Ok(true));
+                // A button may be a media key (play/pause on the grid): show its effect quickly.
+                if result.is_ok() {
+                    state.media_refresh.notify_one();
+                    fast_checks_until = tokio::time::Instant::now() + Duration::from_secs(2);
+                    next_playback_check = tokio::time::Instant::now() + Duration::from_millis(60);
+                }
                 let reply = match result {
                     Ok(_) => {
                         serde_json::json!({ "type": "action_result", "requestId": request_id, "ok": true })
@@ -2849,6 +2947,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 } else {
                     Err("invalid_request".to_owned())
                 };
+                if result.is_ok() {
+                    state.media_refresh.notify_one();
+                    fast_checks_until = tokio::time::Instant::now() + Duration::from_secs(2);
+                    next_playback_check = tokio::time::Instant::now() + Duration::from_millis(60);
+                }
                 let reply = match result {
                     Ok(()) => {
                         serde_json::json!({ "type": "action_result", "requestId": request_id, "ok": true })
@@ -2874,6 +2977,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 } else {
                     Err("invalid_request".to_owned())
                 };
+                if result.is_ok() {
+                    state.media_refresh.notify_one();
+                    fast_checks_until = tokio::time::Instant::now() + Duration::from_secs(2);
+                    next_playback_check = tokio::time::Instant::now() + Duration::from_millis(60);
+                }
                 let reply = match result {
                     Ok(()) => {
                         serde_json::json!({ "type": "action_result", "requestId": request_id, "ok": true })
@@ -3036,6 +3144,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 } else {
                     Err("invalid_request".to_owned())
                 };
+                if result.is_ok() {
+                    state.media_refresh.notify_one();
+                    fast_checks_until = tokio::time::Instant::now() + Duration::from_secs(2);
+                    next_playback_check = tokio::time::Instant::now() + Duration::from_millis(60);
+                }
                 let reply = match result {
                     Ok(()) => {
                         serde_json::json!({ "type": "action_result", "requestId": request_id, "ok": true })
@@ -3051,6 +3164,12 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 {
                     break;
                 }
+            }
+            ClientMessage::PcStatsSubscribe { needs } if authenticated => {
+                pc_stats_needs = pc_stats::Needs::from_names(&needs[..needs.len().min(16)]);
+                state.pc_stats_demand.set(connection_id, pc_stats_needs, None);
+                // The next message carries the whole minute so graphs start full.
+                pc_stats_history_sent = false;
             }
             ClientMessage::WidgetSurface { surface } if authenticated => {
                 if surface.is_valid() {
@@ -3110,6 +3229,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     if authenticated {
         state.active_devices.fetch_sub(1, Ordering::Relaxed);
     }
+    // This phone no longer needs any readings.
+    state.pc_stats_demand.remove(connection_id);
     if let Some(source_id) = legacy_source_id {
         if let Ok(mut offers) = state.legacy_offers.write() {
             if let Some(offer) = offers.get_mut(&source_id) {
@@ -3783,6 +3904,7 @@ pub fn run() {
     let (deck_updates, _) = broadcast::channel(16);
     let (media_state, _) =
         tokio::sync::watch::channel(system_media::SystemMediaState::unavailable());
+    let (pc_stats, _) = tokio::sync::watch::channel(pc_stats::PcStatsHistory::default());
     let (legacy_requests, _) = broadcast::channel(16);
     let (navigation_updates, _) = broadcast::channel(16);
     let (auto_profile_updates, _) = broadcast::channel(16);
@@ -3794,6 +3916,10 @@ pub fn run() {
         deck_config: RwLock::new(default_deck_config()),
         deck_updates,
         media_state,
+        media_refresh: Arc::new(tokio::sync::Notify::new()),
+        pc_stats,
+        pc_stats_demand: Arc::new(pc_stats::Demand::default()),
+        next_connection: AtomicU64::new(1),
         independent_navigation: AtomicBool::new(false),
         navigation_updates,
         auto_profile_updates,
@@ -3821,6 +3947,7 @@ pub fn run() {
             save_deck_config,
             get_playback_state,
             get_system_media_state,
+            pc_stats_history,
             extract_app_icon,
             extract_file_thumbnail,
             pending_legacy_imports,
@@ -3892,8 +4019,11 @@ pub fn run() {
 
             system_media::spawn_system_media_monitor(
                 state.media_state.clone(),
+                state.media_refresh.clone(),
                 app.handle().clone(),
             );
+
+            pc_stats::spawn_pc_stats_monitor(state.pc_stats.clone(), state.pc_stats_demand.clone());
 
             tauri::async_runtime::spawn(serve(state));
             let open = MenuItem::with_id(app, "open", "Open Freeze", true, None::<&str>)?;
@@ -3942,4 +4072,27 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running Freeze");
+}
+
+#[cfg(all(test, windows))]
+mod playback_timing {
+    /// Times the media calls the app makes every second: `cargo test --lib playback_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "talks to this PC's media session"]
+    fn media_call_costs() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            for (label, runs) in [("current_playback_state", 20), ("read_system_volume", 20)] {
+                let started = std::time::Instant::now();
+                for _ in 0..runs {
+                    if label == "read_system_volume" {
+                        let _ = super::system_media::read_system_volume();
+                    } else {
+                        let _ = super::current_playback_state().await;
+                    }
+                }
+                println!("{label}: {:.1} ms per call", started.elapsed().as_secs_f64() * 1000.0 / runs as f64);
+            }
+        });
+    }
 }

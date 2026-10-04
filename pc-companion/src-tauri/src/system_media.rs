@@ -52,7 +52,13 @@ impl SystemMediaState {
     }
 }
 
-pub(super) fn spawn_system_media_monitor(updates: watch::Sender<SystemMediaState>, app: AppHandle) {
+/// Polls the system media session once a second, and every 150 ms for 2 s after `refresh` fires
+/// (a control was just sent), so play/pause and track changes show up quickly.
+pub(super) fn spawn_system_media_monitor(
+    updates: watch::Sender<SystemMediaState>,
+    refresh: std::sync::Arc<tokio::sync::Notify>,
+    app: AppHandle,
+) {
     tauri::async_runtime::spawn(async move {
         #[cfg(windows)]
         let mut manager = None;
@@ -63,6 +69,7 @@ pub(super) fn spawn_system_media_monitor(updates: watch::Sender<SystemMediaState
         #[cfg(windows)]
         let mut last_artwork_attempt = None;
         let mut last_media_content: Option<SystemMediaState> = None;
+        let mut fast_until = std::time::Instant::now();
 
         loop {
             let snapshot = read_system_media_state(
@@ -104,7 +111,17 @@ pub(super) fn spawn_system_media_monitor(updates: watch::Sender<SystemMediaState
                     );
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let wait = if std::time::Instant::now() < fast_until {
+                std::time::Duration::from_millis(150)
+            } else {
+                std::time::Duration::from_secs(1)
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = refresh.notified() => {
+                    fast_until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                }
+            }
         }
     });
 }

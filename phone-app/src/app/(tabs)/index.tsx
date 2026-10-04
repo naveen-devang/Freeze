@@ -11,6 +11,7 @@ import { DeckButton, DeckMediaCommand, DeckWidget, PlaybackState, SystemMediaSta
 import { nowPlayingLayout, NowPlayingRow } from '../../now-playing-layout';
 import { ClockFaceWidget } from '../../clock-face-widget';
 import { LyricsWidget } from '../../lyrics-widget';
+import { PcStatsWidget } from '../../pc-stats-widget';
 import { buttonPlacement, deckOccupancy, widgetPageOccupancy, WidgetScreenItem } from '../../deck-layout';
 import { colors } from '../../theme';
 import { TabBarHiddenContext } from '../../navigation/tab-bar-context';
@@ -499,7 +500,7 @@ export default function DeckScreen() {
               if (item.type === 'widget') {
                 const placement = item.widget.placement;
                 if (placement.row !== sourceRow || placement.column !== sourceColumn) return null;
-                return <View key={item.widget.id} style={[styles.immersiveKey, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12, 0)]}>{item.widget.type === 'clock' ? <ClockFaceWidget face={item.widget.face} color={item.widget.color} /> : item.widget.type === 'now_playing' ? <NowPlayingWidget media={mediaState} connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} seekMedia={seekMedia} /> : item.widget.type === 'lyrics' ? <LyricsWidget media={mediaState} connected={connected} seekMedia={seekMedia} /> : <PluginTextWidget widget={item.widget} immersive />}</View>;
+                return <View key={item.widget.id} style={[styles.immersiveKey, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12, 0)]}>{item.widget.type === 'clock' ? <ClockFaceWidget face={item.widget.face} color={item.widget.color} /> : item.widget.type === 'pc_stats' ? <PcStatsWidget face={item.widget.face} metric={item.widget.metric} color={item.widget.color} gpu={item.widget.gpu} columns={placement.columnSpan} rows={placement.rowSpan} /> : item.widget.type === 'now_playing' ? <NowPlayingWidget media={mediaState} connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} seekMedia={seekMedia} /> : item.widget.type === 'lyrics' ? <LyricsWidget media={mediaState} connected={connected} seekMedia={seekMedia} /> : <PluginTextWidget widget={item.widget} immersive />}</View>;
               }
               const button = item.button;
               const placement = buttonPlacement({ id: widgetScreen.id, name: widgetScreen.name, rows: widgetRows, columns: widgetColumns, buttons: widgetScreen.buttons }, button);
@@ -603,7 +604,7 @@ export default function DeckScreen() {
               if (item.type === 'widget') {
                 const placement = item.widget.placement;
                 if (placement.row !== sourceRow || placement.column !== sourceColumn) return null;
-                return <View key={item.widget.id} style={[styles.key, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, widgetCellWidth, widgetCellHeight)]}>{item.widget.type === 'clock' ? <ClockFaceWidget face={item.widget.face} color={item.widget.color} /> : item.widget.type === 'now_playing' ? <NowPlayingWidget media={mediaState} connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} seekMedia={seekMedia} /> : item.widget.type === 'lyrics' ? <LyricsWidget media={mediaState} connected={connected} seekMedia={seekMedia} /> : <PluginTextWidget widget={item.widget} />}</View>;
+                return <View key={item.widget.id} style={[styles.key, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, widgetCellWidth, widgetCellHeight)]}>{item.widget.type === 'clock' ? <ClockFaceWidget face={item.widget.face} color={item.widget.color} /> : item.widget.type === 'pc_stats' ? <PcStatsWidget face={item.widget.face} metric={item.widget.metric} color={item.widget.color} gpu={item.widget.gpu} columns={placement.columnSpan} rows={placement.rowSpan} /> : item.widget.type === 'now_playing' ? <NowPlayingWidget media={mediaState} connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} seekMedia={seekMedia} /> : item.widget.type === 'lyrics' ? <LyricsWidget media={mediaState} connected={connected} seekMedia={seekMedia} /> : <PluginTextWidget widget={item.widget} />}</View>;
               }
               const button = item.button;
               const placement = buttonPlacement({ id: widgetScreen.id, name: widgetScreen.name, rows: widgetRows, columns: widgetColumns, buttons: widgetScreen.buttons }, button);

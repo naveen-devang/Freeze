@@ -11,8 +11,11 @@ type FreezeClockApi = {
 };
 
 export const FreezeClock = (globalThis as unknown as { FreezeClock: FreezeClockApi }).FreezeClock;
-// Same cap as the phone: smooth enough for every face and half the work of 60 fps.
-FreezeClock.setFrameRate(30);
+// Editor previews are thumbnails: 15 fps keeps motion readable at a quarter of the work of 60 fps.
+// The phone draws the real widget at 30.
+FreezeClock.setFrameRate(15);
+// Nothing animates while the Freeze window is hidden or minimised.
+document.addEventListener('visibilitychange', () => FreezeClock.setPaused(document.hidden));
 export const CLOCK_CATEGORIES: [ClockCategory, string][] = [['classic', 'Classic'], ['retro', 'Retro'], ['ambient', 'Ambient'], ['kinetic', 'Kinetic']];
 export const CLOCK_COLOR_PRESETS = ['#93c5fd', '#f472b6', '#fb923c', '#facc15', '#4ade80', '#2dd4bf', '#a78bfa', '#f4f4f5'];
 export const DEFAULT_CLOCK_COLOR = '#93c5fd';

@@ -1,0 +1,50 @@
+# Builds and tests the PC companion's sensor code on Windows and macOS, and checks the shared PC stats
+# widgets render in every GPU scenario. The live sample runs the real sensor sources on each runner
+# (no physical GPU there, so it proves they start, read and fall back without crashing).
+name: PC stats
+
+on:
+  push:
+    paths: ['pc-companion/**', 'phone-app/src/pc-stats*', 'scripts/*pc-stats*', '.github/workflows/pc-stats.yml']
+  pull_request:
+    paths: ['pc-companion/**', 'phone-app/src/pc-stats*', 'scripts/*pc-stats*', '.github/workflows/pc-stats.yml']
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: pc-companion
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'x86_64-apple-darwin' || '' }}
+      # Tauri's build script needs the built frontend.
+      - run: npm ci && npx vite build
+      - run: cargo test --lib
+        working-directory: pc-companion/src-tauri
+      - run: cargo test --lib live_sample -- --ignored --nocapture
+        working-directory: pc-companion/src-tauri
+      - name: Type-check for Intel Macs
+        if: matrix.os == 'macos-latest'
+        run: cargo check --target x86_64-apple-darwin
+        working-directory: pc-companion/src-tauri
+
+  widgets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      # Ubuntu runners ship Google Chrome, which the render check drives headless.
+      - run: node scripts/check-pc-stats.ts
+      - run: node scripts/check-clock-faces.ts
