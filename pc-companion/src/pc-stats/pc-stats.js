@@ -310,7 +310,8 @@ const STYLES = [
       <g class="needle" style="transform-origin:${cx}px ${cy}px"><line x1="${cx}" y1="${cy}" x2="${cx}" y2="${cy - r * 0.62}" stroke="var(--fg)" stroke-width="2" stroke-linecap="round"/></g>
       <circle cx="${cx}" cy="${cy}" r="${clamp(s * 0.04, 2, 5)}" fill="var(--fg)"/></svg>`;
     const a = q('.arcv', svg), nd = q('.needle', svg);
-    const bw = r * 1.2, by = cy + r * 0.34, bh = y0 + s - by;
+    // The arc ends at ±0.87r below the hub, so the reading can be that wide less the stroke.
+    const bw = Math.max(r * 1.2, 2 * (0.866 * r - sw)), by = cy + r * 0.34, bh = y0 + s - by;
     const text = side ? readout(el, k, beside.textW, h - 2 * p, { x: beside.textX, y: p, detail: true }) : readout(el, k, bw, bh, { x: cx - bw / 2, y: by, align: 'center' });
     return () => { setArc(a, k); nd.style.transform = `rotate(${-120 + frac(k) * 240}deg)`; text.update(); };
   } },
