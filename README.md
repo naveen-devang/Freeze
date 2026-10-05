@@ -2,6 +2,14 @@
 
 Phone control deck and local PC companion.
 
+## Download
+
+Get the latest installers from the [Releases page](https://github.com/naveen-devang/Freeze/releases/latest). After the first install, Freeze updates itself.
+
+- **Windows:** `Freeze_*_x64-setup.exe`. Windows may say "Windows protected your PC" because the installer isn't signed; choose **More info → Run anyway**.
+- **macOS:** `Freeze_*_aarch64.dmg` for Apple silicon (M1 and later) or `Freeze_*_x64.dmg` for Intel. The app isn't notarized by Apple, so the first time, open **System Settings → Privacy & Security** and choose **Open Anyway** (on macOS 14 and earlier, right-click the app and choose **Open**).
+- **Android:** `Freeze.apk`. Allow installs from your browser or file manager when Android asks.
+
 ## Run the PC companion (Windows or macOS)
 
 ```powershell
@@ -35,3 +43,7 @@ The app uses the React Native WebSocket API and the companion protocol documente
 Run `bash scripts/setup-release-signing.sh` once to create the signing keys and store them as GitHub Actions secrets. Back up `~/.freeze-signing`: installed apps can't update without those keys.
 
 To ship, run `node scripts/bump-version.ts 1.2.0`, commit, then `git tag v1.2.0 && git push origin v1.2.0`. The **Release** workflow builds Windows, macOS and Android into a draft GitHub release. Publish the draft to make it the latest release.
+
+## License
+
+Freeze is free software under the [GNU General Public License v3.0](LICENSE). `phone-app/` also contains files from Expo's app template, which are MIT licensed (`phone-app/LICENSE`). macOS release builds bundle [mediaremote-adapter](https://github.com/ungive/mediaremote-adapter) (BSD-3-Clause).
