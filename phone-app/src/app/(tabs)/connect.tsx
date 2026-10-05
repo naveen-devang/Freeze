@@ -6,6 +6,7 @@ import { Camera, Check, ChevronDown, ChevronRight, Monitor, QrCode, RefreshCw, S
 import { connectionId, PcConnection, usePcConnection } from '../../connection';
 import { colors } from '../../theme';
 import { ScreenSettingsSection } from '../../screen-power';
+import { AppUpdatesSection } from '../../app-updates';
 
 type PairingCode = PcConnection & { type: 'freeze-pair'; version: 1 };
 
@@ -184,6 +185,7 @@ export default function ConnectScreen() {
           </View>
 
           <ScreenSettingsSection />
+          <AppUpdatesSection />
 
           <View style={styles.localNote}><ShieldCheck size={15} color={colors.muted} /><Text style={styles.localNoteText}>{connection?.transport === 'usb' ? 'Direct Android USB connection through authorized USB debugging.' : 'Direct connection over your local Wi-Fi. Use a trusted network.'}</Text></View>
           {!permission?.granted && !scanning && <View style={styles.permissionNote}><Camera size={14} color={colors.faint} /><Text style={styles.permissionText}>Camera access is only used to scan the pairing code.</Text></View>}

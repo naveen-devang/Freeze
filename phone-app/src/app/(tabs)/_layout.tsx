@@ -1,9 +1,11 @@
 import { useState } from 'react';
 import { NativeTabs } from 'expo-router/unstable-native-tabs';
 import { TabBarHiddenContext } from '../../navigation/tab-bar-context';
+import { useUpdateBadge } from '../../app-updates';
 
 export default function TabLayout() {
   const [hidden, setHidden] = useState(false);
+  const updateWaiting = useUpdateBadge();
 
   return (
     <TabBarHiddenContext.Provider value={setHidden}>
@@ -18,6 +20,7 @@ export default function TabLayout() {
         <NativeTabs.Trigger name="connect">
           <NativeTabs.Trigger.Icon sf="wifi" md="wifi" />
           <NativeTabs.Trigger.Label>Connect</NativeTabs.Trigger.Label>
+          <NativeTabs.Trigger.Badge hidden={!updateWaiting}>1</NativeTabs.Trigger.Badge>
         </NativeTabs.Trigger>
         <NativeTabs.Trigger name="edit">
           <NativeTabs.Trigger.Icon sf="square.stack.3d.up" md="layers" />
