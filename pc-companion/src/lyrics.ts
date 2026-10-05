@@ -426,7 +426,7 @@ const VIDEO_EXTRA_S = 8;
 
 const seconds = (milliseconds: number) => `${(milliseconds / 1000).toFixed(1)} s`;
 
-function sungSpan(lines: LyricLine[]) {
+export function sungSpan(lines: LyricLine[]) {
   const sung = lines.filter((line) => !isGapLine(line));
   return { firstMs: sung[0]?.timeMs ?? 0, lastMs: sung[sung.length - 1]?.timeMs ?? 0 };
 }
@@ -441,6 +441,21 @@ export function timingVersions(all: LyricLine[][]): TimingVersion[] {
     else versions.push({ lines, firstMs, lastMs, entries: 1 });
   }
   return versions.sort((a, b) => b.entries - a.entries || a.firstMs - b.firstMs);
+}
+
+// The timing version nearest to a first and last sung line (the last only when known), or none within the
+// grouping tolerance. Two versions can open together and differ by seconds at the end, so both lines count.
+export function nearestVersion(versions: TimingVersion[], firstMs: number, lastMs?: number): TimingVersion | undefined {
+  let nearest: TimingVersion | undefined;
+  let nearestGap = Infinity;
+  for (const version of versions) {
+    const firstGap = Math.abs(version.firstMs - firstMs);
+    const lastGap = lastMs === undefined ? 0 : Math.abs(version.lastMs - lastMs);
+    if (firstGap > VERSION_TOLERANCE_MS || lastGap > VERSION_TOLERANCE_MS || firstGap + lastGap >= nearestGap) continue;
+    nearest = version;
+    nearestGap = firstGap + lastGap;
+  }
+  return nearest;
 }
 
 const syncedLines = (rated: Rated[]) => rated.flatMap((entry) => entry.lyrics.kind === 'synced' ? [entry.lyrics.lines] : []);

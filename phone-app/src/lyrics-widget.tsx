@@ -3,7 +3,7 @@ import { AccessibilityInfo, Animated, Easing, KeyboardAvoidingView, Modal, PanRe
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import Storage from 'expo-sqlite/kv-store';
 import type { SystemMediaState } from './connection';
-import { activeLineAt, fetchLyrics, isGapLine, lyricLineOpacity, lyricsLayout, lyricsTrace, lyricsTrackKey, withIntroGap, type LyricLine, type Lyrics, type TimingVersion } from './lyrics';
+import { activeLineAt, fetchLyrics, isGapLine, lyricLineOpacity, lyricsLayout, lyricsTrace, lyricsTrackKey, nearestVersion, sungSpan, withIntroGap, type LyricLine, type Lyrics, type TimingVersion } from './lyrics';
 import { Minus, Plus, RefreshCw, X } from 'lucide-react-native';
 import { colors } from './theme';
 
@@ -23,7 +23,9 @@ const NEUTRAL_GAP_MS = 4000;
 // so the previous song's duration cannot immediately select a loose timing for the new title.
 const SETTLE_MS = 1200;
 // Some players publish the duration late or never: wait this long for it, then look up by name alone.
-const MISSING_DURATION_WAIT_MS = 1500;
+// Without a length the lookup can pick another timing of the song (one 16 s off for "Summer Rain"), so a
+// lookup that has to guess shows lyrics that then jump once the length arrives; waiting avoids most of those.
+const MISSING_DURATION_WAIT_MS = 3000;
 // Browsing: a vertical drag scrolls the lyrics, and they stop following the song until this long after the
 // last touch. Meanwhile every line is bright enough to read.
 const BROWSE_RESUME_MS = 3000;
@@ -36,7 +38,7 @@ const clamp = (value: number, min: number, max: number) => Math.max(min, Math.mi
 // Sync fixes the user made for a track: a timing version (named by when its first line is sung) and an
 // offset, where a negative offset shows the lyrics later. Kept on the phone for the latest few hundred tracks.
 // `title` is a song name typed in the panel, for songs the PC reports under a name LRCLIB doesn't use.
-type SyncChoice = { offsetMs: number; versionFirstMs?: number; title?: string };
+type SyncChoice = { offsetMs: number; versionFirstMs?: number; versionLastMs?: number; title?: string };
 type StoredSyncChoice = SyncChoice & { at: number };
 const SYNC_CHOICES_KEY = 'freeze.lyrics-sync';
 const MAX_SYNC_CHOICES = 300;
@@ -44,8 +46,6 @@ const MAX_SYNC_CHOICES = 300;
 const MAX_OFFSET_MS = 10 * 60_000;
 const NUDGE_MS = 500;
 const MAX_TYPED_TITLE = 200;
-// Matches TimingVersion grouping in lyrics.ts: versions this close are the same timing.
-const SAME_VERSION_MS = 400;
 const NO_CHOICE: SyncChoice = { offsetMs: 0 };
 let syncChoices: Promise<Record<string, StoredSyncChoice>> | null = null;
 
@@ -54,6 +54,7 @@ function validChoice(value: unknown): value is StoredSyncChoice {
   const choice = value as Partial<StoredSyncChoice>;
   return typeof choice.offsetMs === 'number' && Number.isFinite(choice.offsetMs) && Math.abs(choice.offsetMs) <= MAX_OFFSET_MS &&
     (choice.versionFirstMs === undefined || (typeof choice.versionFirstMs === 'number' && Number.isFinite(choice.versionFirstMs))) &&
+    (choice.versionLastMs === undefined || (typeof choice.versionLastMs === 'number' && Number.isFinite(choice.versionLastMs))) &&
     (choice.title === undefined || (typeof choice.title === 'string' && choice.title.length <= MAX_TYPED_TITLE)) &&
     typeof choice.at === 'number';
 }
@@ -90,7 +91,7 @@ function useSyncChoice(key: string | null) {
       // A nudge made while this loaded is newer than what was saved.
       if (!alive || latest.current?.key === key) return;
       const saved = choices[key];
-      latest.current = { key, choice: saved ? { offsetMs: saved.offsetMs, versionFirstMs: saved.versionFirstMs, title: saved.title } : NO_CHOICE };
+      latest.current = { key, choice: saved ? { offsetMs: saved.offsetMs, versionFirstMs: saved.versionFirstMs, versionLastMs: saved.versionLastMs, title: saved.title } : NO_CHOICE };
       setLoaded(latest.current);
     });
     return () => { alive = false; };
@@ -494,17 +495,27 @@ export function LyricsWidget({ media, connected, seekMedia }: { media: SystemMed
   const resultKey = key ? `${key}|${typedTitle ?? ''}` : null;
   const [retry, setRetry] = useState(0);
   const [debug, setDebug] = useState(false);
+  // A new song's name can arrive before its length, and until it does the length is the last song's.
+  // `carriedMs` is that previous length: while the reported one still equals it, the length is waited on
+  // like a missing one.
+  const lastSong = useRef<{ identity: string; carriedMs?: number; durationMs?: number } | null>(null);
   // Waits for the track details to settle (longer while the duration is missing), then looks it up.
   // A duration arriving later changes the key, which restarts the wait and looks up again with it.
   useEffect(() => {
     if (!key) return;
+    const identity = key.slice(0, key.lastIndexOf('\u0000'));
+    const before = lastSong.current;
+    const song = before?.identity === identity ? before : { identity, carriedMs: before?.durationMs, durationMs: media.durationMs };
+    song.durationMs = media.durationMs;
+    lastSong.current = song;
+    const carried = media.durationMs !== undefined && media.durationMs === song.carriedMs;
     let alive = true;
     const track = { title: media.title, artist: media.artist, album: media.album, durationMs: media.durationMs };
     const timer = setTimeout(() => {
       void fetchLyrics(track, typedTitle).then((lyrics) => {
         if (alive && resultKey) setResult({ key: resultKey, lyrics });
       });
-    }, media.durationMs ? SETTLE_MS : MISSING_DURATION_WAIT_MS);
+    }, media.durationMs && !carried ? SETTLE_MS : MISSING_DURATION_WAIT_MS);
     return () => {
       alive = false;
       clearTimeout(timer);
@@ -519,16 +530,18 @@ export function LyricsWidget({ media, connected, seekMedia }: { media: SystemMed
   }, [lyrics]);
   const showDebug = useCallback(() => setDebug(true), []);
   const versions = useMemo(() => lyrics !== 'loading' && (lyrics.kind === 'synced' || lyrics.kind === 'plain') ? lyrics.versions ?? [] : [], [lyrics]);
-  const autoFirstMs = lyrics !== 'loading' && lyrics.kind === 'synced' ? firstSungMs(lyrics.lines) : undefined;
+  // Each timing is told apart by its first and last sung lines: two can open together and differ at the end.
+  const autoSpan = lyrics !== 'loading' && lyrics.kind === 'synced' ? sungSpan(lyrics.lines) : undefined;
+  const auto = autoSpan ? nearestVersion(versions, autoSpan.firstMs, autoSpan.lastMs) : undefined;
   // A timing version the user picked wins over the automatic one, even over lyrics shown unsynced.
-  const picked = choice.versionFirstMs === undefined ? undefined : versions.find((version) => Math.abs(version.firstMs - (choice.versionFirstMs ?? 0)) <= SAME_VERSION_MS);
+  const picked = choice.versionFirstMs === undefined ? undefined : nearestVersion(versions, choice.versionFirstMs, choice.versionLastMs);
   const chosenLines = picked?.lines ?? (lyrics !== 'loading' && lyrics.kind === 'synced' ? lyrics.lines : null);
   const lines = useMemo(() => chosenLines ? withIntroGap(chosenLines) : null, [chosenLines]);
   const nudge = useCallback((deltaMs: number) => updateChoice((current) => ({ ...current, offsetMs: current.offsetMs + deltaMs })), [updateChoice]);
-  const pickVersion = useCallback((firstMs: number | undefined) => updateChoice((current) => ({ ...current, versionFirstMs: firstMs })), [updateChoice]);
+  const pickVersion = useCallback((version: TimingVersion | undefined) => updateChoice((current) => ({ ...current, versionFirstMs: version?.firstMs, versionLastMs: version?.lastMs })), [updateChoice]);
   const resetOffset = useCallback(() => updateChoice((current) => ({ ...current, offsetMs: 0 })), [updateChoice]);
   // Another title means another song's entries: an earlier timing pick no longer applies.
-  const searchTitle = useCallback((title: string | undefined) => updateChoice((current) => ({ ...current, title: title?.trim().slice(0, MAX_TYPED_TITLE) || undefined, versionFirstMs: undefined })), [updateChoice]);
+  const searchTitle = useCallback((title: string | undefined) => updateChoice((current) => ({ ...current, title: title?.trim().slice(0, MAX_TYPED_TITLE) || undefined, versionFirstMs: undefined, versionLastMs: undefined })), [updateChoice]);
   const width = size.width || 92;
   const height = size.height || 92;
   const { messageSize } = lyricsLayout(width, height);
@@ -539,7 +552,7 @@ export function LyricsWidget({ media, connected, seekMedia }: { media: SystemMed
   if (!hasMedia) content = <Message title="Nothing playing" size={messageSize} />;
   else if (lyrics === 'loading') content = <BreathingDots size={messageSize * 0.5} labelSize={messageSize} />;
   // Keyed by track and timing version, so a new song or timing mounts fresh: no scroll from the old position.
-  else if (lines) content = <SyncedLyrics key={`${key}:${picked?.firstMs ?? 'auto'}`} lines={lines} media={media} width={width} height={height} canSeek={canSeek} seekMedia={seekMedia} onLongPress={showDebug} offsetMs={choice.offsetMs} onNudge={nudge} onResetOffset={resetOffset} />;
+  else if (lines) content = <SyncedLyrics key={`${key}:${picked ? `${picked.firstMs}:${picked.lastMs}` : 'auto'}`} lines={lines} media={media} width={width} height={height} canSeek={canSeek} seekMedia={seekMedia} onLongPress={showDebug} offsetMs={choice.offsetMs} onNudge={nudge} onResetOffset={resetOffset} />;
   else if (lyrics.kind === 'plain') content = <ScrollView nestedScrollEnabled showsVerticalScrollIndicator={false} contentContainerStyle={{ padding: messageSize }}>
     {versions.length > 0 ? <Text allowFontScaling={false} style={[styles.plainHint, { fontSize: messageSize * 0.8 }]}>Not synced to this video · long-press to pick a timing</Text> : null}
     <Text allowFontScaling={false} onLongPress={showDebug} style={[styles.plain, { fontSize: messageSize * 1.05, lineHeight: messageSize * 1.55 }]}>{lyrics.text}</Text>
@@ -559,7 +572,7 @@ export function LyricsWidget({ media, connected, seekMedia }: { media: SystemMed
         {size.height ? content : null}
       </Pressable>}
     {debug ? <LyricsDebug media={media} status={lyrics === 'loading' ? 'loading' : lyrics.kind} onClose={() => setDebug(false)}
-      sync={{ versions, shownFirstMs: picked?.firstMs ?? autoFirstMs, autoFirstMs, reason: lyrics !== 'loading' && lyrics.kind === 'synced' ? lyrics.reason : undefined, picked: picked !== undefined, offsetMs: choice.offsetMs }}
+      sync={{ versions, shown: picked ?? auto, auto, synced: autoSpan !== undefined, reason: lyrics !== 'loading' && lyrics.kind === 'synced' ? lyrics.reason : undefined, picked: picked !== undefined, offsetMs: choice.offsetMs }}
       onPickVersion={pickVersion} onResetOffset={resetOffset} typedTitle={typedTitle} onSearchTitle={searchTitle} /> : null}
   </View>;
 }
@@ -567,11 +580,11 @@ export function LyricsWidget({ media, connected, seekMedia }: { media: SystemMed
 const durationLabel = (milliseconds?: number) => milliseconds === undefined ? 'not reported' : `${(milliseconds / 1000).toFixed(1)} s`;
 
 // What the PC reported for the track and each lookup step, refreshed while a lookup is still running.
-type SyncPanel = { versions: TimingVersion[]; shownFirstMs?: number; autoFirstMs?: number; reason?: string; picked: boolean; offsetMs: number };
+type SyncPanel = { versions: TimingVersion[]; shown?: TimingVersion; auto?: TimingVersion; synced: boolean; reason?: string; picked: boolean; offsetMs: number };
 
 // The sync fixes, then what the PC reported for the track and each lookup step, refreshed while a lookup
 // is still running. Tapping a timing version uses it for this track from now on.
-function LyricsDebug({ media, status, onClose, sync, onPickVersion, onResetOffset, typedTitle, onSearchTitle }: { media: SystemMediaState; status: string; onClose: () => void; sync: SyncPanel; onPickVersion: (firstMs: number | undefined) => void; onResetOffset: () => void; typedTitle?: string; onSearchTitle: (title: string | undefined) => void }) {
+function LyricsDebug({ media, status, onClose, sync, onPickVersion, onResetOffset, typedTitle, onSearchTitle }: { media: SystemMediaState; status: string; onClose: () => void; sync: SyncPanel; onPickVersion: (version: TimingVersion | undefined) => void; onResetOffset: () => void; typedTitle?: string; onSearchTitle: (title: string | undefined) => void }) {
   const [draft, setDraft] = useState(typedTitle ?? '');
   const [, setRefresh] = useState(0);
   useEffect(() => {
@@ -589,7 +602,6 @@ function LyricsDebug({ media, status, onClose, sync, onPickVersion, onResetOffse
     trace.key ? '' : 'lookup skipped: no title, or shorter than 30 s / longer than 15 min',
     ...trace.steps,
   ].filter(Boolean);
-  const same = (a?: number, b?: number) => a !== undefined && b !== undefined && Math.abs(a - b) <= SAME_VERSION_MS;
   // A native modal keeps the deck's scroll/swipe responders out of these touches.
   // Dismissal lives outside the scroll content, so a drag cannot become a close tap.
   return <Modal transparent animationType="fade" onRequestClose={onClose} supportedOrientations={['portrait', 'landscape-left', 'landscape-right']}>
@@ -611,11 +623,12 @@ function LyricsDebug({ media, status, onClose, sync, onPickVersion, onResetOffse
                 {sync.offsetMs !== 0 ? <Pressable onPress={onResetOffset} hitSlop={6} accessibilityRole="button" accessibilityLabel="Reset the lyrics offset" style={styles.debugChip}><Text allowFontScaling={false} style={styles.debugChipText}>Reset</Text></Pressable> : null}
               </View>
               {sync.versions.length > 0 ? <>
-                <Text allowFontScaling={false} style={styles.debugText}>timings found ({sync.picked ? 'picked by you' : sync.autoFirstMs === undefined ? 'none used: the lengths differ, so shown unsynced' : sync.reason ? `automatic: ${sync.reason}` : 'automatic'}):</Text>
+                <Text allowFontScaling={false} style={styles.debugText}>timings found ({sync.picked ? 'picked by you' : !sync.synced ? 'none used: the lengths differ, so shown unsynced' : sync.reason ? `automatic: ${sync.reason}` : 'automatic'}):</Text>
                 {sync.versions.map((version) => {
-                  const shown = same(version.firstMs, sync.shownFirstMs);
-                  return <Pressable key={version.firstMs} onPress={() => onPickVersion(version.firstMs)} accessibilityRole="button" accessibilityState={{ selected: shown }} accessibilityLabel={`Use the timing starting at ${(version.firstMs / 1000).toFixed(1)} seconds`} style={[styles.debugChip, shown && styles.debugChipSelected]}>
-                    <Text allowFontScaling={false} style={styles.debugChipText}>{shown ? '✓ ' : ''}starts {(version.firstMs / 1000).toFixed(1)} s · {version.entries} {version.entries === 1 ? 'entry' : 'entries'}{same(version.firstMs, sync.autoFirstMs) ? ' · automatic' : ''}</Text>
+                  // Exactly one timing is ticked: the one on screen.
+                  const shown = version === sync.shown;
+                  return <Pressable key={`${version.firstMs}:${version.lastMs}`} onPress={() => onPickVersion(version)} accessibilityRole="button" accessibilityState={{ selected: shown }} accessibilityLabel={`Use the timing starting at ${(version.firstMs / 1000).toFixed(1)} seconds`} style={[styles.debugChip, shown && styles.debugChipSelected]}>
+                    <Text allowFontScaling={false} style={styles.debugChipText}>{shown ? '✓ ' : ''}starts {(version.firstMs / 1000).toFixed(1)} s, ends {(version.lastMs / 1000).toFixed(1)} s · {version.entries} {version.entries === 1 ? 'entry' : 'entries'}{version === sync.auto ? ' · automatic' : ''}</Text>
                   </Pressable>;
                 })}
                 {sync.picked ? <Pressable onPress={() => onPickVersion(undefined)} accessibilityRole="button" accessibilityLabel="Go back to the automatic timing" style={styles.debugChip}><Text allowFontScaling={false} style={styles.debugChipText}>Back to automatic</Text></Pressable> : null}

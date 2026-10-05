@@ -1,7 +1,7 @@
 // Run: node scripts/check-lyrics.ts
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { activeLineAt, withoutSong, artistMatches, cleanArtist, cleanTitle, isGapLine, latinArtist, latinPart, lyricsTrackKey, matchAlias, matchContext, nativePart, nativeSongTitle, normalizeText, parseLrc, pickLooseResult, pickSearchResult, quotedSong, romanize, searchQueries, soundKey, timingVersions, titleMatches, withIntroGap } from '../phone-app/src/lyrics.ts';
+import { activeLineAt, nearestVersion, withoutSong, artistMatches, cleanArtist, cleanTitle, isGapLine, latinArtist, latinPart, lyricsTrackKey, matchAlias, matchContext, nativePart, nativeSongTitle, normalizeText, parseLrc, pickLooseResult, pickSearchResult, quotedSong, romanize, searchQueries, soundKey, timingVersions, titleMatches, withIntroGap } from '../phone-app/src/lyrics.ts';
 import { fetchLyrics, lyricsTrace, setLyricsUserAgent } from '../phone-app/src/lyrics.ts';
 
 assert.equal(
@@ -198,6 +198,30 @@ const kissEntries = [
 ];
 const firstLine = (lyrics: ReturnType<typeof pickSearchResult>) => lyrics?.kind === 'synced' ? lyrics.lines[0].timeMs : null;
 assert.deepEqual(timingVersions(kissEntries.map((entry) => parseLrc(entry.syncedLyrics))).map((version) => [version.firstMs, version.entries]), [[8000, 11], [17100, 1]]);
+
+// Two timings can open together and differ by seconds at the end (LRCLIB's "Kesariya": first lines 50 ms
+// apart, last lines 14 s apart). They stay two versions, and each line set maps to exactly one of them,
+// so the details panel ticks one timing, and picking one selects its own lines rather than the other's.
+{
+  const lyric = (first: number, last: number) => [{ timeMs: first, text: 'a' }, { timeMs: (first + last) / 2, text: 'b' }, { timeMs: last, text: 'c' }];
+  const album = lyric(9490, 244_100);
+  const video = lyric(9440, 258_000);
+  const versions = timingVersions([album, album, video]);
+  assert.deepEqual(versions.map((version) => [version.firstMs, version.lastMs, version.entries]), [[9490, 244_100, 2], [9440, 258_000, 1]]);
+  for (const version of versions) {
+    const owners = versions.filter((candidate) => candidate === nearestVersion(versions, version.firstMs, version.lastMs));
+    assert.deepEqual(owners, [version], 'a timing maps to exactly one version');
+  }
+  assert.equal(nearestVersion(versions, 9440, 258_000)?.lines, video, 'the later-ending timing is not mistaken for the other');
+  assert.equal(nearestVersion(versions, 9490, 244_100)?.lines, album);
+  // A choice saved before last lines were stored has only a first line: the nearest first line wins.
+  assert.equal(nearestVersion(versions, 9440)?.lines, video);
+  assert.equal(nearestVersion(versions, 9490)?.lines, album);
+  // Nothing within the grouping tolerance matches no version.
+  assert.equal(nearestVersion(versions, 12_000, 244_100), undefined);
+  assert.equal(nearestVersion(versions, 9490, 250_000), undefined);
+  assert.equal(nearestVersion([], 9490, 244_100), undefined);
+}
 // The music video (its title says MV) takes the timing that starts later, by its intro.
 const kissVideo = pick(kissEntries, { title: "aespa エスパ 'KISS N TELL' MV", artist: 'SMTOWN', durationMs: 190_000 });
 assert.equal(firstLine(kissVideo), 17100);
