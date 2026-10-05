@@ -25,3 +25,8 @@ Thumbs.db
 
 # Built by scripts/build-mediaremote-adapter.sh
 pc-companion/src-tauri/mediaremote/
+
+# Internal research notes kept out of the public repo
+pc-companion/docs/elgato-plugin-ip-risk-research.md
+pc-companion/docs/stream-deck-plugin-compatibility-research.md
+pc-companion/docs/stream-deck-plus-xl-layout-research.md
