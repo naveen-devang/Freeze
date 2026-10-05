@@ -25,7 +25,7 @@ const SETTLE_MS = 1200;
 // Some players publish the duration late or never: wait this long for it, then look up by name alone.
 // Without a length the lookup can pick another timing of the song (one 16 s off for "Summer Rain"), so a
 // lookup that has to guess shows lyrics that then jump once the length arrives; waiting avoids most of those.
-const MISSING_DURATION_WAIT_MS = 3000;
+const MISSING_DURATION_WAIT_MS = 2000;
 // Browsing: a vertical drag scrolls the lyrics, and they stop following the song until this long after the
 // last touch. Meanwhile every line is bright enough to read.
 const BROWSE_RESUME_MS = 3000;
