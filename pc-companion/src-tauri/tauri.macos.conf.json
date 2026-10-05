@@ -8,9 +8,12 @@
         "minWidth": 900,
         "minHeight": 640,
         "windowEffects": {
-          "effects": ["sidebar"],
+          "effects": [
+            "sidebar"
+          ],
           "state": "followsWindowActiveState"
-        }
+        },
+        "theme": "Dark"
       }
     ]
   }
