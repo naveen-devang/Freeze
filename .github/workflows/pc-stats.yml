@@ -5,6 +5,8 @@ name: PC stats
 
 on:
   push:
+    # Branches only: a release tag points at a commit these checks already ran on.
+    branches: ['**']
     paths: ['pc-companion/**', 'phone-app/src/pc-stats*', 'scripts/*pc-stats*', 'scripts/build-mediaremote-adapter.sh', '.github/workflows/pc-stats.yml']
   pull_request:
     paths: ['pc-companion/**', 'phone-app/src/pc-stats*', 'scripts/*pc-stats*', 'scripts/build-mediaremote-adapter.sh', '.github/workflows/pc-stats.yml']
