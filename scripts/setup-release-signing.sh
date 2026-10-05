@@ -193,6 +193,7 @@ ENV_FILE="$KEYS/passwords.env"
 P12_OPTS=(-keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1) # readable by macOS `security import` and Java
 
 [[ -d .git && -d pc-companion ]] || { echo "Run this from the Freeze repo root."; exit 1; }
+[[ -t 0 ]] || { echo "Run this in a terminal window (Git Bash): it asks you to confirm steps."; exit 1; }
 command -v openssl >/dev/null || { echo "openssl is required (Git Bash ships it)."; exit 1; }
 gh auth status >/dev/null 2>&1 || { echo "Log in first: gh auth login"; exit 1; }
 mkdir -p "$KEYS"; chmod 700 "$KEYS"
@@ -214,7 +215,7 @@ if [[ -f "$KEYS/updater.key" ]]; then
   password TAURI_PASSWORD
 else
   password TAURI_PASSWORD
-  (cd pc-companion && npx tauri signer generate --ci -w "$KEYS/updater.key" -p "$TAURI_PASSWORD") >/dev/null
+  (cd pc-companion && node_modules/.bin/tauri signer generate --ci -w "$KEYS/updater.key" -p "$TAURI_PASSWORD") >/dev/null 2>&1
   printf '  %s✓ created%s %s\n' "$GREEN" "$RESET" "$KEYS/updater.key"
 fi
 node -e "const fs = require('fs'), p = 'pc-companion/src-tauri/tauri.conf.json', c = JSON.parse(fs.readFileSync(p, 'utf8'));

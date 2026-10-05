@@ -41,7 +41,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDMwMDQ1OTQ4RjQ5QjE4NjcKUldSbkdKdjBTRmtFTVBLQk9sbG1uejUrRjU5bVV4eXRvMXdYRnFHN2Qydk55M0RVaXBrOGc3UkkK",
       "endpoints": [
         "https://github.com/naveen-devang/Freeze/releases/latest/download/latest.json"
       ],
