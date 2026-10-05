@@ -20,7 +20,8 @@ export default function TabLayout() {
         <NativeTabs.Trigger name="connect">
           <NativeTabs.Trigger.Icon sf="wifi" md="wifi" />
           <NativeTabs.Trigger.Label>Connect</NativeTabs.Trigger.Label>
-          <NativeTabs.Trigger.Badge hidden={!updateWaiting}>1</NativeTabs.Trigger.Badge>
+          {/* No text: expo-router ignores `hidden` on a badge that has text. Empty shows a dot. */}
+          <NativeTabs.Trigger.Badge hidden={!updateWaiting} />
         </NativeTabs.Trigger>
         <NativeTabs.Trigger name="edit">
           <NativeTabs.Trigger.Icon sf="square.stack.3d.up" md="layers" />

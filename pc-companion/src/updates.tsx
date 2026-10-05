@@ -40,7 +40,10 @@ export function useUpdater() {
       ready.current = update;
       setState({ kind: "ready", version: update.version, notes: update.body ?? "" });
     } catch (error) {
-      setState({ kind: "error", message: String(error) });
+      // The updater reports ReleaseNotFound when GitHub answers without a release file (404: nothing
+      // published yet, or the repo isn't public), so there's nothing newer. Network failures differ.
+      if (String(error).includes("Could not fetch a valid release JSON")) setState({ kind: "current", checkedAt: Date.now() });
+      else setState({ kind: "error", message: String(error) });
     } finally {
       busy.current = false;
     }

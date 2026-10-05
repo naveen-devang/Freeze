@@ -38,9 +38,17 @@ export async function checkForUpdate() {
   if (Platform.OS !== 'android' || state.kind === 'checking' || state.kind === 'downloading' || state.kind === 'ready') return;
   lastCheck = Date.now();
   set({ kind: 'checking' });
+  let response: Response;
   try {
-    const response = await fetch(`${RELEASES}/latest.json`, { cache: 'no-store' });
-    if (!response.ok) throw new Error(`GitHub answered ${response.status}`);
+    response = await fetch(`${RELEASES}/latest.json`, { cache: 'no-store' });
+  } catch {
+    set({ kind: 'error', message: "Couldn't reach GitHub. Check your internet connection, then try again." });
+    return;
+  }
+  // 404 means no release is published yet (or the repo isn't public), so there's nothing newer.
+  if (response.status === 404) { set({ kind: 'current' }); return; }
+  if (!response.ok) { set({ kind: 'error', message: `GitHub didn't answer (error ${response.status}). Try again later.` }); return; }
+  try {
     const latest = await response.json() as { version?: string; notes?: string };
     const version = (latest.version ?? '').replace(/^v/, '');
     if (!isNewer(version, CURRENT_VERSION)) {
@@ -52,7 +60,7 @@ export async function checkForUpdate() {
     const bytes = Number(head?.headers.get('content-length')) || null;
     set({ kind: 'available', version, notes: latest.notes ?? '', bytes });
   } catch {
-    set({ kind: 'error', message: "Couldn't reach GitHub. Check your internet connection, then try again." });
+    set({ kind: 'error', message: "GitHub sent an update file Freeze couldn't read. Try again later." });
   }
 }
 
