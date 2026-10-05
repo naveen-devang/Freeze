@@ -3520,7 +3520,12 @@ async fn current_playback_state() -> PlaybackState {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+async fn current_playback_state() -> PlaybackState {
+    system_media::adapter_playback_state()
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 async fn current_playback_state() -> PlaybackState {
     PlaybackState::Unavailable
 }
@@ -3573,6 +3578,21 @@ fn run_action(action: ClientAction) -> Result<(), String> {
             }
         }
         ClientAction::Media { command } => {
+            // On macOS, playback commands go straight to the now playing app (MediaRemote IDs:
+            // toggle play/pause 2, next 4, previous 5); media keys are the fallback and need
+            // Accessibility permission.
+            #[cfg(target_os = "macos")]
+            {
+                let command_id = match command {
+                    MediaCommand::PlayPause => Some(2),
+                    MediaCommand::NextTrack => Some(4),
+                    MediaCommand::PreviousTrack => Some(5),
+                    MediaCommand::VolumeUp | MediaCommand::VolumeDown | MediaCommand::Mute => None,
+                };
+                if command_id.is_some_and(|id| system_media::send_media_command(id).is_ok()) {
+                    return Ok(());
+                }
+            }
             let mut enigo = Enigo::new(&Settings::default()).map_err(|error| error.to_string())?;
             let key = match command {
                 MediaCommand::PlayPause => Key::MediaPlayPause,
@@ -4117,8 +4137,13 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Freeze");
+        .build(tauri::generate_context!())
+        .expect("error while building Freeze")
+        .run(|_, event| {
+            if let tauri::RunEvent::Exit = event {
+                system_media::shutdown();
+            }
+        });
 }
 
 #[cfg(all(test, windows))]

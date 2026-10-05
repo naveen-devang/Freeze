@@ -524,7 +524,7 @@ function App() {
               </p>
               {connection?.isMacos && (
                 <p className="pair-note mac-note">
-                  Allow Freeze under System Settings → Privacy &amp; Security → Accessibility to send controls. macOS does not expose other apps’ global playback state, so the phone reflects the last Play/Pause command sent from Freeze.
+                  Allow Freeze under System Settings → Privacy &amp; Security → Accessibility to send shortcuts and volume keys. Now playing, play/pause and track skipping work without it.
                 </p>
               )}
             </div>

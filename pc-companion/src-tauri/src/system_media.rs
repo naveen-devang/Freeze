@@ -4,7 +4,7 @@ use tokio::sync::watch;
 
 use super::PlaybackState;
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 const MAX_ARTWORK_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -108,6 +108,8 @@ pub(super) fn spawn_system_media_monitor(
     refresh: std::sync::Arc<tokio::sync::Notify>,
     app: AppHandle,
 ) {
+    #[cfg(target_os = "macos")]
+    mac_adapter::start(&app);
     tauri::async_runtime::spawn(async move {
         #[cfg(windows)]
         let mut manager = None;
@@ -471,7 +473,15 @@ pub(super) async fn seek(position_ms: u64) -> Result<(), String> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub(super) async fn seek(position_ms: u64) -> Result<(), String> {
+    let micros = position_ms.saturating_mul(1000).to_string();
+    tauri::async_runtime::spawn_blocking(move || mac_adapter::run(&["seek", &micros]))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(super) async fn seek(_position_ms: u64) -> Result<(), String> {
     Err("Seeking is not supported on this platform".into())
 }
@@ -486,7 +496,7 @@ fn windows_now_ticks() -> i64 {
     UNIX_EPOCH_TICKS.saturating_add((since_unix.as_nanos() / 100) as i64)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn bounded_text(value: String, max_chars: usize) -> Option<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -520,7 +530,7 @@ fn read_artwork(
     ))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 fn artwork_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("image/png")
@@ -535,13 +545,347 @@ fn artwork_mime(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 async fn read_system_media_state() -> SystemMediaState {
-    SystemMediaState {
-        volume_percent: read_system_volume(),
-        ..SystemMediaState::unavailable()
+    match mac_adapter::latest() {
+        Some(now_playing) => adapter_media_state(&now_playing, epoch_micros_now(), read_system_volume()),
+        None => SystemMediaState::unavailable(),
     }
 }
+
+#[cfg(not(any(windows, target_os = "macos")))]
+async fn read_system_media_state() -> SystemMediaState {
+    SystemMediaState::unavailable()
+}
+
+/// Play/pause state from macOS's now playing service; unavailable when nothing reports any.
+#[cfg(target_os = "macos")]
+pub(super) fn adapter_playback_state() -> PlaybackState {
+    match mac_adapter::latest() {
+        Some(now_playing) if now_playing.playing => PlaybackState::Playing,
+        Some(_) => PlaybackState::Paused,
+        None => PlaybackState::Unavailable,
+    }
+}
+
+/// Sends a MediaRemote command (play/pause 2, next 4, previous 5) to the player macOS lists as now
+/// playing. Unlike media keys it needs no Accessibility permission. With no player reporting, it
+/// errors so the caller sends a media key instead, which lets macOS start the last player.
+#[cfg(target_os = "macos")]
+pub(super) fn send_media_command(command_id: u8) -> Result<(), String> {
+    if mac_adapter::latest().is_none() {
+        return Err("No app is reporting playback".into());
+    }
+    mac_adapter::run(&["send", &command_id.to_string()])
+}
+
+/// Stops the macOS now playing stream so its perl process doesn't outlive Freeze.
+pub(super) fn shutdown() {
+    #[cfg(target_os = "macos")]
+    mac_adapter::stop();
+}
+
+#[cfg(target_os = "macos")]
+fn epoch_micros_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_micros() as f64)
+        .unwrap_or(0.0)
+}
+
+/// One reading of `mediaremote-adapter.pl stream --no-diff --micros`.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Debug, PartialEq)]
+struct AdapterNowPlaying {
+    bundle_id: String,
+    title: String,
+    artist: Option<String>,
+    album: Option<String>,
+    playing: bool,
+    duration_micros: Option<f64>,
+    /// Position at `timestamp_epoch_micros`; the player doesn't report it again until something changes.
+    elapsed_micros: Option<f64>,
+    timestamp_epoch_micros: Option<f64>,
+    playback_rate: Option<f64>,
+    artwork_data_url: Option<String>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl AdapterNowPlaying {
+    fn same_track(&self, other: &Self) -> bool {
+        self.bundle_id == other.bundle_id
+            && self.title == other.title
+            && self.artist == other.artist
+            && self.album == other.album
+    }
+}
+
+/// Reads one line of adapter output: `None` for a line that isn't data, `Some(None)` when no player
+/// reports anything (an empty payload, or one without the adapter's mandatory keys).
+#[cfg(any(target_os = "macos", test))]
+fn parse_adapter_line(line: &str) -> Option<Option<AdapterNowPlaying>> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("type").and_then(|kind| kind.as_str()) != Some("data") {
+        return None;
+    }
+    let payload = value.get("payload")?.as_object()?;
+    let text = |key: &str, max_chars: usize| {
+        payload
+            .get(key)
+            .and_then(|value| value.as_str())
+            .and_then(|value| bounded_text(value.to_owned(), max_chars))
+    };
+    let number = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|value| value.as_f64())
+            .filter(|value| value.is_finite() && *value >= 0.0)
+    };
+    let (Some(bundle_id), Some(title), Some(playing)) = (
+        text("bundleIdentifier", 256),
+        text("title", 512),
+        payload.get("playing").and_then(|value| value.as_bool()),
+    ) else {
+        return Some(None);
+    };
+    Some(Some(AdapterNowPlaying {
+        bundle_id,
+        title,
+        artist: text("artist", 512),
+        album: text("album", 512),
+        playing,
+        duration_micros: number("durationMicros").filter(|duration| *duration > 0.0),
+        elapsed_micros: number("elapsedTimeMicros"),
+        timestamp_epoch_micros: number("timestampEpochMicros"),
+        playback_rate: number("playbackRate").map(|rate| rate.min(16.0)),
+        artwork_data_url: payload
+            .get("artworkData")
+            .and_then(|value| value.as_str())
+            .and_then(adapter_artwork),
+    }))
+}
+
+/// The adapter sends artwork as base64; it's checked like Windows thumbnails before it's shown.
+#[cfg(any(target_os = "macos", test))]
+fn adapter_artwork(encoded: &str) -> Option<String> {
+    use base64::Engine;
+    // Base64 is a third larger than the image, so this caps the image at MAX_ARTWORK_BYTES.
+    if encoded.len() as u64 > MAX_ARTWORK_BYTES.div_ceil(3) * 4 {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let mime = artwork_mime(&bytes)?;
+    Some(format!("data:{mime};base64,{encoded}"))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn adapter_media_state(
+    now_playing: &AdapterNowPlaying,
+    now_epoch_micros: f64,
+    volume_percent: Option<u8>,
+) -> SystemMediaState {
+    // Players report the position as of `timestamp`, so while playing add the time since then at
+    // the current rate. Synced lyrics depend on this, as on Windows.
+    let rate = if now_playing.playing { now_playing.playback_rate.unwrap_or(1.0) } else { 0.0 };
+    let (position_ms, duration_ms) = match (now_playing.elapsed_micros, now_playing.duration_micros) {
+        (Some(elapsed), Some(duration)) => {
+            let since = now_playing
+                .timestamp_epoch_micros
+                .map_or(0.0, |at| (now_epoch_micros - at).max(0.0));
+            let position = (elapsed + since * rate).min(duration);
+            (Some((position / 1000.0) as u64), Some((duration / 1000.0) as u64))
+        }
+        (None, Some(duration)) => (None, Some((duration / 1000.0) as u64)),
+        _ => (None, None),
+    };
+    SystemMediaState {
+        source_app_id: Some(now_playing.bundle_id.clone()),
+        title: Some(now_playing.title.clone()),
+        artist: now_playing.artist.clone(),
+        album: now_playing.album.clone(),
+        playback_state: if now_playing.playing { PlaybackState::Playing } else { PlaybackState::Paused },
+        position_ms,
+        duration_ms,
+        artwork_data_url: now_playing.artwork_data_url.clone(),
+        volume_percent,
+        can_seek: duration_ms.is_some(),
+        playback_rate: if now_playing.playing { now_playing.playback_rate } else { None },
+    }
+}
+
+/// Now playing on macOS through mediaremote-adapter (BSD-3-Clause,
+/// https://github.com/ungive/mediaremote-adapter). Since macOS 15.4 only Apple-signed processes may
+/// read MediaRemote, so the adapter's script runs in the system's /usr/bin/perl and loads its
+/// framework there. Release builds bundle both (scripts/build-mediaremote-adapter.sh); a build
+/// without them reports media as unavailable, as before.
+#[cfg(target_os = "macos")]
+mod mac_adapter {
+    use super::{parse_adapter_line, AdapterNowPlaying};
+    use std::io::{BufRead, BufReader};
+    use std::path::PathBuf;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    use tauri::{AppHandle, Manager};
+
+    const PERL: &str = "/usr/bin/perl";
+    const SCRIPT: &str = "mediaremote-adapter.pl";
+    const FRAMEWORK: &str = "MediaRemoteAdapter.framework";
+    /// The library ships under a plain name: a `.framework` folder inside the app's Resources would
+    /// be taken for nested code when the app is signed.
+    const BUNDLED_LIBRARY: &str = "MediaRemoteAdapter.dylib";
+
+    struct Paths {
+        script: PathBuf,
+        framework: PathBuf,
+    }
+
+    static PATHS: OnceLock<Paths> = OnceLock::new();
+    static LATEST: Mutex<Option<AdapterNowPlaying>> = Mutex::new(None);
+    static STREAM: Mutex<Option<Child>> = Mutex::new(None);
+    static STOPPING: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn start(app: &AppHandle) {
+        match install(app) {
+            Ok(paths) => {
+                if PATHS.set(paths).is_ok() {
+                    std::thread::spawn(stream_forever);
+                }
+            }
+            Err(error) => eprintln!("Now playing on macOS is off: {error}"),
+        }
+    }
+
+    pub(super) fn latest() -> Option<AdapterNowPlaying> {
+        LATEST.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
+    pub(super) fn stop() {
+        STOPPING.store(true, Ordering::SeqCst);
+        if let Some(mut child) = STREAM.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Runs one adapter command (`seek`, `send`) and waits up to 3 s for it to finish.
+    pub(super) fn run(args: &[&str]) -> Result<(), String> {
+        let paths = PATHS.get().ok_or("The now playing adapter isn't installed")?;
+        let mut child = Command::new(PERL)
+            .arg(&paths.script)
+            .arg(&paths.framework)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| error.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("The now playing adapter failed ({status})"))
+                };
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("The now playing adapter didn't answer".into());
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+    }
+
+    /// Copies the bundled adapter out of the app before use. Files inside a downloaded app carry
+    /// the quarantine flag, which can stop macOS loading the library into perl; files Freeze writes
+    /// itself don't. Each file is replaced through a rename so a running copy is never rewritten.
+    fn install(app: &AppHandle) -> Result<Paths, String> {
+        let source = app.path().resource_dir().map_err(|error| error.to_string())?.join("mediaremote");
+        let target = app.path().app_local_data_dir().map_err(|error| error.to_string())?.join("mediaremote");
+        // The script loads FRAMEWORK/MediaRemoteAdapter, so the library goes back into that layout.
+        let files = [(SCRIPT, SCRIPT.to_owned()), (BUNDLED_LIBRARY, format!("{FRAMEWORK}/MediaRemoteAdapter"))];
+        for (bundled, installed) in files {
+            let bytes = std::fs::read(source.join(bundled)).map_err(|error| format!("{bundled}: {error}"))?;
+            let destination = target.join(installed);
+            if std::fs::read(&destination).ok().as_deref() == Some(bytes.as_slice()) {
+                continue;
+            }
+            let folder = destination.parent().ok_or("Invalid adapter path")?;
+            std::fs::create_dir_all(folder).map_err(|error| error.to_string())?;
+            let staging = folder.join(format!(".{}.new", destination.file_name().and_then(|name| name.to_str()).unwrap_or("adapter")));
+            std::fs::write(&staging, &bytes).map_err(|error| error.to_string())?;
+            std::fs::rename(&staging, &destination).map_err(|error| error.to_string())?;
+        }
+        Ok(Paths { script: target.join(SCRIPT), framework: target.join(FRAMEWORK) })
+    }
+
+    /// Keeps one `stream` process running and stores its latest reading. A stream that ran for a
+    /// while restarts after 2 s; one that keeps exiting backs off to a minute.
+    fn stream_forever() {
+        let Some(paths) = PATHS.get() else { return };
+        let mut retry = Duration::from_secs(1);
+        while !STOPPING.load(Ordering::SeqCst) {
+            let started = Instant::now();
+            match Command::new(PERL)
+                .arg(&paths.script)
+                .arg(&paths.framework)
+                .args(["stream", "--no-diff", "--micros", "--debounce=100"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    let stdout = child.stdout.take();
+                    *STREAM.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(child);
+                    if STOPPING.load(Ordering::SeqCst) {
+                        stop();
+                    }
+                    if let Some(stdout) = stdout {
+                        for line in BufReader::new(stdout).lines() {
+                            let Ok(line) = line else { break };
+                            if let Some(update) = parse_adapter_line(&line) {
+                                store(update);
+                            }
+                        }
+                    }
+                    if let Some(mut child) = STREAM.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                }
+                Err(error) => eprintln!("Could not start the now playing adapter: {error}"),
+            }
+            *LATEST.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            retry = if started.elapsed() > Duration::from_secs(60) {
+                Duration::from_secs(2)
+            } else {
+                (retry * 2).min(Duration::from_secs(60))
+            };
+            std::thread::sleep(retry);
+        }
+    }
+
+    /// Artwork often arrives after the rest of a track's details, so the last image stays for the
+    /// same track until a new one comes; a new track never keeps the old image.
+    fn store(update: Option<AdapterNowPlaying>) {
+        let mut latest = LATEST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let next = update.map(|mut now_playing| {
+            if now_playing.artwork_data_url.is_none() {
+                if let Some(previous) = latest.as_ref().filter(|previous| previous.same_track(&now_playing)) {
+                    now_playing.artwork_data_url = previous.artwork_data_url.clone();
+                }
+            }
+            now_playing
+        });
+        *latest = next;
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -557,6 +901,87 @@ mod tests {
             playback_rate: None,
             ..SystemMediaState::unavailable()
         }
+    }
+
+    // A 1x1 PNG, as the adapter sends artwork: plain base64.
+    const PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+    fn adapter_line(payload: &str) -> String {
+        format!(r#"{{"type":"data","diff":false,"payload":{payload}}}"#)
+    }
+
+    #[test]
+    fn reads_adapter_output_like_the_windows_session() {
+        let line = adapter_line(&format!(
+            r#"{{"bundleIdentifier":"com.apple.Music","playing":true,"title":"Summer Rain","artist":"SAM KIM","album":"Our Beloved Summer","durationMicros":201000000,"elapsedTimeMicros":30000000,"timestampEpochMicros":1791230400000000,"playbackRate":1,"artworkMimeType":"image/png","artworkData":"{PNG_BASE64}"}}"#
+        ));
+        let now_playing = parse_adapter_line(&line).expect("a data line").expect("media");
+        assert_eq!(now_playing.bundle_id, "com.apple.Music");
+        assert_eq!(now_playing.title, "Summer Rain");
+        assert_eq!(now_playing.artist.as_deref(), Some("SAM KIM"));
+        assert!(now_playing.artwork_data_url.as_deref().is_some_and(|url| url.starts_with("data:image/png;base64,")));
+
+        // 2.5 s after the player reported 30 s, the song is at 32.5 s.
+        let state = adapter_media_state(&now_playing, 1_791_230_402_500_000.0, Some(40));
+        assert_eq!(state.playback_state, PlaybackState::Playing);
+        assert_eq!(state.position_ms, Some(32_500));
+        assert_eq!(state.duration_ms, Some(201_000));
+        assert_eq!(state.playback_rate, Some(1.0));
+        assert_eq!(state.volume_percent, Some(40));
+        assert_eq!(state.source_app_id.as_deref(), Some("com.apple.Music"));
+        assert!(state.can_seek);
+
+        // Never past the end, however stale the report.
+        let late = adapter_media_state(&now_playing, 1_791_230_400_000_000.0 + 10_000_000_000.0, None);
+        assert_eq!(late.position_ms, Some(201_000));
+    }
+
+    #[test]
+    fn paused_media_keeps_its_position_and_missing_rate_means_normal_speed() {
+        let paused = parse_adapter_line(&adapter_line(
+            r#"{"bundleIdentifier":"com.spotify.client","playing":false,"title":"Song","durationMicros":180000000,"elapsedTimeMicros":60000000,"timestampEpochMicros":1000000,"playbackRate":0}"#,
+        ))
+        .unwrap()
+        .unwrap();
+        let state = adapter_media_state(&paused, 9_000_000.0, None);
+        assert_eq!(state.playback_state, PlaybackState::Paused);
+        assert_eq!(state.position_ms, Some(60_000));
+        assert_eq!(state.playback_rate, None);
+
+        let no_rate = parse_adapter_line(&adapter_line(
+            r#"{"bundleIdentifier":"com.google.Chrome","playing":true,"title":"Video","durationMicros":100000000,"elapsedTimeMicros":0,"timestampEpochMicros":1000000}"#,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(adapter_media_state(&no_rate, 3_000_000.0, None).position_ms, Some(2_000));
+    }
+
+    #[test]
+    fn nothing_playing_and_junk_lines_are_told_apart() {
+        assert_eq!(parse_adapter_line(&adapter_line("{}")), Some(None));
+        // Missing a mandatory key (title) counts as nothing playing.
+        assert_eq!(parse_adapter_line(&adapter_line(r#"{"bundleIdentifier":"a.b","playing":true}"#)), Some(None));
+        assert_eq!(parse_adapter_line("not json"), None);
+        assert_eq!(parse_adapter_line(r#"{"type":"other","payload":{}}"#), None);
+    }
+
+    #[test]
+    fn live_streams_without_a_length_have_no_position() {
+        let radio = parse_adapter_line(&adapter_line(
+            r#"{"bundleIdentifier":"com.apple.Music","playing":true,"title":"Radio","elapsedTimeMicros":5000000,"timestampEpochMicros":1000000,"durationMicros":0}"#,
+        ))
+        .unwrap()
+        .unwrap();
+        let state = adapter_media_state(&radio, 2_000_000.0, None);
+        assert_eq!((state.position_ms, state.duration_ms, state.can_seek), (None, None, false));
+    }
+
+    #[test]
+    fn rejects_artwork_that_is_not_an_image_or_too_large() {
+        assert!(adapter_artwork(PNG_BASE64).is_some());
+        assert_eq!(adapter_artwork("aGVsbG8="), None, "plain text isn't an image");
+        assert_eq!(adapter_artwork("!!!"), None, "not base64");
+        assert_eq!(adapter_artwork(&"A".repeat((MAX_ARTWORK_BYTES as usize / 3 + 2) * 4)), None);
     }
 
     #[test]

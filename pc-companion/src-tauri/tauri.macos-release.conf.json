@@ -1,0 +1,9 @@
+{
+  "bundle": {
+    "resources": {
+      "mediaremote/mediaremote-adapter.pl": "mediaremote/mediaremote-adapter.pl",
+      "mediaremote/MediaRemoteAdapter.dylib": "mediaremote/MediaRemoteAdapter.dylib",
+      "mediaremote/LICENSE": "mediaremote/LICENSE"
+    }
+  }
+}

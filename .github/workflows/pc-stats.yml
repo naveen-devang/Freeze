@@ -5,9 +5,9 @@ name: PC stats
 
 on:
   push:
-    paths: ['pc-companion/**', 'phone-app/src/pc-stats*', 'scripts/*pc-stats*', '.github/workflows/pc-stats.yml']
+    paths: ['pc-companion/**', 'phone-app/src/pc-stats*', 'scripts/*pc-stats*', 'scripts/build-mediaremote-adapter.sh', '.github/workflows/pc-stats.yml']
   pull_request:
-    paths: ['pc-companion/**', 'phone-app/src/pc-stats*', 'scripts/*pc-stats*', '.github/workflows/pc-stats.yml']
+    paths: ['pc-companion/**', 'phone-app/src/pc-stats*', 'scripts/*pc-stats*', 'scripts/build-mediaremote-adapter.sh', '.github/workflows/pc-stats.yml']
 
 jobs:
   rust:
@@ -29,6 +29,11 @@ jobs:
           targets: ${{ matrix.os == 'macos-latest' && 'x86_64-apple-darwin' || '' }}
       # Tauri's build script needs the built frontend.
       - run: npm ci && npx vite build
+      # Builds the macOS now playing adapter and checks it still loads and reads MediaRemote.
+      - name: Build the now playing adapter
+        if: matrix.os == 'macos-latest'
+        run: MEDIAREMOTE_FULL_TEST=1 bash scripts/build-mediaremote-adapter.sh
+        working-directory: .
       - run: cargo test --lib
         working-directory: pc-companion/src-tauri
       - run: cargo test --lib live_sample -- --ignored --nocapture
