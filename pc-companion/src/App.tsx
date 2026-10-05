@@ -51,6 +51,7 @@ import { PcStatsPreview } from "./pc-stats/PcStatsPreview";
 import { PcStatsSettings } from "./pc-stats/PcStatsSettings";
 import { AddWidgetMenu, type WidgetChoice } from "./AddWidgetMenu";
 import { widgetBlockSize, type WidgetSurface } from "./now-playing-layout";
+import { version } from "../package.json";
 
 type ConnectionInfo = {
   host: string;
@@ -418,7 +419,7 @@ function App() {
         </nav>
 
         <div className="sidebar-bottom">
-          <span className="version">0.1.0</span>
+          <span className="version">{version}</span>
         </div>
       </aside>
 

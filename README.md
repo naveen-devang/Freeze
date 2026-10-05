@@ -29,3 +29,9 @@ iOS uses Wi-Fi. iOS does not provide a general-purpose USB data channel from an 
 Android's ADB reverse feature forwards a device port to the host and works with USB-connected physical devices. [Android ADB reverse docs](https://developer.android.com/develop/ui/views/layout/webapps/access-local-server)
 
 The app uses the React Native WebSocket API and the companion protocol documented in [the PC companion README](pc-companion/README.md).
+
+## Release
+
+Run `bash scripts/setup-release-signing.sh` once to create the signing keys and store them as GitHub Actions secrets. Back up `~/.freeze-signing`: installed apps can't update without those keys.
+
+To ship, run `node scripts/bump-version.ts 1.2.0`, commit, then `git tag v1.2.0 && git push origin v1.2.0`. The **Release** workflow builds Windows, macOS and Android into a draft GitHub release. Publish the draft to make it the latest release.

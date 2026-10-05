@@ -14,3 +14,11 @@ node_modules/
 .DS_Store
 Thumbs.db
 *.tsbuildinfo
+
+# Release signing keys live in ~/.freeze-signing, never here
+*.jks
+*.keystore
+*.p12
+*.pem
+*.key
+!*.key.pub
