@@ -217,8 +217,9 @@ else
   (cd pc-companion && npx tauri signer generate --ci -w "$KEYS/updater.key" -p "$TAURI_PASSWORD") >/dev/null
   printf '  %s✓ created%s %s\n' "$GREEN" "$RESET" "$KEYS/updater.key"
 fi
-cp "$KEYS/updater.key.pub" pc-companion/src-tauri/updater.key.pub
-note "Public key copied to pc-companion/src-tauri/updater.key.pub (safe to commit)."
+node -e "const fs = require('fs'), p = 'pc-companion/src-tauri/tauri.conf.json', c = JSON.parse(fs.readFileSync(p, 'utf8'));
+  c.plugins.updater.pubkey = fs.readFileSync(process.argv[1], 'utf8').trim(); fs.writeFileSync(p, JSON.stringify(c, null, 2) + '\n');" "$KEYS/updater.key.pub"
+note "Public key written to pc-companion/src-tauri/tauri.conf.json (safe to commit)."
 set_secret TAURI_SIGNING_PRIVATE_KEY "$(cat "$KEYS/updater.key")"
 set_secret TAURI_SIGNING_PRIVATE_KEY_PASSWORD "$TAURI_PASSWORD"
 pause
@@ -292,4 +293,4 @@ else
 fi
 
 finish
-say "Next: commit pc-companion/src-tauri/updater.key.pub."
+say "Next: commit pc-companion/src-tauri/tauri.conf.json (it now holds the updater public key)."

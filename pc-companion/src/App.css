@@ -78,6 +78,14 @@ button:focus-visible { outline: 2px solid #d4d4d8; outline-offset: 2px; }
 .freeze-plugin-format span { margin-top: 6px; display: block; }
 .plugin-action-info span { color: var(--subtle); font-size: 11px; font-weight: 400; line-height: 1.4; }
 .setting-error { flex-basis: 100%; margin: -7px 0 0; color: #f87171; font-size: 12px; }
+.updates-setting { margin-bottom: 14px; }
+.update-progress { flex-basis: 100%; height: 4px; overflow: hidden; border-radius: 999px; background: var(--border); }
+.update-progress > span { display: block; height: 100%; border-radius: inherit; background: #e4e4e7; transition: width 200ms ease; }
+.update-notes { flex-basis: 100%; margin: 0; padding: 10px 12px 10px 28px; display: grid; gap: 3px; border: 1px solid var(--border); border-radius: 6px; background: #18181b; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.update-auto { flex-basis: 100%; padding-top: 14px; display: flex; align-items: center; justify-content: space-between; gap: 20px; border-top: 1px solid var(--border); color: var(--muted); font-size: 13px; }
+.update-pill { margin-left: auto; padding: 4px 9px; display: flex; align-items: center; gap: 6px; border: 1px solid #3f3f46; border-radius: 999px; background: var(--card-raised); color: var(--foreground); font-size: 11px; cursor: pointer; }
+.update-pill .status-dot { margin-top: 0; background: var(--green); }
+.sidebar-bottom { display: flex; justify-content: flex-end; }
 .ready-badge { display: flex; align-items: center; gap: 7px; min-height: 28px; padding: 0 10px; border: 1px solid var(--border); border-radius: 6px; color: var(--muted); font-size: 12px; }
 .ready-badge .status-dot { margin: 0; }
 .ready-badge.ready { color: #d4d4d8; }

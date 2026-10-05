@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, WindowEvent,
+    Emitter, Manager, WindowEvent,
 };
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -3972,6 +3972,8 @@ pub fn run() {
     tauri::Builder::default()
         .manage(state.clone())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
             connection_info,
             deck_config,
@@ -4063,8 +4065,9 @@ pub fn run() {
 
             tauri::async_runtime::spawn(serve(state));
             let open = MenuItem::with_id(app, "open", "Open Freeze", true, None::<&str>)?;
+            let updates = MenuItem::with_id(app, "updates", "Check for Updates…", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit Freeze", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &quit])?;
+            let menu = Menu::with_items(app, &[&open, &updates, &quit])?;
             let icon = app
                 .default_window_icon()
                 .ok_or("missing default window icon")?
@@ -4080,6 +4083,14 @@ pub fn run() {
                             let _ = window.show();
                             let _ = window.set_focus();
                         }
+                    }
+                    "updates" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                        // The window's Settings → Updates card runs the check.
+                        let _ = app.emit("check-for-updates", ());
                     }
                     "quit" => app.exit(0),
                     _ => (),

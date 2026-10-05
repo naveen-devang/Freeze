@@ -52,6 +52,7 @@ import { PcStatsSettings } from "./pc-stats/PcStatsSettings";
 import { AddWidgetMenu, type WidgetChoice } from "./AddWidgetMenu";
 import { widgetBlockSize, type WidgetSurface } from "./now-playing-layout";
 import { version } from "../package.json";
+import { UpdatesSetting, useUpdater } from "./updates";
 
 type ConnectionInfo = {
   host: string;
@@ -218,6 +219,13 @@ function App() {
   const [usbError, setUsbError] = useState('');
   const [pairingError, setPairingError] = useState('');
   const [screen, setScreen] = useState<'overview' | 'deck' | 'settings'>('overview');
+  const updater = useUpdater();
+  const { checkNow } = updater;
+  useEffect(() => {
+    // The tray's "Check for Updates…" item.
+    const stop = listen('check-for-updates', () => { setScreen('settings'); void checkNow(); });
+    return () => { void stop.then((unlisten) => unlisten()); };
+  }, [checkNow]);
   const [deckConfig, setDeckConfig] = useState<DeckConfig | null>(null);
   const [independentNavigation, setIndependentNavigation] = useState(false);
   const [navigationSettingBusy, setNavigationSettingBusy] = useState(false);
@@ -419,7 +427,7 @@ function App() {
         </nav>
 
         <div className="sidebar-bottom">
-          <span className="version">{version}</span>
+          {updater.state.kind === 'ready' ? <button type="button" className="update-pill" onClick={() => void updater.restart()}><span className="status-dot" />Restart to update</button> : <span className="version">{version}</span>}
         </div>
       </aside>
 
@@ -439,7 +447,8 @@ function App() {
             {importError ? <p className="usb-error" role="alert">{importError}</p> : null}
           </section> : null}
           {screen === 'deck' ? <DesktopDeckEditor config={deckConfig} onSaved={setDeckConfig} playbackState={playbackState} mediaState={mediaState} isMacos={connection?.isMacos ?? false} plugins={freezePlugins} widgetSurface={connection?.widgetSurface ?? null} /> : screen === 'settings' ? <>
-          <div className="page-heading"><div><h1>Settings</h1><p>Manage device navigation and Freeze plugins.</p></div></div>
+          <div className="page-heading"><div><h1>Settings</h1><p>Manage updates, device navigation and Freeze plugins.</p></div></div>
+          <UpdatesSetting updater={updater} />
           <section className="device-navigation-setting">
             <div className="device-navigation-copy"><h2>Independent device navigation</h2><p>Let each connected phone use its own profile and page. Turn this off to mirror navigation across all phones.</p></div>
             <button className={`setting-switch ${independentNavigation ? 'enabled' : ''}`} type="button" role="switch" aria-checked={independentNavigation} aria-label="Independent device navigation" disabled={navigationSettingBusy} onClick={() => void saveIndependentNavigation(!independentNavigation)}><span /></button>
