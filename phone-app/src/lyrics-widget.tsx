@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AccessibilityInfo, Animated, Easing, KeyboardAvoidingView, Modal, PanResponder, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
+import { AccessibilityInfo, Animated, Easing, KeyboardAvoidingView, Modal, PanResponder, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import Storage from 'expo-sqlite/kv-store';
 import type { SystemMediaState } from './connection';
-import { activeLineAt, fetchLyrics, isGapLine, lyricLineOpacity, lyricsLayout, lyricsTrace, lyricsTrackKey, nearestVersion, sungSpan, withIntroGap, type LyricLine, type Lyrics, type TimingVersion } from './lyrics';
-import { Minus, Plus, RefreshCw, X } from 'lucide-react-native';
+import { activeLineAt, fetchLyrics, fetchLyricsById, isGapLine, lyricLineOpacity, lyricsLayout, lyricsTrace, lyricsTrackKey, nearestVersion, sungSpan, withIntroGap, type LyricLine, type Lyrics, type LyricsEntry, type TimingVersion } from './lyrics';
+import { ChevronLeft, Minus, Plus, RefreshCw, Search, X } from 'lucide-react-native';
+import { LyricsFinder } from './lyrics-finder';
 import { colors } from './theme';
 
 // ponytail: one fixed lead for every setup; make it a setting if lines feel early or late on some PCs.
@@ -38,7 +39,7 @@ const clamp = (value: number, min: number, max: number) => Math.max(min, Math.mi
 // Sync fixes the user made for a track: a timing version (named by when its first line is sung) and an
 // offset, where a negative offset shows the lyrics later. Kept on the phone for the latest few hundred tracks.
 // `title` is a song name typed in the panel, for songs the PC reports under a name LRCLIB doesn't use.
-type SyncChoice = { offsetMs: number; versionFirstMs?: number; versionLastMs?: number; title?: string };
+type SyncChoice = { offsetMs: number; versionFirstMs?: number; versionLastMs?: number; lrclibId?: number; title?: string };
 type StoredSyncChoice = SyncChoice & { at: number };
 const SYNC_CHOICES_KEY = 'freeze.lyrics-sync';
 const MAX_SYNC_CHOICES = 300;
@@ -55,6 +56,7 @@ function validChoice(value: unknown): value is StoredSyncChoice {
   return typeof choice.offsetMs === 'number' && Number.isFinite(choice.offsetMs) && Math.abs(choice.offsetMs) <= MAX_OFFSET_MS &&
     (choice.versionFirstMs === undefined || (typeof choice.versionFirstMs === 'number' && Number.isFinite(choice.versionFirstMs))) &&
     (choice.versionLastMs === undefined || (typeof choice.versionLastMs === 'number' && Number.isFinite(choice.versionLastMs))) &&
+    (choice.lrclibId === undefined || (Number.isInteger(choice.lrclibId) && (choice.lrclibId ?? 0) > 0)) &&
     (choice.title === undefined || (typeof choice.title === 'string' && choice.title.length <= MAX_TYPED_TITLE)) &&
     typeof choice.at === 'number';
 }
@@ -71,7 +73,7 @@ function loadSyncChoices() {
 
 async function saveSyncChoice(key: string, choice: SyncChoice) {
   const choices = await loadSyncChoices();
-  if (choice.offsetMs !== 0 || choice.versionFirstMs !== undefined || choice.title) choices[key] = { ...choice, at: Date.now() };
+  if (choice.offsetMs !== 0 || choice.versionFirstMs !== undefined || choice.lrclibId !== undefined || choice.title) choices[key] = { ...choice, at: Date.now() };
   else delete choices[key];
   const oldest = Object.entries(choices).sort((a, b) => b[1].at - a[1].at).slice(MAX_SYNC_CHOICES);
   for (const [stale] of oldest) delete choices[stale];
@@ -91,7 +93,7 @@ function useSyncChoice(key: string | null) {
       // A nudge made while this loaded is newer than what was saved.
       if (!alive || latest.current?.key === key) return;
       const saved = choices[key];
-      latest.current = { key, choice: saved ? { offsetMs: saved.offsetMs, versionFirstMs: saved.versionFirstMs, versionLastMs: saved.versionLastMs, title: saved.title } : NO_CHOICE };
+      latest.current = { key, choice: saved ? { offsetMs: saved.offsetMs, versionFirstMs: saved.versionFirstMs, versionLastMs: saved.versionLastMs, lrclibId: saved.lrclibId, title: saved.title } : NO_CHOICE };
       setLoaded(latest.current);
     });
     return () => { alive = false; };
@@ -123,7 +125,6 @@ const signedSeconds = (milliseconds: number) => {
   const total = Math.abs(milliseconds) / 1000;
   return total < 60 ? `${sign}${total.toFixed(1)} s` : `${sign}${Math.floor(total / 60)}:${String(Math.floor(total % 60)).padStart(2, '0')}`;
 };
-const firstSungMs = (lines: LyricLine[]) => lines.find((line) => !isGapLine(line))?.timeMs ?? 0;
 
 // Holding speeds up: steps 1-10 move 1x, the next 10 move 4x, then 20x (0.5 s, 2 s, 10 s for nudges),
 // so a minutes-long intro is a few seconds of holding.
@@ -492,7 +493,7 @@ export function LyricsWidget({ media, connected, seekMedia }: { media: SystemMed
   const [choice, updateChoice] = useSyncChoice(key);
   const typedTitle = choice.title;
   // Results belong to the track and the title it was looked up with.
-  const resultKey = key ? `${key}|${typedTitle ?? ''}` : null;
+  const resultKey = key ? `${key}|${typedTitle ?? ''}|${choice.lrclibId ?? ''}` : null;
   const [retry, setRetry] = useState(0);
   const [debug, setDebug] = useState(false);
   // A new song's name can arrive before its length, and until it does the length is the last song's.
@@ -511,16 +512,18 @@ export function LyricsWidget({ media, connected, seekMedia }: { media: SystemMed
     const carried = media.durationMs !== undefined && media.durationMs === song.carriedMs;
     let alive = true;
     const track = { title: media.title, artist: media.artist, album: media.album, durationMs: media.durationMs };
+    // An entry picked in Find lyrics is fetched by its number, with no wait for the track's details.
+    const pickedId = choice.lrclibId;
     const timer = setTimeout(() => {
-      void fetchLyrics(track, typedTitle).then((lyrics) => {
+      void (pickedId !== undefined ? fetchLyricsById(pickedId) : fetchLyrics(track, typedTitle)).then((lyrics) => {
         if (alive && resultKey) setResult({ key: resultKey, lyrics });
       });
-    }, media.durationMs && !carried ? SETTLE_MS : MISSING_DURATION_WAIT_MS);
+    }, pickedId !== undefined ? 0 : media.durationMs && !carried ? SETTLE_MS : MISSING_DURATION_WAIT_MS);
     return () => {
       alive = false;
       clearTimeout(timer);
     };
-  }, [key, resultKey, typedTitle, retry, media.title, media.artist, media.album, media.durationMs]);
+  }, [key, resultKey, typedTitle, choice.lrclibId, retry, media.title, media.artist, media.album, media.durationMs]);
   // Lyrics belong to one track: anything fetched for another key is never shown.
   const lyrics = useMemo((): Lyrics | 'loading' => !key ? { kind: 'none' } : result?.key === resultKey ? result.lyrics : 'loading', [key, resultKey, result]);
   useEffect(() => {
@@ -538,6 +541,12 @@ export function LyricsWidget({ media, connected, seekMedia }: { media: SystemMed
   const chosenLines = picked?.lines ?? (lyrics !== 'loading' && lyrics.kind === 'synced' ? lyrics.lines : null);
   const lines = useMemo(() => chosenLines ? withIntroGap(chosenLines) : null, [chosenLines]);
   const nudge = useCallback((deltaMs: number) => updateChoice((current) => ({ ...current, offsetMs: current.offsetMs + deltaMs })), [updateChoice]);
+  // Using an entry from Find lyrics replaces any timing picked for the automatic lyrics.
+  const useEntry = useCallback((entry: LyricsEntry) => {
+    updateChoice((current) => ({ ...current, lrclibId: entry.id, versionFirstMs: undefined, versionLastMs: undefined }));
+    setDebug(false);
+  }, [updateChoice]);
+  const useAutomatic = useCallback(() => updateChoice((current) => ({ ...current, lrclibId: undefined })), [updateChoice]);
   const pickVersion = useCallback((version: TimingVersion | undefined) => updateChoice((current) => ({ ...current, versionFirstMs: version?.firstMs, versionLastMs: version?.lastMs })), [updateChoice]);
   const resetOffset = useCallback(() => updateChoice((current) => ({ ...current, offsetMs: 0 })), [updateChoice]);
   // Another title means another song's entries: an earlier timing pick no longer applies.
@@ -572,6 +581,7 @@ export function LyricsWidget({ media, connected, seekMedia }: { media: SystemMed
         {size.height ? content : null}
       </Pressable>}
     {debug ? <LyricsDebug media={media} status={lyrics === 'loading' ? 'loading' : lyrics.kind} onClose={() => setDebug(false)}
+      pickedId={choice.lrclibId} shown={picked ? { firstMs: picked.firstMs, lastMs: picked.lastMs } : autoSpan} onUseEntry={useEntry} onAutomatic={useAutomatic}
       sync={{ versions, shown: picked ?? auto, auto, synced: autoSpan !== undefined, reason: lyrics !== 'loading' && lyrics.kind === 'synced' ? lyrics.reason : undefined, picked: picked !== undefined, offsetMs: choice.offsetMs }}
       onPickVersion={pickVersion} onResetOffset={resetOffset} typedTitle={typedTitle} onSearchTitle={searchTitle} /> : null}
   </View>;
@@ -584,8 +594,8 @@ type SyncPanel = { versions: TimingVersion[]; shown?: TimingVersion; auto?: Timi
 
 // The sync fixes, then what the PC reported for the track and each lookup step, refreshed while a lookup
 // is still running. Tapping a timing version uses it for this track from now on.
-function LyricsDebug({ media, status, onClose, sync, onPickVersion, onResetOffset, typedTitle, onSearchTitle }: { media: SystemMediaState; status: string; onClose: () => void; sync: SyncPanel; onPickVersion: (version: TimingVersion | undefined) => void; onResetOffset: () => void; typedTitle?: string; onSearchTitle: (title: string | undefined) => void }) {
-  const [draft, setDraft] = useState(typedTitle ?? '');
+function LyricsDebug({ media, status, onClose, pickedId, shown, onUseEntry, onAutomatic, sync, onPickVersion, onResetOffset, typedTitle, onSearchTitle }: { media: SystemMediaState; status: string; onClose: () => void; pickedId?: number; shown?: { firstMs: number; lastMs: number }; onUseEntry: (entry: LyricsEntry) => void; onAutomatic: () => void; sync: SyncPanel; onPickVersion: (version: TimingVersion | undefined) => void; onResetOffset: () => void; typedTitle?: string; onSearchTitle: (title: string | undefined) => void }) {
+  const [finding, setFinding] = useState(false);
   const [, setRefresh] = useState(0);
   useEffect(() => {
     const interval = setInterval(() => setRefresh((value) => value + 1), 500);
@@ -611,12 +621,15 @@ function LyricsDebug({ media, status, onClose, sync, onPickVersion, onResetOffse
         <SafeAreaView pointerEvents="box-none" style={styles.debugSafeArea}>
           <View accessibilityViewIsModal style={styles.debug}>
             <View style={styles.debugHeader}>
-              <Text accessibilityRole="header" style={styles.debugTitle}>Lyrics details</Text>
+              {finding ? <Pressable onPress={() => setFinding(false)} accessibilityRole="button" accessibilityLabel="Back to lyrics details" style={styles.debugBack}>
+                <ChevronLeft size={20} color={colors.text} />
+              </Pressable> : null}
+              <Text accessibilityRole="header" style={styles.debugTitle}>{finding ? 'Find lyrics' : 'Lyrics details'}</Text>
               <Pressable onPress={onClose} accessibilityRole="button" accessibilityLabel="Close lyrics details" style={styles.debugClose}>
                 <X size={20} color={colors.text} />
               </Pressable>
             </View>
-            <ScrollView style={styles.debugScroll} contentContainerStyle={styles.debugContent} keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag" contentInsetAdjustmentBehavior="never" directionalLockEnabled bounces={false} overScrollMode="never" indicatorStyle="white">
+            {finding ? <LyricsFinder media={media} pickedId={pickedId} shown={shown} onUse={onUseEntry} onAutomatic={onAutomatic} /> : <ScrollView style={styles.debugScroll} contentContainerStyle={styles.debugContent} keyboardShouldPersistTaps="handled" keyboardDismissMode="on-drag" contentInsetAdjustmentBehavior="never" directionalLockEnabled bounces={false} overScrollMode="never" indicatorStyle="white">
               <Text allowFontScaling={false} style={styles.debugHeading}>Sync</Text>
               <View style={styles.debugRow}>
                 <Text allowFontScaling={false} style={styles.debugText}>offset: {sync.offsetMs === 0 ? 'none' : `${signedSeconds(sync.offsetMs)} (${sync.offsetMs < 0 ? 'lyrics later' : 'lyrics earlier'})`}</Text>
@@ -633,19 +646,19 @@ function LyricsDebug({ media, status, onClose, sync, onPickVersion, onResetOffse
                 })}
                 {sync.picked ? <Pressable onPress={() => onPickVersion(undefined)} accessibilityRole="button" accessibilityLabel="Go back to the automatic timing" style={styles.debugChip}><Text allowFontScaling={false} style={styles.debugChipText}>Back to automatic</Text></Pressable> : null}
               </> : null}
-              <Text allowFontScaling={false} style={styles.debugHeading}>Song name</Text>
-              <Text allowFontScaling={false} style={styles.debugText}>{typedTitle ? `searching with "${typedTitle}" instead of the PC's title` : 'Lyrics missing or wrong? Type the song name as LRCLIB lists it, e.g. in English.'}</Text>
-              <View style={styles.debugRow}>
-                <TextInput value={draft} onChangeText={setDraft} onSubmitEditing={() => onSearchTitle(draft)} placeholder="Song name" placeholderTextColor={colors.faint} returnKeyType="search" autoCorrect={false} maxLength={MAX_TYPED_TITLE} accessibilityLabel="Song name to search lyrics with" style={styles.debugInput} />
-                <Pressable onPress={() => onSearchTitle(draft)} disabled={!draft.trim()} hitSlop={6} accessibilityRole="button" accessibilityLabel="Search lyrics with this song name" style={[styles.debugChip, !draft.trim() && styles.debugChipDisabled]}><Text allowFontScaling={false} style={styles.debugChipText}>Search</Text></Pressable>
-                {typedTitle ? <Pressable onPress={() => {
-                  setDraft('');
-                  onSearchTitle(undefined);
-                }} hitSlop={6} accessibilityRole="button" accessibilityLabel="Use the PC's title again" style={styles.debugChip}><Text allowFontScaling={false} style={styles.debugChipText}>Use PC title</Text></Pressable> : null}
-              </View>
+              <Text allowFontScaling={false} style={styles.debugHeading}>Lyrics</Text>
+              <Text allowFontScaling={false} style={styles.debugText}>{pickedId !== undefined ? `using the entry you picked (LRCLIB #${pickedId})` : 'Wrong or missing lyrics? Search LRCLIB and pick the right entry.'}</Text>
+              <Pressable onPress={() => setFinding(true)} accessibilityRole="button" accessibilityLabel="Find lyrics on LRCLIB" style={({ pressed }) => [styles.debugPrimary, pressed && { opacity: 0.76 }]}>
+                <Search size={15} color="#18181b" /><Text allowFontScaling={false} style={styles.debugPrimaryText}>Find lyrics</Text>
+              </Pressable>
+              {pickedId !== undefined ? <Pressable onPress={onAutomatic} hitSlop={6} accessibilityRole="button" accessibilityLabel="Go back to automatic lyrics" style={styles.debugChip}><Text allowFontScaling={false} style={styles.debugChipText}>Back to automatic</Text></Pressable> : null}
+              {typedTitle ? <View style={styles.debugRow}>
+                <Text allowFontScaling={false} style={styles.debugText}>searching with “{typedTitle}” instead of the PC’s title</Text>
+                <Pressable onPress={() => onSearchTitle(undefined)} hitSlop={6} accessibilityRole="button" accessibilityLabel="Use the PC's title again" style={styles.debugChip}><Text allowFontScaling={false} style={styles.debugChipText}>Use PC title</Text></Pressable>
+              </View> : null}
               <Text allowFontScaling={false} style={styles.debugHeading}>Details</Text>
               {rows.map((row, index) => <Text key={index} allowFontScaling={false} selectable style={styles.debugText}>{row}</Text>)}
-            </ScrollView>
+            </ScrollView>}
           </View>
         </SafeAreaView>
       </KeyboardAvoidingView>
@@ -670,8 +683,11 @@ const styles = StyleSheet.create({
   debugSafeArea: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 16 },
   debug: { flex: 1, width: '100%', maxWidth: 560, maxHeight: '90%', minHeight: 0, borderRadius: 16, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.bg, overflow: 'hidden' },
   debugHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 8, paddingLeft: 16, paddingRight: 8, borderBottomWidth: 1, borderBottomColor: colors.border },
-  debugTitle: { color: colors.text, fontSize: 16, fontWeight: '600' },
+  debugTitle: { flex: 1, color: colors.text, fontSize: 16, fontWeight: '600' },
   debugClose: { width: 40, height: 40, alignItems: 'center', justifyContent: 'center', borderRadius: 8 },
+  debugBack: { width: 40, height: 40, marginLeft: -12, alignItems: 'center', justifyContent: 'center', borderRadius: 8 },
+  debugPrimary: { height: 41, borderRadius: 5, backgroundColor: '#e4e4e7', flexDirection: 'row', gap: 7, alignItems: 'center', justifyContent: 'center' },
+  debugPrimaryText: { color: '#18181b', fontSize: 14, fontWeight: '600' },
   debugScroll: { flex: 1, minHeight: 0 },
   debugContent: { padding: 16, gap: 8 },
   debugText: { color: colors.text, fontSize: 11, lineHeight: 15, fontFamily: Platform.select({ ios: 'Menlo', default: 'monospace' }) },
@@ -679,8 +695,6 @@ const styles = StyleSheet.create({
   debugRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
   debugChip: { alignSelf: 'flex-start', paddingHorizontal: 8, paddingVertical: 5, borderRadius: 8, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panelRaised },
   debugChipSelected: { borderColor: colors.accent },
-  debugChipDisabled: { opacity: 0.4 },
-  debugInput: { flexGrow: 1, flexShrink: 1, minWidth: 120, paddingHorizontal: 8, paddingVertical: 5, borderRadius: 8, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panel, color: colors.text, fontSize: 12 },
   debugChipText: { color: colors.text, fontSize: 12, fontWeight: '600' },
   plainHint: { color: colors.faint, fontWeight: '600', marginBottom: 8 },
 });

@@ -1,7 +1,7 @@
 // Run: node scripts/check-lyrics.ts
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { activeLineAt, nearestVersion, withoutSong, artistMatches, cleanArtist, cleanTitle, isGapLine, latinArtist, latinPart, lyricsTrackKey, matchAlias, matchContext, nativePart, nativeSongTitle, normalizeText, parseLrc, pickLooseResult, pickSearchResult, quotedSong, romanize, searchQueries, soundKey, timingVersions, titleMatches, withIntroGap } from '../phone-app/src/lyrics.ts';
+import { activeLineAt, buildEntryList, fetchLyricsById, guessFields, nearestVersion, searchEntries, withoutSong, artistMatches, cleanArtist, cleanTitle, isGapLine, latinArtist, latinPart, lyricsTrackKey, matchAlias, matchContext, nativePart, nativeSongTitle, normalizeText, parseLrc, pickLooseResult, pickSearchResult, quotedSong, romanize, searchQueries, soundKey, timingVersions, titleMatches, withIntroGap } from '../phone-app/src/lyrics.ts';
 import { fetchLyrics, lyricsTrace, setLyricsUserAgent } from '../phone-app/src/lyrics.ts';
 
 assert.equal(
@@ -442,6 +442,153 @@ try {
   assert.equal(laterSearches, 2);
 } finally {
   globalThis.fetch = originalFetch;
+}
+
+// Find lyrics: the pick list built from real LRCLIB responses (scripts/fixtures, trimmed to the lines the
+// logic reads). "Summer Rain SAM KIM" holds 7 entries: four copies of one timing (one titled in two
+// scripts), one that opens 0.5 s earlier and ends 0.6 s earlier, one unsynced, and an instrumental version.
+{
+  const samKim = JSON.parse(readFileSync(new URL('./fixtures/lrclib-summer-rain.json', import.meta.url), 'utf8'));
+  const nameOnly = JSON.parse(readFileSync(new URL('./fixtures/lrclib-summer-rain-name-only.json', import.meta.url), 'utf8'));
+  const video = { title: "SAM KIM (샘김) 'Summer Rain' MV", artist: '1theK', durationMs: 202_000 };
+  const typed = { song: 'Summer Rain', artist: 'Sam Kim' };
+
+  // The fields start with the song and artist inside the video title, not the noisy title itself.
+  assert.deepEqual(guessFields(video), { song: 'Summer Rain', artist: 'SAM KIM', songs: [], artists: ['1theK'] });
+  assert.deepEqual(guessFields({ title: 'Arijit Singh - Kesariya (Official Video)', artist: 'T-Series' }), { song: 'Kesariya', artist: 'Arijit Singh', songs: ['Arijit Singh', 'Arijit Singh - Kesariya'], artists: ['T-Series'] });
+  assert.deepEqual(guessFields({ title: 'Blinding Lights', artist: 'The Weeknd' }), { song: 'Blinding Lights', artist: 'The Weeknd', songs: [], artists: [] });
+  // Film uploads ("Song - Film | Cast | Singer") put the song on the left.
+  assert.equal(guessFields({ title: 'Kesariya - Brahmāstra | Ranbir Kapoor | Arijit Singh', artist: 'Sony Music India' }).song, 'Kesariya');
+
+  // Fitting length: the timing four entries share is recommended, with the reason.
+  const list = buildEntryList(samKim, video, typed);
+  assert.equal(list.total, 7);
+  assert.equal(list.recommendedId, 34467573);
+  assert.equal(list.reason, 'Same length, same artist, 4 entries share this timing');
+  assert.equal(list.closestId, undefined);
+  assert.deepEqual(list.entries.map((entry) => [entry.id, entry.ids.length, entry.kind, entry.variant]), [
+    [34467573, 4, 'synced', undefined], [10270491, 1, 'synced', undefined], [2171244, 1, 'plain', undefined], [14527123, 1, 'synced', 'Instrumental version'],
+  ], 'recommended first, then the other timing, unsynced, and the instrumental version last');
+  assert.equal(list.entries[0].fitsLength, true);
+  assert.deepEqual(list.entries[0].preview[0], { timeMs: 650, text: '우리 같이 걷던 곳' });
+  assert.deepEqual(list.others, []);
+  // The recommendation is the timing the automatic lookup would use for the same song.
+  const auto = pickSearchResult(samKim, matchContext(video, { title: typed.song, artist: typed.artist }), { allowDominant: false });
+  assert.equal(auto?.kind, 'synced');
+  assert.equal(auto?.kind === 'synced' ? auto.lines[0].timeMs : -1, list.entries[0].firstMs);
+
+  // A length 20 s off fits nothing: no recommendation, the nearest is marked instead.
+  const off = buildEntryList(samKim, { ...video, durationMs: 222_000 }, typed);
+  assert.equal(off.recommendedId, undefined);
+  assert.equal(off.reason, undefined);
+  assert.equal(off.closestId, 34467573);
+  assert.ok(off.entries.every((entry) => entry.fitsLength === false));
+
+  // An unknown length falls back to name and artist, and says so.
+  const unknown = buildEntryList(samKim, { ...video, durationMs: undefined }, typed);
+  assert.equal(unknown.recommendedId, 34467573);
+  assert.equal(unknown.reason, 'Song length unknown, so matched on name and artist, 4 entries share this timing');
+  assert.equal(unknown.lengthKnown, false);
+
+  // Entries with identical lyrics can list different lengths (a real "Good Day" entry says 930 s): the row
+  // shows, and uses, the entry whose length is closest to the song, so it never contradicts itself.
+  const stamp = (ms: number) => `[${String(Math.floor(ms / 60000)).padStart(2, '0')}:${((ms % 60000) / 1000).toFixed(2).padStart(5, '0')}]`;
+  const entry = (id: number, durationS: number, firstMs: number, lastMs: number, name = 'Good Day', artistName = 'IU') => ({
+    id, trackName: name, artistName, albumName: 'Album', duration: durationS, instrumental: false, plainLyrics: 'a\nb\nc\nd',
+    syncedLyrics: [firstMs, firstMs + 10_000, firstMs + 20_000, lastMs].map((time, index) => `${stamp(time)} line ${index}`).join('\n'),
+  });
+  const goodDay = { title: '[MV] IU(아이유) _ 좋은 날(Good Day)', artist: '1theK', durationMs: 235_000 };
+  const bogus = buildEntryList([entry(1, 930, 9000, 200_000), entry(2, 235, 9100, 200_100), entry(3, 234, 9000, 200_000)], goodDay, { song: 'Good Day', artist: 'IU' });
+  assert.equal(bogus.entries.length, 1);
+  assert.deepEqual([bogus.entries[0].id, bogus.entries[0].ids, bogus.entries[0].durationS, bogus.entries[0].fitsLength], [2, [2, 1, 3], 235, true]);
+  assert.equal(bogus.recommendedId, 2);
+  assert.equal(bogus.reason, 'Same length, same artist, 3 entries share this timing');
+
+  // A music video's intro delays the singing: of two fitting timings, the one starting a few seconds
+  // later is recommended for a video title, and the one most entries share for a plain title.
+  const timings = [entry(10, 200, 5000, 190_000), entry(11, 200, 5100, 190_100), entry(12, 200, 4900, 189_900), entry(13, 200, 12_300, 197_000)];
+  const videoList = buildEntryList(timings, { title: 'IU - Good Day (Official MV)', artist: 'IU', durationMs: 200_000 }, { song: 'Good Day', artist: 'IU' });
+  assert.equal(videoList.recommendedId, 13);
+  assert.equal(videoList.reason, 'Same length, same artist, music video timing');
+  const audioList = buildEntryList(timings, { title: 'Good Day', artist: 'IU', durationMs: 200_000 }, { song: 'Good Day', artist: 'IU' });
+  assert.equal(audioList.recommendedId, 10);
+  assert.equal(audioList.reason, 'Same length, same artist, 3 entries share this timing');
+  assert.equal(audioList.entries.length, 2);
+
+  // A name written in two scripts starts as its Latin half, which LRCLIB matches best; the native half and
+  // the whole name are suggestions.
+  const twoScripts = guessFields({ title: '[MV] IU(아이유) _ 좋은 날(Good Day)', artist: '1theK' });
+  assert.deepEqual([twoScripts.song, twoScripts.artist], ['Good Day', 'IU']);
+  assert.ok(twoScripts.songs.includes('좋은 날') && twoScripts.songs.includes('좋은 날(Good Day)'));
+  assert.ok(twoScripts.artists.includes('아이유'));
+
+  // Songs by other artists that share the name go to "other songs", and nothing is recommended among them.
+  const wrongArtists = buildEntryList(nameOnly, video, typed);
+  assert.deepEqual(wrongArtists.entries, []);
+  assert.equal(wrongArtists.recommendedId, undefined);
+  assert.ok(wrongArtists.others.length > 10 && wrongArtists.others.every((entry) => !/sam kim/i.test(entry.artist)));
+  // With no artist typed every artist's entry of this name is a candidate, and the length decides.
+  const anyArtist = buildEntryList(nameOnly, { title: 'Summer Rain', durationMs: 220_000 }, { song: 'Summer Rain', artist: '' });
+  assert.equal(anyArtist.others.length, 0);
+  assert.ok(anyArtist.entries.length > 10);
+  assert.equal(anyArtist.recommendedId, 36963849);
+
+  // Searching: song + artist first, widening to the song alone only when that finds fewer than three
+  // entries of it, and free text only when nothing is found. Entries seen twice are listed once.
+  const realFetch = globalThis.fetch;
+  const asked: string[] = [];
+  const respond = (handler: (url: URL) => unknown) => {
+    globalThis.fetch = async (input) => {
+      asked.push(String(input).replace('https://lrclib.net', ''));
+      return new Response(JSON.stringify(handler(new URL(String(input)))), { headers: { 'Content-Type': 'application/json' } });
+    };
+  };
+  const queryNames = () => asked.map((request) => request.split('?')[1]?.split('=')[0]);
+  try {
+    // Song + artist finds enough entries (four rows): nothing more is asked.
+    asked.length = 0;
+    respond(() => samKim);
+    const enough = await searchEntries({ song: 'Summer Rain', artist: 'Sam Kim' }, video);
+    assert.equal(enough.recommendedId, 34467573);
+    assert.deepEqual(asked, ['/api/search?track_name=Summer%20Rain&artist_name=Sam%20Kim']);
+
+    // Too few (the artist is written differently on LRCLIB): the song alone is searched too, and an
+    // entry that both searches return is listed once.
+    asked.length = 0;
+    respond((url) => url.searchParams.has('artist_name') ? samKim.slice(0, 2) : samKim);
+    const widened = await searchEntries({ song: 'Summer Rain', artist: 'Sam Kim' }, video);
+    assert.deepEqual(asked, ['/api/search?track_name=Summer%20Rain&artist_name=Sam%20Kim', '/api/search?track_name=Summer%20Rain']);
+    assert.equal(widened.total, 7, 'seven entries, not nine');
+    assert.equal(widened.entries.length, 4);
+
+    // Free text is the last resort, tried only when nothing was found.
+    asked.length = 0;
+    respond((url) => url.searchParams.has('q') ? samKim : []);
+    const viaText = await searchEntries({ song: 'Summer Rain', artist: 'Sam Kim' }, video);
+    assert.equal(viaText.recommendedId, 34467573);
+    assert.deepEqual(queryNames(), ['track_name', 'track_name', 'q']);
+
+    asked.length = 0;
+    respond(() => []);
+    const none = await searchEntries({ song: 'Summer Rain Official MV', artist: '' }, video);
+    assert.deepEqual([none.entries.length, none.others.length, none.total], [0, 0, 0]);
+    assert.deepEqual(queryNames(), ['track_name', 'q']);
+    asked.length = 0;
+    assert.deepEqual((await searchEntries({ song: '  ', artist: 'Sam Kim' }, video)).entries, [], 'an empty song asks nothing');
+    assert.deepEqual(asked, []);
+
+    // A picked entry is shown from the search that found it, or fetched by its number.
+    respond(() => samKim);
+    await searchEntries({ song: 'Summer Rain', artist: 'Sam Kim' }, video);
+    asked.length = 0;
+    assert.equal((await fetchLyricsById(34467573)).kind, 'synced');
+    assert.deepEqual(asked, [], 'an entry from the list needs no second request');
+    respond(() => samKim[0]);
+    assert.equal((await fetchLyricsById(99_999_001)).kind, 'synced');
+    assert.deepEqual(asked, ['/api/get/99999001'], 'fetched by number');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 }
 
 console.log('lyrics checks passed (including dominant timing fallback, Android request recovery and unchanged iOS/desktop headers)');

@@ -17,7 +17,7 @@ export type LyricsTrack = { title?: string; artist?: string; album?: string; dur
 // What a lookup tried, step by step, for the widget's debug readout.
 export type LyricsTrace = { key: string | null; steps: string[] };
 
-type LrclibRecord = { id?: unknown; trackName?: unknown; artistName?: unknown; duration?: unknown; instrumental?: unknown; plainLyrics?: unknown; syncedLyrics?: unknown };
+type LrclibRecord = { id?: unknown; trackName?: unknown; artistName?: unknown; albumName?: unknown; duration?: unknown; instrumental?: unknown; plainLyrics?: unknown; syncedLyrics?: unknown };
 
 const API = 'https://lrclib.net/api';
 // LRCLIB asks clients to identify themselves. Browsers can't set User-Agent, so use its alternative header.
@@ -588,7 +588,7 @@ async function getJsonOnce(url: string, headers: Record<string, string>): Promis
 }
 
 const lrclib = (path: string, params: Record<string, string>, steps: string[]) => getJson(
-  `${API}${path}?${queryString(params)}`,
+  `${API}${path}${Object.keys(params).length > 0 ? `?${queryString(params)}` : ''}`,
   steps,
   lrclibUserAgent ? { ...HEADERS, 'User-Agent': lrclibUserAgent } : HEADERS,
 );
@@ -803,4 +803,311 @@ export function fetchLyrics(track: LyricsTrack, typedTitle?: string): Promise<Ly
 export function lyricsTrace(track: LyricsTrack, typedTitle?: string): LyricsTrace {
   const key = lookupKey(track, typedTitle);
   return { key, steps: key ? [...(traces.get(key) ?? [])] : [] };
+}
+
+
+// ── Find lyrics: search LRCLIB and list its entries so one can be picked ──────────────────────────────
+
+// The song and artist typed into the Find lyrics screen.
+export type EntryFields = { song: string; artist: string };
+
+// What the screen's two fields start with, and one-tap suggestions for each, from what the PC reported.
+export type FieldGuess = { song: string; artist: string; songs: string[]; artists: string[] };
+
+const MAX_SUGGESTION = 80;
+const MAX_SUGGESTIONS = 4;
+
+const distinct = (values: (string | null | undefined)[], skip: string) => {
+  const seen = new Set([comparable(skip)]);
+  const result: string[] = [];
+  for (const value of values) {
+    const text = value?.trim();
+    if (!text || text.length > MAX_SUGGESTION || seen.has(comparable(text))) continue;
+    seen.add(comparable(text));
+    result.push(text);
+  }
+  return result.slice(0, MAX_SUGGESTIONS);
+};
+
+// A video title is a poor search term, so the fields start with the song and artist found inside it:
+// the quoted name of "ARTIST 'Song' MV", else the right half of "Artist - Song", or the left half of
+// "Song - Film | Cast | Singer" (film uploads list people after bars). The other readings and the PC's
+// own artist are offered as suggestions.
+export function guessFields(track: LyricsTrack): FieldGuess {
+  const title = cleanTitle(track.title ?? '');
+  const quoted = quotedSong(track.title ?? '');
+  const dash = title.match(/^(.+?)\s+[-–—]\s+(.+)$/);
+  const right = dash ? cleanTitle(dash[2]) : null;
+  const left = dash ? cleanTitle(dash[1]) : null;
+  const filmStyle = dash !== null && (track.title ?? '').includes('|');
+  const reported = cleanArtist(track.artist ?? '');
+  const chosenSong = quoted?.title || (filmStyle ? left : right) || title;
+  const chosenArtist = quoted?.artist || (dash && !filmStyle ? cleanArtist(dash[1]) : '') || reported;
+  // A name written in two scripts ("좋은 날(Good Day)", "IU(아이유)") starts as its Latin half, which LRCLIB
+  // matches best; the native half and the whole name are offered as suggestions.
+  const latinFirst = (name: string, clean: (text: string) => string) => hasNativeScript(name) && latinPart(name) ? clean(latinPart(name)) : name;
+  const song = latinFirst(chosenSong, cleanTitle);
+  const artist = latinFirst(chosenArtist, cleanArtist);
+  const halves = (name: string) => hasNativeScript(name) && latinPart(name) ? [nativePart(name), name] : [];
+  return {
+    song,
+    artist,
+    // The whole cleaned title is only a useful reading when no quoted name was found inside it.
+    songs: distinct([...halves(chosenSong), quoted?.title, filmStyle ? right : left, filmStyle ? left : right, quoted ? null : title, withoutSong(title)], song),
+    artists: distinct([...halves(chosenArtist), quoted?.artist, dash ? cleanArtist(dash[1]) : null, latinArtist(track), reported], artist),
+  };
+}
+
+// Another version of the song, named in the entry's title: its lyrics or timing may belong to a different cut.
+const VARIANT_WORDS: [RegExp, string][] = [
+  [/\binst(?:rumental)?\b\.?/i, 'Instrumental version'],
+  [/\b(?:live|concert|unplugged)\b/i, 'Live'],
+  [/\b(?:remix|rmx|radio mix|extended mix)\b/i, 'Remix'],
+  [/\bacoustic\b/i, 'Acoustic'],
+  [/\bkaraoke\b/i, 'Karaoke'],
+  [/\b(?:sped\s*up|slowed|nightcore|8d)\b/i, 'Sped up or slowed'],
+  [/\bcover\b/i, 'Cover'],
+];
+
+// A version label for an entry's title, unless the song being played carries the same word.
+function variantOf(trackName: string, context: MatchContext): string | undefined {
+  for (const [pattern, label] of VARIANT_WORDS) {
+    const word = trackName.match(pattern)?.[0];
+    if (word && !context.text.includes(` ${comparable(word)} `)) return label;
+  }
+  return undefined;
+}
+
+// The title without its version words, so "Song (Inst.)" can still be recognised as the song.
+function withoutVariant(trackName: string): string {
+  let name = trackName;
+  for (const [pattern] of VARIANT_WORDS) {
+    name = name.replace(new RegExp(`\\s*[([][^)\\]]*${pattern.source}[^)\\]]*[)\\]]`, 'gi'), '').replace(new RegExp(`\\s+[-–—]?\\s*${pattern.source}`, 'gi'), '');
+  }
+  return name.trim();
+}
+
+export type EntryPreviewLine = { timeMs?: number; text: string };
+
+// One row of the pick list: one LRCLIB entry, or several that carry exactly the same timing (or text).
+export type LyricsEntry = {
+  // The LRCLIB entry to use, and every entry this row stands for.
+  id: number;
+  ids: number[];
+  title: string;
+  artist: string;
+  album: string;
+  kind: 'synced' | 'plain' | 'instrumental';
+  // Set when the title names another version of the song ("Instrumental version", "Live", ...).
+  variant?: string;
+  durationS?: number;
+  // The entry's length minus the playing song's, in seconds; known when both are.
+  lengthGapS?: number;
+  fitsLength?: boolean;
+  // Synced lyrics run past the end of the playing song, so their timing belongs to a longer cut.
+  overruns: boolean;
+  firstMs?: number;
+  lastMs?: number;
+  lineCount: number;
+  preview: EntryPreviewLine[];
+};
+
+export type EntryList = {
+  // Entries for this song, best first, and entries for other songs that share the name.
+  entries: LyricsEntry[];
+  others: LyricsEntry[];
+  // The entry to use if you have no preference, with why; absent when nothing fits the song.
+  recommendedId?: number;
+  reason?: string;
+  // Without a recommendation, the entry nearest to fitting.
+  closestId?: number;
+  // How many LRCLIB entries with usable lyrics the searches found.
+  total: number;
+  lengthKnown: boolean;
+};
+
+type Draft = LyricsEntry & { titleMatch: boolean; strongTitle: boolean; artistMatch: boolean; related: boolean; text: string };
+
+const PREVIEW_LINES = 4;
+const MAX_OTHERS = 20;
+const OVERRUN_ALLOWANCE_MS = 5000;
+
+function toDraft(record: LrclibRecord, context: MatchContext): Draft | null {
+  const lyrics = fromRecord(record);
+  if (!lyrics || lyrics.kind === 'none' || lyrics.kind === 'error' || typeof record.id !== 'number') return null;
+  const title = typeof record.trackName === 'string' ? record.trackName : '';
+  const artist = typeof record.artistName === 'string' ? record.artistName : '';
+  const album = typeof record.albumName === 'string' ? record.albumName : '';
+  const durationS = typeof record.duration === 'number' && Number.isFinite(record.duration) ? record.duration : undefined;
+  const lengthGapS = durationS !== undefined && context.durationMs ? durationS - context.durationMs / 1000 : undefined;
+  const variant = variantOf(title, context);
+  const artistMatch = artistMatches(record, context);
+  const titleMatch = titleMatches(record, context) || (variant !== undefined && titleMatches({ ...record, trackName: withoutVariant(title) }, context));
+  const sung = lyrics.kind === 'synced' ? lyrics.lines.filter((line) => !isGapLine(line)) : [];
+  const text = lyrics.kind === 'plain' ? lyrics.text : '';
+  return {
+    id: record.id, ids: [record.id], title, artist, album, kind: lyrics.kind, variant, durationS, lengthGapS,
+    fitsLength: lengthGapS === undefined ? undefined : Math.abs(lengthGapS) <= DURATION_TOLERANCE_S,
+    overruns: lyrics.kind === 'synced' && Boolean(context.durationMs) && lyrics.lines[lyrics.lines.length - 1].timeMs > (context.durationMs ?? 0) + OVERRUN_ALLOWANCE_MS,
+    firstMs: sung[0]?.timeMs, lastMs: sung[sung.length - 1]?.timeMs, lineCount: lyrics.kind === 'synced' ? sung.length : text.split(/\r?\n/).filter((line) => line.trim()).length,
+    preview: lyrics.kind === 'synced' ? sung.slice(0, PREVIEW_LINES).map((line) => ({ timeMs: line.timeMs, text: line.text })) : text.split(/\r?\n/).filter((line) => line.trim()).slice(0, PREVIEW_LINES).map((line) => ({ text: line.trim() })),
+    titleMatch, strongTitle: titleMatches(record, context, true), artistMatch, related: false,
+    text,
+  };
+}
+
+// Merges drafts that carry the same thing: synced entries with the same first and last line, plain ones
+// with the same text. Versions of the song are kept apart from the song itself. Entries with identical
+// lyrics can list different lengths (one of "Good Day" says 930 s), so the row shows, and uses, the entry
+// whose length is closest to the song playing.
+function groupDrafts(drafts: Draft[]): Draft[] {
+  const groups: Draft[][] = [];
+  for (const draft of drafts) {
+    const same = groups.find(([first]) => first.related === draft.related && first.kind === draft.kind && first.variant === draft.variant && (
+      draft.kind === 'synced'
+        ? Math.abs((first.firstMs ?? 0) - (draft.firstMs ?? 0)) <= VERSION_TOLERANCE_MS && Math.abs((first.lastMs ?? 0) - (draft.lastMs ?? 0)) <= VERSION_TOLERANCE_MS
+        : draft.kind === 'plain' ? first.text === draft.text : true));
+    if (same) same.push(draft);
+    else groups.push([draft]);
+  }
+  return groups.map((members) => {
+    const nearer = (a: Draft, b: Draft) => Math.abs(b.lengthGapS ?? Infinity) < Math.abs(a.lengthGapS ?? Infinity) ? b : a;
+    const best = members.reduce(nearer);
+    return { ...best, ids: [best.id, ...members.filter((member) => member !== best).map((member) => member.id)] };
+  });
+}
+
+const KIND_ORDER = { synced: 0, plain: 1, instrumental: 2 };
+
+// Best first: the song itself before its other versions, entries that fit the song's length and don't run
+// past its end, synced before unsynced, then the timing most entries share, then the nearest length.
+function ranked(drafts: Draft[]): Draft[] {
+  return drafts.map((draft, index) => ({ draft, index })).sort((a, b) =>
+    Number(a.draft.variant !== undefined) - Number(b.draft.variant !== undefined) ||
+    Number(a.draft.fitsLength === false) - Number(b.draft.fitsLength === false) ||
+    Number(a.draft.overruns) - Number(b.draft.overruns) ||
+    KIND_ORDER[a.draft.kind] - KIND_ORDER[b.draft.kind] ||
+    b.draft.ids.length - a.draft.ids.length ||
+    Math.abs(a.draft.lengthGapS ?? 0) - Math.abs(b.draft.lengthGapS ?? 0) ||
+    a.index - b.index).map(({ draft }) => draft);
+}
+
+const publicEntry = (draft: Draft): LyricsEntry => ({
+  id: draft.id, ids: draft.ids, title: draft.title, artist: draft.artist, album: draft.album, kind: draft.kind, variant: draft.variant,
+  durationS: draft.durationS, lengthGapS: draft.lengthGapS, fitsLength: draft.fitsLength, overruns: draft.overruns,
+  firstMs: draft.firstMs, lastMs: draft.lastMs, lineCount: draft.lineCount, preview: draft.preview,
+});
+
+function whyRecommended(entry: Draft, lengthKnown: boolean, video: boolean): string {
+  const parts: string[] = [];
+  if (!lengthKnown) parts.push('song length unknown, so matched on name and artist');
+  else {
+    if (entry.lengthGapS !== undefined) parts.push(Math.abs(entry.lengthGapS) <= 1 ? 'same length' : `length within ${Math.round(Math.abs(entry.lengthGapS))} s`);
+    if (entry.artistMatch) parts.push('same artist');
+  }
+  if (video) parts.push('music video timing');
+  if (entry.ids.length > 1) parts.push(`${entry.ids.length} entries share this timing`);
+  if (entry.kind === 'plain') parts.push('only unsynced lyrics fit');
+  const text = parts.join(', ');
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+// Sorts LRCLIB's results into the pick list for a song: rows for entries of this song, rows for other songs
+// that share its name, and the entry Freeze recommends, chosen from the rows on the list by the same
+// principles as the automatic lookup (see pickSearchResult).
+export function buildEntryList(found: LrclibRecord[], track: LyricsTrack, fields: EntryFields): EntryList {
+  const song = fields.song.trim();
+  const artist = fields.artist.trim();
+  const context = matchContext(track, song ? { title: song, artist: artist || undefined } : undefined);
+  const seen = new Set<unknown>();
+  const unique = found.filter((record) => record.id === undefined || !seen.has(record.id) && seen.add(record.id));
+  const drafts = unique.flatMap((record) => toDraft(record, context) ?? []);
+  // With no artist typed, any artist's entry of this name is the song; with one, the artist must match.
+  const groups = groupDrafts(drafts.map((draft) => ({ ...draft, related: draft.titleMatch && (artist ? draft.artistMatch : true) })));
+  const lengthKnown = Boolean(context.durationMs);
+  const related = ranked(groups.filter((group) => group.related));
+  const others = ranked(groups.filter((group) => !group.related)).slice(0, MAX_OTHERS);
+
+  // Rows of the song itself (not its other versions) that fit: the length within the tolerance and no lyrics
+  // running past the end of the song; without a length, only a firm name and artist match counts. The best
+  // ranked row is recommended: the timing most entries share, the nearest length, synced before unsynced.
+  const candidates = related.filter((group) => group.variant === undefined);
+  const fitting = candidates.filter((group) => lengthKnown ? group.fitsLength === true && !group.overruns : group.strongTitle && group.artistMatch);
+  let recommended: Draft | undefined = fitting[0];
+  let video = false;
+  // A music video's intro delays the singing, so among several fitting timings the later one that starts
+  // within a minute of the usual one is used, as in the automatic lookup (see pickSearchResult).
+  const synced = fitting.filter((group) => group.kind === 'synced');
+  if (context.videoTitle && synced.length > 1 && synced[0] === recommended) {
+    const usual = synced[0];
+    const later = synced
+      .filter((group) => (group.firstMs ?? 0) > (usual.firstMs ?? 0) + VERSION_TOLERANCE_MS && (group.firstMs ?? 0) - (usual.firstMs ?? 0) <= MAX_INTRO_MS)
+      .sort((a, b) => (b.firstMs ?? 0) - (a.firstMs ?? 0))[0];
+    if (later) {
+      recommended = later;
+      video = true;
+    }
+  }
+  const closest = recommended ? undefined : candidates[0];
+  // The recommended row leads the list.
+  const entries = recommended ? [recommended, ...related.filter((group) => group !== recommended)] : related;
+  return {
+    entries: entries.map(publicEntry),
+    others: others.map(publicEntry),
+    recommendedId: recommended?.id,
+    reason: recommended ? whyRecommended(recommended, lengthKnown, video) : undefined,
+    closestId: closest?.id,
+    total: drafts.length,
+    lengthKnown,
+  };
+}
+
+// Entries picked from a list are kept so showing one needs no second request.
+const entryCache = new Map<number, Promise<Lyrics>>();
+const MAX_ENTRY_CACHE = 100;
+const keepEntry = (id: number, lyrics: Promise<Lyrics>) => {
+  entryCache.delete(id);
+  entryCache.set(id, lyrics);
+  while (entryCache.size > MAX_ENTRY_CACHE) entryCache.delete(entryCache.keys().next().value as number);
+};
+
+// Searches LRCLIB for what was typed and builds the pick list. Song and artist first; the song alone when
+// that finds fewer than three entries of it (the artist may be written differently on LRCLIB); free text
+// when it still finds none. Failures to reach LRCLIB are thrown so the screen can say so.
+export async function searchEntries(fields: EntryFields, track: LyricsTrack): Promise<EntryList> {
+  const song = normalizeText(fields.song).trim();
+  const artist = normalizeText(fields.artist).trim();
+  const steps: string[] = [];
+  if (!song) return buildEntryList([], track, { song, artist });
+  const found: LrclibRecord[] = [];
+  const attempts: Record<string, string>[] = [
+    ...(artist ? [{ track_name: song, artist_name: artist }] : []),
+    { track_name: song },
+    { q: `${song} ${artist}`.trim() },
+  ];
+  let list = buildEntryList(found, track, { song, artist });
+  for (const [index, params] of attempts.entries()) {
+    const widen = index === 0 || (list.entries.length < 3 && (params.q === undefined || list.entries.length === 0));
+    if (!widen) continue;
+    found.push(...records(await lrclib('/search', params, steps)));
+    list = buildEntryList(found, track, { song, artist });
+  }
+  for (const record of found) {
+    const lyrics = fromRecord(record);
+    if (lyrics && typeof record.id === 'number') keepEntry(record.id, Promise.resolve(lyrics));
+  }
+  return list;
+}
+
+// One LRCLIB entry's lyrics by its number, for a pick that was saved earlier.
+export function fetchLyricsById(id: number): Promise<Lyrics> {
+  const cached = entryCache.get(id);
+  if (cached) return cached;
+  const pending = lrclib(`/get/${id}`, {}, []).then((record): Lyrics => (record && typeof record === 'object' && !Array.isArray(record) ? fromRecord(record as LrclibRecord) : null) ?? { kind: 'none' })
+    .catch((): Lyrics => {
+      entryCache.delete(id);
+      return { kind: 'error' };
+    });
+  keepEntry(id, pending);
+  return pending;
 }
