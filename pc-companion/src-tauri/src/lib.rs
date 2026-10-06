@@ -29,6 +29,7 @@ use tauri::{
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
+mod adb;
 mod pc_stats;
 mod system_media;
 
@@ -2425,43 +2426,47 @@ fn rotate_pairing_key(state: tauri::State<'_, Arc<AppState>>) -> Result<(), Stri
 }
 
 fn ensure_android_usb_reverse() -> Result<(), String> {
-    let devices = Command::new("adb")
-        .args(["devices"])
-        .output()
-        .map_err(|_| {
-            "Install Android SDK Platform-Tools and make adb available in PATH".to_owned()
-        })?;
+    let adb = adb::find().ok_or_else(|| adb::MISSING.to_owned())?;
+    let timeout = Duration::from_secs(15);
+    let devices = adb::run(&adb, &["devices"], timeout).map_err(|error| {
+        // A vanished or stuck adb is looked up again next time.
+        adb::forget();
+        error
+    })?;
     if !devices.status.success() {
         return Err("Android Debug Bridge could not list connected devices".into());
     }
     let output = String::from_utf8_lossy(&devices.stdout);
-    let states: Vec<_> = output
+    let states: Vec<&str> = output
         .lines()
         .skip(1)
+        .filter(|line| !line.trim().is_empty())
         .filter_map(|line| line.split_whitespace().nth(1))
         .collect();
     if states.iter().any(|state| *state == "unauthorized") {
         return Err("Unlock your Android phone and allow USB debugging for this PC".into());
+    }
+    if states.iter().any(|state| *state == "no") {
+        return Err("This PC is not allowed to use the phone over USB. On Linux, add a udev rule for the phone".into());
+    }
+    if states.iter().any(|state| *state == "offline") {
+        return Err("The phone is not responding. Unplug it, plug it in again and unlock it".into());
     }
     if states.len() > 1 {
         return Err("Connect only one Android phone by USB at a time".into());
     }
     let authorized = states.iter().filter(|state| **state == "device").count();
     if authorized == 0 {
-        return Err("Connect one Android phone by USB and enable USB debugging".into());
+        return Err("Connect one Android phone by USB and turn on USB debugging".into());
     }
-    let forwards = Command::new("adb")
-        .args(["reverse", "--list"])
-        .output()
+    let forwards = adb::run(&adb, &["reverse", "--list"], timeout)
         .map_err(|_| "Android Debug Bridge could not check USB forwarding".to_owned())?;
     if forwards.status.success()
         && String::from_utf8_lossy(&forwards.stdout).contains("tcp:39421 tcp:39421")
     {
         return Ok(());
     }
-    let reverse = Command::new("adb")
-        .args(["reverse", "tcp:39421", "tcp:39421"])
-        .output()
+    let reverse = adb::run(&adb, &["reverse", "tcp:39421", "tcp:39421"], timeout)
         .map_err(|_| "Android Debug Bridge could not configure USB forwarding".to_owned())?;
     if !reverse.status.success() {
         let detail = String::from_utf8_lossy(&reverse.stderr);
@@ -2472,6 +2477,16 @@ fn ensure_android_usb_reverse() -> Result<(), String> {
         });
     }
     Ok(())
+}
+
+#[tauri::command]
+fn adb_status() -> adb::Status {
+    adb::status()
+}
+
+#[tauri::command]
+async fn install_adb(app: tauri::AppHandle) -> Result<(), String> {
+    adb::install(app).await.map(|_| ())
 }
 
 fn create_pairing_key() -> String {
@@ -4012,11 +4027,14 @@ pub fn run() {
             request_legacy_deck_import,
             import_legacy_deck,
             enable_android_usb,
+            adb_status,
+            install_adb,
             rotate_pairing_key
         ])
         .setup(move |app| {
             let config_dir = app.path().app_config_dir()?;
             fs::create_dir_all(&config_dir)?;
+            adb::init(&config_dir);
             let token = load_or_create_pairing_key(&config_dir.join("pairing-key"))
                 .map_err(std::io::Error::other)?;
             *state

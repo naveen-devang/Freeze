@@ -217,6 +217,9 @@ function App() {
   const [usbEnabled, setUsbEnabled] = useState(false);
   const [usbBusy, setUsbBusy] = useState(false);
   const [usbError, setUsbError] = useState('');
+  // Set when this PC has no adb: the card then offers Google's download (size in MB) instead of failing.
+  const [adbDownloadMb, setAdbDownloadMb] = useState<number | null>(null);
+  const [adbProgress, setAdbProgress] = useState('');
   const [pairingError, setPairingError] = useState('');
   const [screen, setScreen] = useState<'overview' | 'deck' | 'settings'>('overview');
   const updater = useUpdater();
@@ -339,11 +342,37 @@ function App() {
       await invoke('enable_android_usb');
       setUsbEnabled(true);
       setTransport('usb');
+      setAdbDownloadMb(null);
     } catch (error) {
-      setUsbError(String(error));
+      if (String(error) === 'ADB_MISSING') {
+        const status = await invoke<{ downloadMb: number }>('adb_status').catch(() => null);
+        setAdbDownloadMb(status?.downloadMb ?? 10);
+      } else setUsbError(String(error));
     } finally {
       setUsbBusy(false);
     }
+  }
+
+  async function installAdb() {
+    setUsbBusy(true);
+    setUsbError('');
+    setAdbProgress('Starting…');
+    const stop = await listen<{ stage: string; received: number; total: number }>('adb-progress', ({ payload }) => {
+      setAdbProgress(payload.stage === 'download' ? `Downloading… ${Math.min(100, Math.floor((payload.received / payload.total) * 100))}%` : payload.stage === 'verify' ? 'Checking the download…' : 'Unpacking…');
+    });
+    try {
+      await invoke('install_adb');
+      setAdbDownloadMb(null);
+      stop();
+      setAdbProgress('');
+      await enableAndroidUsb();
+      return;
+    } catch (error) {
+      setUsbError(String(error));
+    }
+    stop();
+    setAdbProgress('');
+    setUsbBusy(false);
   }
 
   async function rotatePairingKey() {
@@ -508,14 +537,17 @@ function App() {
               <div className="usb-setup">
                 <div>
                   <strong>Android USB</strong>
-                  <span>Requires USB debugging and Android Platform-Tools.</span>
+                  <span>{adbDownloadMb !== null
+                    ? `Freeze needs Google's Android USB tool (adb, about ${adbDownloadMb} MB). It is downloaded from dl.google.com and kept inside Freeze.`
+                    : "Needs USB debugging turned on in the phone's Developer options."}</span>
                 </div>
-                <button className="secondary-button" onClick={() => void enableAndroidUsb()} disabled={!connection || usbBusy}>
-                  {usbBusy ? 'Setting up…' : usbEnabled ? 'Reconnect USB' : 'Set up USB'}
+                <button className="secondary-button" onClick={() => void (adbDownloadMb !== null ? installAdb() : enableAndroidUsb())} disabled={!connection || usbBusy}>
+                  {adbProgress || (usbBusy ? 'Setting up…' : adbDownloadMb !== null ? `Download (${adbDownloadMb} MB)` : usbEnabled ? 'Reconnect USB' : 'Set up USB')}
                 </button>
               </div>
               {usbError ? <p className="usb-error" role="alert">{usbError}</p> : null}
               {transport === 'usb' && usbEnabled ? <p className="pair-note">Connect the Android phone by USB, then scan this code. Keep USB debugging enabled while using Freeze.</p> : null}
+              {transport === 'usb' ? <p className="pair-note">On the phone: Settings → About phone → tap Build number 7 times → Developer options → turn on USB debugging, then tap Allow when asked.</p> : null}
               <p className="pair-note">iPhone USB data control needs a compatible MFi accessory. Use Wi-Fi on iOS.</p>
               <button className="secondary-button reset-pairing-button" onClick={() => void rotatePairingKey()}>Reset pairing key</button>
               {pairingError ? <p className="usb-error" role="alert">{pairingError}</p> : null}
