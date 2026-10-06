@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AccessibilityInfo, Animated, Easing, KeyboardAvoidingView, Modal, PanResponder, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { AccessibilityInfo, AppState, Animated, Easing, KeyboardAvoidingView, Modal, PanResponder, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import Storage from 'expo-sqlite/kv-store';
 import type { SystemMediaState } from './connection';
@@ -7,6 +7,7 @@ import { activeLineAt, fetchLyrics, fetchLyricsById, isGapLine, lyricLineOpacity
 import { ChevronLeft, Minus, Plus, RefreshCw, Search, X } from 'lucide-react-native';
 import { LyricsFinder } from './lyrics-finder';
 import { colors } from './theme';
+import { IDLE_MS } from './web-widget-lifecycle';
 
 // ponytail: one fixed lead for every setup; make it a setting if lines feel early or late on some PCs.
 const LYRICS_LEAD_MS = 250;
@@ -35,6 +36,34 @@ const BROWSE_OPACITY = 0.55;
 const ERROR_RETRY_MS = 15_000;
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+
+// Lyrics a widget shows outlive it: turning the phone swaps the deck's whole layout and mounts a new widget,
+// which shows them at once instead of loading again. Like hidden web widgets, they go IDLE_MS after the
+// last widget showing them does. Errors are not kept, so a new widget still retries.
+type KeptLyrics = { lyrics: Lyrics; users: number; drop?: ReturnType<typeof setTimeout> };
+const kept = new Map<string, KeptLyrics>();
+
+function holdLyrics(key: string, lyrics: Lyrics) {
+  const entry = kept.get(key) ?? { lyrics, users: 0 };
+  if (entry.drop) clearTimeout(entry.drop);
+  entry.drop = undefined;
+  entry.lyrics = lyrics;
+  entry.users += 1;
+  kept.set(key, entry);
+  return () => {
+    entry.users -= 1;
+    if (entry.users === 0) entry.drop = setTimeout(() => { if (kept.get(key) === entry) kept.delete(key); }, IDLE_MS);
+  };
+}
+
+function useAppActive() {
+  const [active, setActive] = useState(AppState.currentState === 'active');
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', (next) => setActive(next === 'active'));
+    return () => subscription.remove();
+  }, []);
+  return active;
+}
 
 // Sync fixes the user made for a track: a timing version (named by when its first line is sung) and an
 // offset, where a negative offset shows the lyrics later. Kept on the phone for the latest few hundred tracks.
@@ -215,7 +244,7 @@ function GapDots({ size, active, rate, startMs, endMs, now, clock, reduceMotion 
   return <Dots size={size} opacities={opacities} scale={active ? Animated.multiply(breath, exit) : 1} />;
 }
 
-function SyncedLyrics({ lines, media, width, height, canSeek, seekMedia, onLongPress, offsetMs, onNudge, onResetOffset }: { lines: LyricLine[]; media: SystemMediaState; width: number; height: number; canSeek: boolean; seekMedia: (positionMs: number) => boolean; onLongPress: () => void; offsetMs: number; onNudge: (deltaMs: number) => void; onResetOffset: () => void }) {
+function SyncedLyrics({ lines, media, active, width, height, canSeek, seekMedia, onLongPress, offsetMs, onNudge, onResetOffset }: { lines: LyricLine[]; media: SystemMediaState; active: boolean; width: number; height: number; canSeek: boolean; seekMedia: (positionMs: number) => boolean; onLongPress: () => void; offsetMs: number; onNudge: (deltaMs: number) => void; onResetOffset: () => void }) {
   const reduceMotion = useReduceMotion();
   const { compact, fontSize, padding, lineGap, anchorY } = lyricsLayout(width, height);
 
@@ -236,12 +265,16 @@ function SyncedLyrics({ lines, media, width, height, canSeek, seekMedia, onLongP
 
   // The latest report from the PC and when it arrived; the resync button snaps back to it.
   const reported = useRef<{ positionMs?: number; rate?: number; at: number }>({ at: 0 });
+  // Hidden (another tab, or the app in the background), no timer runs; coming back snaps to the line now sung.
+  const wasActive = useRef(active);
 
   // Re-anchors the clock on each position report, picks the current line, then sleeps until the next one starts.
   useEffect(() => {
     // A nudge glides the whole list together (no wave), and is never held back as jitter: fast taps
     // then just retarget the same smooth motion instead of jumping.
     const nudged = offset.current !== offsetMs;
+    if (active && !wasActive.current) snap.current = true;
+    wasActive.current = active;
     if (nudged) {
       offset.current = offsetMs;
       glide.current = true;
@@ -264,10 +297,10 @@ function SyncedLyrics({ lines, media, width, height, canSeek, seekMedia, onLongP
     }
     shownRef.current = next;
     setShown(next);
-    if (anchor.current.rate <= 0 || next + 1 >= lines.length) return;
+    if (!active || anchor.current.rate <= 0 || next + 1 >= lines.length) return;
     const timer = setTimeout(() => setTick((value) => value + 1), Math.max(0, lines[next + 1].timeMs - position) / anchor.current.rate + 5);
     return () => clearTimeout(timer);
-  }, [lines, tick, now, media.positionMs, rate, offsetMs]);
+  }, [lines, tick, now, media.positionMs, rate, offsetMs, active]);
 
   const animated = useMemo(() => lines.map(() => ({ y: new Animated.Value(0), opacity: new Animated.Value(0.15), scale: new Animated.Value(0.96) })), [lines]);
   const offsets = useRef<number[]>([]);
@@ -486,7 +519,7 @@ function BreathingDots({ size, label, labelSize }: { size: number; label?: strin
   </View>;
 }
 
-export function LyricsWidget({ media, connected, seekMedia }: { media: SystemMediaState; connected: boolean; seekMedia: (positionMs: number) => boolean }) {
+export function LyricsWidget({ media, connected, focused, seekMedia }: { media: SystemMediaState; connected: boolean; focused: boolean; seekMedia: (positionMs: number) => boolean }) {
   const [size, setSize] = useState({ width: 0, height: 0 });
   const key = lyricsTrackKey(media);
   const [result, setResult] = useState<{ key: string; lyrics: Lyrics } | null>(null);
@@ -510,6 +543,7 @@ export function LyricsWidget({ media, connected, seekMedia }: { media: SystemMed
     song.durationMs = media.durationMs;
     lastSong.current = song;
     const carried = media.durationMs !== undefined && media.durationMs === song.carriedMs;
+    if (resultKey && kept.has(resultKey)) return;
     let alive = true;
     const track = { title: media.title, artist: media.artist, album: media.album, durationMs: media.durationMs };
     // An entry picked in Find lyrics is fetched by its number, with no wait for the track's details.
@@ -525,7 +559,13 @@ export function LyricsWidget({ media, connected, seekMedia }: { media: SystemMed
     };
   }, [key, resultKey, typedTitle, choice.lrclibId, retry, media.title, media.artist, media.album, media.durationMs]);
   // Lyrics belong to one track: anything fetched for another key is never shown.
-  const lyrics = useMemo((): Lyrics | 'loading' => !key ? { kind: 'none' } : result?.key === resultKey ? result.lyrics : 'loading', [key, resultKey, result]);
+  const lyrics = useMemo((): Lyrics | 'loading' => !key ? { kind: 'none' } : result?.key === resultKey ? result.lyrics : (resultKey && kept.get(resultKey)?.lyrics) || 'loading', [key, resultKey, result]);
+  const keepable = lyrics !== 'loading' && lyrics.kind !== 'error' && key ? lyrics : null;
+  useEffect(() => {
+    if (resultKey && keepable) return holdLyrics(resultKey, keepable);
+  }, [resultKey, keepable]);
+  const appActive = useAppActive();
+  const active = focused && appActive;
   useEffect(() => {
     if (lyrics === 'loading' || lyrics.kind !== 'error') return;
     const timer = setTimeout(() => setRetry((value) => value + 1), ERROR_RETRY_MS);
@@ -561,7 +601,7 @@ export function LyricsWidget({ media, connected, seekMedia }: { media: SystemMed
   if (!hasMedia) content = <Message title="Nothing playing" size={messageSize} />;
   else if (lyrics === 'loading') content = <BreathingDots size={messageSize * 0.5} labelSize={messageSize} />;
   // Keyed by track and timing version, so a new song or timing mounts fresh: no scroll from the old position.
-  else if (lines) content = <SyncedLyrics key={`${key}:${picked ? `${picked.firstMs}:${picked.lastMs}` : 'auto'}`} lines={lines} media={media} width={width} height={height} canSeek={canSeek} seekMedia={seekMedia} onLongPress={showDebug} offsetMs={choice.offsetMs} onNudge={nudge} onResetOffset={resetOffset} />;
+  else if (lines) content = <SyncedLyrics key={`${key}:${picked ? `${picked.firstMs}:${picked.lastMs}` : 'auto'}`} lines={lines} media={media} active={active} width={width} height={height} canSeek={canSeek} seekMedia={seekMedia} onLongPress={showDebug} offsetMs={choice.offsetMs} onNudge={nudge} onResetOffset={resetOffset} />;
   else if (lyrics.kind === 'plain') content = <ScrollView nestedScrollEnabled showsVerticalScrollIndicator={false} contentContainerStyle={{ padding: messageSize }}>
     {versions.length > 0 ? <Text allowFontScaling={false} style={[styles.plainHint, { fontSize: messageSize * 0.8 }]}>Not synced to this video · long-press to pick a timing</Text> : null}
     <Text allowFontScaling={false} onLongPress={showDebug} style={[styles.plain, { fontSize: messageSize * 1.05, lineHeight: messageSize * 1.55 }]}>{lyrics.text}</Text>
