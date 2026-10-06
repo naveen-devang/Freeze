@@ -25,7 +25,8 @@ button:focus-visible { outline: 2px solid #d4d4d8; outline-offset: 2px; }
 
 .app-shell { min-height: 100vh; display: grid; grid-template-columns: 228px minmax(0, 1fr); }
 .app-shell.macos-native-sidebar { background: transparent; }
-.macos-native-sidebar .sidebar { background: transparent; }
+/* The title bar overlays the page on macOS: the traffic lights sit over the top of the sidebar. */
+.macos-native-sidebar .sidebar { padding-top: 44px; background: transparent; }
 .macos-native-sidebar .main-panel { background: var(--background); }
 .sidebar { position: fixed; inset: 0 auto 0 0; width: 228px; padding: 18px 12px 14px; display: flex; flex-direction: column; background: var(--sidebar); border-right: 1px solid var(--border); }
 .brand { height: 38px; display: flex; align-items: center; gap: 10px; padding: 0 10px; color: var(--foreground); font-size: 14px; font-weight: 600; }

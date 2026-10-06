@@ -436,8 +436,8 @@ function App() {
 
   return (
     <main className={`app-shell ${connection?.isMacos ? 'macos-native-sidebar' : ''}`}>
-      <aside className="sidebar">
-        <div className="brand">
+      <aside className="sidebar" data-tauri-drag-region>
+        <div className="brand" data-tauri-drag-region>
           <Snowflake size={20} strokeWidth={1.8} />
           <span>Freeze</span>
         </div>
@@ -461,7 +461,7 @@ function App() {
       </aside>
 
       <section className="main-panel">
-        <header className="topbar">
+        <header className="topbar" data-tauri-drag-region>
           <span>{screen === 'overview' ? 'Overview' : screen === 'deck' ? 'Deck' : 'Settings'}</span>
           <div className="network-badge">
             <Wifi size={14} strokeWidth={1.8} />

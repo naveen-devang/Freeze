@@ -13,7 +13,10 @@
           ],
           "state": "followsWindowActiveState"
         },
-        "theme": "Dark"
+        "theme": "Dark",
+        "transparent": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ]
   }
