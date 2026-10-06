@@ -1,6 +1,6 @@
 [package]
 name = "freeze-pc"
-version = "1.0.2"
+version = "1.0.3"
 description = "Local PC companion for Freeze"
 authors = ["Freeze"]
 edition = "2021"
