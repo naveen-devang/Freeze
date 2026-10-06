@@ -74,6 +74,7 @@ fn managed_exe() -> Option<PathBuf> {
 }
 
 fn command(program: &Path) -> Command {
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut command = Command::new(program);
     #[cfg(windows)]
     {

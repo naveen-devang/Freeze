@@ -2250,6 +2250,8 @@ fn switch_profile_for_foreground(state: &AppState, foreground: &ForegroundApp) {
 }
 
 #[tauri::command]
+// The flag is Windows-only; renaming it would change the argument name the front end sends.
+#[cfg_attr(not(windows), allow(unused_variables))]
 fn extract_app_icon(app: String, use_shortcut_icon: bool) -> Result<String, String> {
     if app.trim().is_empty() || app.len() > 512 || app.chars().any(char::is_control) {
         return Err("Enter a valid app path".into());
