@@ -20,6 +20,26 @@ if [ "$(git -C "$work/src" rev-parse HEAD)" != "$commit" ]; then
   echo "Tag $version no longer points at $commit; check the upstream release before updating" >&2
   exit 1
 fi
+# Freeze runs the adapter in /usr/bin/perl as its child. A child that touches AppKit (the adapter
+# watches NSWorkspace) is registered by macOS as another instance of the parent app, so the Dock
+# showed a second Freeze icon that bounced for as long as the stream ran, and came back when it was
+# force quit. Marking the process background-only before AppKit registers it keeps it out of the
+# Dock (LaunchServices reads the main bundle's in-memory Info dictionary). Priority 101 runs this
+# before the adapter's own constructor.
+cat >> "$work/src/src/adapter/globals.m" <<'OBJC'
+
+__attribute__((constructor(101))) static void freezeStayOutOfDock(void) {
+    @autoreleasepool {
+        @try {
+            id info = [[NSBundle mainBundle] infoDictionary];
+            if ([info isKindOfClass:[NSMutableDictionary class]]) {
+                [(NSMutableDictionary *)info setObject:@"1" forKey:@"LSBackgroundOnly"];
+            }
+        } @catch (NSException *exception) {
+        }
+    }
+}
+OBJC
 # Without a deployment target the library would only load on this Mac's macOS version or newer.
 cmake -S "$work/src" -B "$work/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 > /dev/null
 cmake --build "$work/build" --target MediaRemoteAdapter MediaRemoteAdapterTestClient > /dev/null
@@ -43,6 +63,17 @@ framework="$work/check/MediaRemoteAdapter.framework"
 mkdir -p "$framework"
 cp "$out/MediaRemoteAdapter.dylib" "$framework/MediaRemoteAdapter"
 /usr/bin/perl "$out/mediaremote-adapter.pl" "$framework" get --no-artwork > /dev/null
+# The stream must not be registered as a foreground app, which is what puts it in the Dock.
+/usr/bin/perl "$out/mediaremote-adapter.pl" "$framework" stream --no-diff > /dev/null 2>&1 &
+stream=$!
+sleep 3
+record="$(lsappinfo list 2>/dev/null | grep "pid = $stream " || true)"
+kill "$stream" 2>/dev/null || true
+echo "LaunchServices record of the adapter's stream: ${record:-none}"
+if [[ "$record" == *'type="Foreground"'* ]]; then
+  echo "The adapter's stream registered as a foreground app, so it would show in the Dock" >&2
+  exit 1
+fi
 if [ "${MEDIAREMOTE_FULL_TEST:-}" = 1 ]; then
   if /usr/bin/perl "$out/mediaremote-adapter.pl" "$framework" "$work/build/MediaRemoteAdapterTestClient" test; then
     echo "MediaRemote access works on this Mac"

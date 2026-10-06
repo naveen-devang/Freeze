@@ -365,21 +365,59 @@ pub(super) fn read_system_volume() -> Option<u8> {
     }
 }
 
+/// Reads the default output device's volume through CoreAudio. This runs every second while
+/// something plays, so it must not start a process: a child that touches AppKit is registered by
+/// macOS as another Freeze and shows a bouncing Freeze icon in the Dock.
 #[cfg(target_os = "macos")]
 pub(super) fn read_system_volume() -> Option<u8> {
-    let output = std::process::Command::new("osascript")
-        .args(["-e", "output volume of (get volume settings)"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    #[repr(C)]
+    struct Address {
+        selector: u32,
+        scope: u32,
+        element: u32,
     }
-    String::from_utf8(output.stdout)
-        .ok()?
-        .trim()
-        .parse::<u8>()
-        .ok()
-        .map(|value| value.min(100))
+    #[link(name = "CoreAudio", kind = "framework")]
+    extern "C" {
+        fn AudioObjectHasProperty(object: u32, address: *const Address) -> u8;
+        fn AudioObjectGetPropertyData(
+            object: u32,
+            address: *const Address,
+            qualifier_size: u32,
+            qualifier: *const std::ffi::c_void,
+            size: *mut u32,
+            data: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+    const SYSTEM_OBJECT: u32 = 1;
+    const DEFAULT_OUTPUT_DEVICE: u32 = u32::from_be_bytes(*b"dOut");
+    const GLOBAL: u32 = u32::from_be_bytes(*b"glob");
+    const OUTPUT: u32 = u32::from_be_bytes(*b"outp");
+    // The volume the menu bar slider shows; devices without it have per-channel volumes.
+    const VIRTUAL_MAIN_VOLUME: u32 = u32::from_be_bytes(*b"vmvc");
+    const VOLUME_SCALAR: u32 = u32::from_be_bytes(*b"volm");
+
+    fn read<T: Default>(object: u32, selector: u32, scope: u32, element: u32) -> Option<T> {
+        let address = Address { selector, scope, element };
+        let mut value = T::default();
+        let mut size = std::mem::size_of::<T>() as u32;
+        // SAFETY: `value` is a plain number of `size` bytes, and the address outlives the calls.
+        unsafe {
+            if AudioObjectHasProperty(object, &address) == 0 {
+                return None;
+            }
+            let status = AudioObjectGetPropertyData(object, &address, 0, std::ptr::null(), &mut size, &mut value as *mut T as *mut _);
+            (status == 0 && size as usize == std::mem::size_of::<T>()).then_some(value)
+        }
+    }
+
+    let device: u32 = read(SYSTEM_OBJECT, DEFAULT_OUTPUT_DEVICE, GLOBAL, 0).filter(|&id| id != 0)?;
+    let scalar = read::<f32>(device, VIRTUAL_MAIN_VOLUME, OUTPUT, 0)
+        .or_else(|| read::<f32>(device, VOLUME_SCALAR, OUTPUT, 0))
+        .or_else(|| {
+            let channels: Vec<f32> = [1, 2].iter().filter_map(|&channel| read(device, VOLUME_SCALAR, OUTPUT, channel)).collect();
+            (!channels.is_empty()).then(|| channels.iter().sum::<f32>() / channels.len() as f32)
+        })?;
+    Some((scalar.clamp(0.0, 1.0) * 100.0).round() as u8)
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
