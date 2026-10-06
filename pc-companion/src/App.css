@@ -17,7 +17,7 @@
   --green: #4ade80;
 }
 
-* { box-sizing: border-box; }
+* { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: #3f3f46 transparent; }
 body { margin: 0; min-width: 760px; min-height: 100vh; background: var(--background); }
 button { font: inherit; }
 input, select, textarea { font: inherit; color: var(--foreground); color-scheme: dark; }
@@ -177,7 +177,7 @@ button:focus-visible { outline: 2px solid #d4d4d8; outline-offset: 2px; }
 .select-trigger:hover:not(:disabled), .select-trigger.open { border-color: #52525b; background: #111113; }
 .select-trigger:focus-visible { outline: 2px solid #52525b; outline-offset: 2px; }
 .select-trigger:disabled { opacity: .5; cursor: default; }
-.select-menu { position: absolute; z-index: 30; top: calc(100% + 6px); left: 0; width: 100%; min-width: 180px; max-height: 260px; padding: 4px; overflow-y: auto; border: 1px solid #3f3f46; border-radius: 7px; background: #18181b; box-shadow: 0 12px 30px rgb(0 0 0 / 38%); }
+.select-menu { position: absolute; z-index: 30; top: calc(100% + 6px); left: 0; width: 100%; min-width: 180px; max-height: 260px; padding: 4px; overflow-x: hidden; overflow-y: auto; border: 1px solid #3f3f46; border-radius: 7px; background: #18181b; box-shadow: 0 12px 30px rgb(0 0 0 / 38%); }
 .select-option { width: 100%; min-height: 34px; padding: 0 9px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 0; border-radius: 4px; background: transparent; color: var(--foreground); font: inherit; font-size: 14px; text-align: left; cursor: pointer; }
 .select-option svg { flex: none; color: var(--muted); }
 .select-option:hover, .select-option.active, .select-option[aria-selected="true"] { background: #27272a; }
@@ -297,7 +297,7 @@ button:focus-visible { outline: 2px solid #d4d4d8; outline-offset: 2px; }
 .widget-transfer-button { width: calc(100% - 28px); margin: 12px 14px 0; }
 .grid-size-control { width: 72px; display: grid; gap: 4px; color: var(--muted); font-size: 11px; }
 .grid-size-control .select-trigger { min-height: 32px; padding: 0 7px; font-size: 12px; }
-.grid-size-control .select-menu { min-width: 64px; }
+.grid-size-control .select-menu { width: max-content; min-width: 100%; }
 .deck-empty { grid-column: 1 / -1; min-height: 250px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 9px; color: var(--subtle); text-align: center; }
 .deck-empty strong { color: #e4e4e7; font-size: 14px; font-weight: 500; }
 .deck-empty span, .properties-empty { color: var(--subtle); font-size: 12px; }
