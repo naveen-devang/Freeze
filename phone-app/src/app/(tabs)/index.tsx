@@ -1,5 +1,5 @@
 import { useCallback, useContext, useEffect, useRef, useState } from 'react';
-import { useRouter } from 'expo-router';
+import { useIsFocused, useRouter } from 'expo-router';
 import { BackHandler, Image, PanResponder, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { AppWindow, ChevronRight, Command, File, FolderOpen, Headphones, Keyboard, Layers2, ListOrdered, Maximize2, Mic, Minimize2, Monitor, Music, Package, PanelsTopLeft, Pause, Play, SkipBack, SkipForward, Snowflake, Volume1, Volume2, VolumeX, Wifi } from 'lucide-react-native';
@@ -296,6 +296,7 @@ export default function DeckScreen() {
   countRender('deck');
   const power = useDeckScreenPower();
   const router = useRouter();
+  const isFocused = useIsFocused();
   const setTabBarHidden = useContext(TabBarHiddenContext);
   const { connection, status, playbackState, actionError, deckConfig, independentNavigation, selectedProfileId, selectedPageId, sendButton, sendMediaCommand, sendSystemVolume, seekMedia, selectPage, reportWidgetSurface } = usePcConnection();
   const [feedback, setFeedback] = useState('');
@@ -552,7 +553,7 @@ export default function DeckScreen() {
                 {button.appIconData ? <Image source={{ uri: button.appIconData }} style={{ width: immersiveWidgetIconSize, height: immersiveWidgetIconSize }} resizeMode="contain" /> : button.iconSvg && button.icon !== 'auto' ? <SvgXml xml={button.iconSvg} width={immersiveWidgetIconSize} height={immersiveWidgetIconSize} /> : <Icon size={immersiveWidgetIconSize} color={colors.text} strokeWidth={1.7} />}
               </Pressable>;
             })}
-            <WebWidgetLayer widgets={webWidgets((p) => cellFrame(p.row - widgetTopRow, p.column - widgetLeftColumn, p.rowSpan, p.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12, 0))} />
+            <WebWidgetLayer focused={isFocused} widgets={webWidgets((p) => cellFrame(p.row - widgetTopRow, p.column - widgetLeftColumn, p.rowSpan, p.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12, 0))} />
             {(widgetArea.pages.length > 1) ? <View style={styles.immersiveWidgetPageIndicator} pointerEvents="none"><Text style={styles.pageTabText}>{widgetPageIndex + 1} / {widgetArea.pages.length}</Text></View> : null}
           </View> : null}
         </View>
@@ -660,7 +661,7 @@ export default function DeckScreen() {
                 <Text style={styles.keyLabel} numberOfLines={2}>{label}</Text>
               </Pressable>;
             })}
-            <WebWidgetLayer widgets={webWidgets((p) => cellFrame(p.row - widgetTopRow, p.column - widgetLeftColumn, p.rowSpan, p.columnSpan, widgetCellWidth, 100))} />
+            <WebWidgetLayer focused={isFocused} widgets={webWidgets((p) => cellFrame(p.row - widgetTopRow, p.column - widgetLeftColumn, p.rowSpan, p.columnSpan, widgetCellWidth, 100))} />
           </View>
         </View> : null}
 

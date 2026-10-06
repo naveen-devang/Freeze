@@ -55,3 +55,5 @@ jobs:
       # Ubuntu runners ship Google Chrome, which the render check drives headless.
       - run: node scripts/check-pc-stats.ts
       - run: node scripts/check-clock-faces.ts
+      - run: node scripts/check-web-fonts.ts
+      - run: node scripts/check-web-widgets.ts
