@@ -3967,6 +3967,20 @@ async fn serve(state: Arc<AppState>) {
     }
 }
 
+/// Pins the native window to the dark appearance. `"theme": "Dark"` only sets the app-wide
+/// appearance, and macOS kept drawing the title bar and sidebar material light on some Macs;
+/// the window's own appearance overrides both the app and the system setting.
+#[cfg(target_os = "macos")]
+fn force_dark_window(window: &tauri::WebviewWindow) {
+    use objc2_app_kit::{NSAppearance, NSAppearanceCustomization, NSAppearanceNameDarkAqua, NSWindow};
+    let Ok(pointer) = window.ns_window() else { return };
+    // SAFETY: Tauri returns the live NSWindow, and setup runs on the main thread.
+    unsafe {
+        let ns_window = &*(pointer as *const NSWindow);
+        ns_window.setAppearance(NSAppearance::appearanceNamed(NSAppearanceNameDarkAqua).as_deref());
+    }
+}
+
 /// Brings the window back from the tray, the taskbar or a second launch.
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -4124,6 +4138,11 @@ pub fn run() {
             );
 
             pc_stats::spawn_pc_stats_monitor(state.pc_stats.clone(), state.pc_stats_demand.clone());
+
+            #[cfg(target_os = "macos")]
+            if let Some(window) = app.get_webview_window("main") {
+                force_dark_window(&window);
+            }
 
             tauri::async_runtime::spawn(serve(state));
             let open = MenuItem::with_id(app, "open", "Open Freeze", true, None::<&str>)?;

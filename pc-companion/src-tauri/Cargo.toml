@@ -45,7 +45,7 @@ nvml-wrapper = "0.13.0"
 libloading = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSRunningApplication", "NSWorkspace"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSAppearance", "NSResponder", "NSRunningApplication", "NSWindow", "NSWorkspace"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSString", "NSURL"] }
 
 
