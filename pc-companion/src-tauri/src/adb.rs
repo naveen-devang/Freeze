@@ -451,6 +451,17 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // Needs an adb installed outside PATH (e.g. WinGet or the Android SDK): cargo test --lib adb::tests::finds -- --ignored
+    #[test]
+    #[ignore]
+    fn finds_adb_when_path_does_not_have_it() {
+        std::env::set_var("PATH", "");
+        forget();
+        let found = find().expect("no adb in the usual places");
+        assert!(found.is_file(), "{found:?}");
+        assert!(works(&found));
+    }
+
     #[test]
     fn swap_replaces_an_existing_install() {
         let root = std::env::temp_dir().join(format!("freeze-adb-swap-{}", std::process::id()));
