@@ -5,7 +5,7 @@
 // is sent, isolates a widget that fails, and uses only its embedded fonts.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -329,6 +329,8 @@ window.ReactNativeWebView = { postMessage: function (message) { window.__message
 })();
 </script>`;
   const dir = mkdtempSync(join(tmpdir(), 'freeze-web-widgets-'));
+  // The headless Edge profile is ~400 MB; remove it however the run ends.
+  process.on('exit', () => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
   const file = join(dir, 'page.html');
   writeFileSync(file, html.replace('<body>', '<body><pre id="result">running</pre>' + harness).replace('</body>', driver + '</body>'));
   const dom = execFileSync(browser, [...(process.platform === 'linux' ? ['--no-sandbox'] : []), '--headless=new', '--disable-gpu', '--no-first-run', `--user-data-dir=${join(dir, 'profile')}`, '--virtual-time-budget=30000', '--dump-dom', pathToFileURL(file).href], { encoding: 'utf8', timeout: 120_000, stdio: ['ignore', 'pipe', 'ignore'] });

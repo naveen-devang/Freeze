@@ -4101,8 +4101,11 @@ pub fn run() {
             let monitor_state = state.clone();
             thread::spawn(move || loop {
                 thread::sleep(Duration::from_secs(3));
-                if monitor_state.android_usb_enabled.load(Ordering::Relaxed) {
-                    let _ = ensure_android_usb_reverse();
+                if monitor_state.android_usb_enabled.load(Ordering::Relaxed)
+                    && ensure_android_usb_reverse().is_err_and(|error| error == adb::MISSING)
+                {
+                    // No adb on this PC: searching for it spawns processes, so look again in 30 s, not 3.
+                    thread::sleep(Duration::from_secs(27));
                 }
             });
 

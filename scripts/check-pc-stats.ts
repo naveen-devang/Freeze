@@ -6,7 +6,7 @@
 // that part is skipped with a notice.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -76,6 +76,8 @@ if (!browser) {
   console.log('pc stats: no Chromium browser found, skipping the render check (set BROWSER to enable)');
 } else {
   const dir = mkdtempSync(join(tmpdir(), 'freeze-pc-stats-'));
+  // The headless Edge profile is ~400 MB; remove it however the run ends.
+  process.on('exit', () => rmSync(dir, { recursive: true, force: true, maxRetries: 5 }));
   const page = join(dir, 'render.html');
   // Renders every style x reading x scenario, checks each tile, and writes failures into #result.
   writeFileSync(page, `<!doctype html><meta charset="utf-8"><body><pre id="result">running</pre><div id="host"></div><script>
