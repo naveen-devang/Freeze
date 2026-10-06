@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { check, type Update } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
+import { invoke } from "@tauri-apps/api/core";
 import { version } from "../package.json";
 
 // Freeze checks GitHub's latest release (tauri.conf.json → plugins.updater), downloads in the
@@ -51,7 +51,7 @@ export function useUpdater() {
 
   // On Windows install() hands over to the installer, which closes and reopens Freeze itself.
   const restart = useCallback(async () => {
-    try { await ready.current?.install(); await relaunch(); }
+    try { await ready.current?.install(); await invoke("restart_app"); }
     catch (error) { setState({ kind: "error", message: String(error) }); }
   }, []);
 

@@ -3967,6 +3967,23 @@ async fn serve(state: Arc<AppState>) {
     }
 }
 
+/// Brings the window back from the tray, the taskbar or a second launch.
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+/// Restarts after an update. The single-instance lock is released first, otherwise the new
+/// process would find this one still running, hand off to it and exit, leaving nothing open.
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle) {
+    tauri_plugin_single_instance::destroy(&app);
+    app.restart();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let host = local_ip_address::local_ip()
@@ -4005,6 +4022,9 @@ pub fn run() {
     });
 
     tauri::Builder::default()
+        // Registered first: a second launch hands off to this process and exits before anything
+        // else (server, monitors, tray) starts.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main_window(app)))
         .manage(state.clone())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -4029,7 +4049,8 @@ pub fn run() {
             enable_android_usb,
             adb_status,
             install_adb,
-            rotate_pairing_key
+            rotate_pairing_key,
+            restart_app
         ])
         .setup(move |app| {
             let config_dir = app.path().app_config_dir()?;
@@ -4116,17 +4137,9 @@ pub fn run() {
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id().as_ref() {
-                    "open" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
+                    "open" => show_main_window(app),
                     "updates" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
+                        show_main_window(app);
                         // The window's Settings → Updates card runs the check.
                         let _ = app.emit("check-for-updates", ());
                     }
@@ -4140,10 +4153,7 @@ pub fn run() {
                         ..
                     } = event
                     {
-                        if let Some(window) = tray.app_handle().get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
+                        show_main_window(tray.app_handle());
                     }
                 })
                 .build(app)?;
