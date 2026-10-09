@@ -23,10 +23,6 @@ export default function TabLayout() {
           {/* No text: expo-router ignores `hidden` on a badge that has text. Empty shows a dot. */}
           <NativeTabs.Trigger.Badge hidden={!updateWaiting} />
         </NativeTabs.Trigger>
-        <NativeTabs.Trigger name="edit">
-          <NativeTabs.Trigger.Icon sf="square.stack.3d.up" md="layers" />
-          <NativeTabs.Trigger.Label>Profiles</NativeTabs.Trigger.Label>
-        </NativeTabs.Trigger>
       </NativeTabs>
     </TabBarHiddenContext.Provider>
   );

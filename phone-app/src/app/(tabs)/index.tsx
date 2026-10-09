@@ -2,7 +2,7 @@ import { useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { useIsFocused, useRouter } from 'expo-router';
 import { BackHandler, Image, PanResponder, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { AppWindow, ChevronRight, Command, File, FolderOpen, Headphones, Keyboard, Layers2, ListOrdered, Maximize2, Mic, Minimize2, Monitor, Music, Package, PanelsTopLeft, Pause, Play, SkipBack, SkipForward, Snowflake, Volume1, Volume2, VolumeX, Wifi } from 'lucide-react-native';
+import { AppWindow, ChevronLeft, ChevronRight, FolderClosed, Command, File, FolderOpen, Headphones, Keyboard, Layers2, ListOrdered, Maximize2, Mic, Minimize2, Monitor, Music, Package, PanelsTopLeft, Pause, Play, SkipBack, SkipForward, Snowflake, Volume1, Volume2, VolumeX, Wifi } from 'lucide-react-native';
 import { StatusBar } from 'expo-status-bar';
 import * as ScreenOrientation from 'expo-screen-orientation';
 import { NavigationBar } from 'expo-navigation-bar';
@@ -13,9 +13,10 @@ import { LyricsWidget } from '../../lyrics-widget';
 import { WebWidgetLayer, type WebWidget } from '../../web-widgets';
 import { countRender, PerfOverlay } from '../../perf-overlay';
 import { useDeckScreenPower } from '../../screen-power';
-import { buttonPlacement, deckOccupancy, widgetPageOccupancy, WidgetScreenItem } from '../../deck-layout';
+import { buttonPlacement, surfaceOccupancy, type SurfaceItem } from '../../deck-layout';
 import { colors } from '../../theme';
 import { TabBarHiddenContext } from '../../navigation/tab-bar-context';
+import { useTabBarClearance } from '../../tab-inset';
 
 const shortcutIcons: Record<string, typeof Command> = {
   command: Command,
@@ -48,6 +49,7 @@ function controlIcon(button: DeckButton, playback: PlaybackState) {
   if (action.type === 'sequence') return ListOrdered;
   if (action.type === 'select_profile') return Layers2;
   if (action.type === 'select_page') return PanelsTopLeft;
+  if (action.type === 'open_folder') return FolderClosed;
   return Keyboard;
 }
 
@@ -292,29 +294,47 @@ function LiveLyrics(props: Omit<Parameters<typeof LyricsWidget>[0], 'media'>) {
   return <LyricsWidget media={useMediaState()} {...props} />;
 }
 
+// A row of pill buttons, scrolled so the selected one is in view (profiles and pages can be many).
+function ChipRow({ label, items, selectedId, onSelect }: { label: string; items: { id: string; name: string }[]; selectedId?: string; onSelect: (id: string) => void }) {
+  const scroller = useRef<ScrollView>(null);
+  const positions = useRef(new Map<string, number>());
+  useEffect(() => {
+    const x = selectedId ? positions.current.get(selectedId) : undefined;
+    if (x !== undefined) scroller.current?.scrollTo({ x: Math.max(0, x - 18), animated: true });
+  }, [selectedId]);
+  return <ScrollView ref={scroller} horizontal showsHorizontalScrollIndicator={false} style={styles.pageTabsScroll} contentContainerStyle={styles.pageTabs} accessibilityLabel={label}>
+    {items.map((item) => <Pressable key={item.id} style={[styles.pageTab, item.id === selectedId && styles.pageTabActive]} onLayout={(event) => { positions.current.set(item.id, event.nativeEvent.layout.x); }} onPress={() => onSelect(item.id)} accessibilityRole="button" accessibilityLabel={`${label} ${item.name}`} accessibilityState={{ selected: item.id === selectedId }}>
+      <Text style={[styles.pageTabText, item.id === selectedId && styles.pageTabTextActive]} numberOfLines={1}>{item.name}</Text>
+    </Pressable>)}
+  </ScrollView>;
+}
+
 export default function DeckScreen() {
   countRender('deck');
   const power = useDeckScreenPower();
   const router = useRouter();
   const isFocused = useIsFocused();
   const setTabBarHidden = useContext(TabBarHiddenContext);
-  const { connection, status, playbackState, actionError, deckConfig, independentNavigation, selectedProfileId, selectedPageId, sendButton, sendMediaCommand, sendSystemVolume, seekMedia, selectPage, reportWidgetSurface } = usePcConnection();
+  const { connection, status, playbackState, actionError, deckConfig, independentNavigation, selectedProfileId, selectedPageId, sendButton, sendMediaCommand, sendSystemVolume, seekMedia, selectPage, selectProfile, reportWidgetSurface } = usePcConnection();
   const [feedback, setFeedback] = useState('');
   const [immersive, setImmersive] = useState(false);
   const [showImmersiveTools, setShowImmersiveTools] = useState(false);
   const [immersiveSize, setImmersiveSize] = useState({ width: 0, height: 0 });
-  const [widgetPageIndices, setWidgetPageIndices] = useState<Record<string, number>>({});
+  // The folder open on each page, by `profile:page`. Folders open and close on this phone only.
+  const [openFolders, setOpenFolders] = useState<Record<string, string>>({});
   const [regularGridWidth, setRegularGridWidth] = useState(0);
-  const [widgetGridWidth, setWidgetGridWidth] = useState(0);
+  const bottomClearance = useTabBarClearance();
   const feedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const immersiveToolsTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeProfile = deckConfig?.profiles.find((profile) => profile.id === (independentNavigation ? selectedProfileId : deckConfig.activeProfileId));
   const activePage = activeProfile?.pages.find((page) => page.id === (independentNavigation ? selectedPageId : activeProfile.activePageId));
   const activePageIndex = activeProfile?.pages.findIndex((page) => page.id === activePage?.id) ?? -1;
-  const widgetArea = activePage?.widgetArea;
-  const widgetPageIndex = Math.min(widgetPageIndices[`${activeProfile?.id}:${activePage?.id}`] ?? 0, Math.max(0, (widgetArea?.pages.length ?? 1) - 1));
-  const widgetScreen = widgetArea?.pages[widgetPageIndex];
-  const hasWidgetArea = !!widgetArea?.enabled;
+  const pageKey = `${activeProfile?.id}:${activePage?.id}`;
+  const folder = activePage?.folders.find((entry) => entry.id === openFolders[pageKey]);
+  // What is drawn: the open folder, else the page.
+  const surface = folder ?? activePage;
+  const openFolder = (folderId: string) => setOpenFolders((current) => ({ ...current, [pageKey]: folderId }));
+  const closeFolder = useCallback(() => setOpenFolders((current) => { const { [pageKey]: _closed, ...rest } = current; return rest; }), [pageKey]);
 
   useEffect(() => () => {
     if (feedbackTimer.current) {
@@ -352,6 +372,13 @@ export default function DeckScreen() {
     return () => NavigationBar.setHidden(false);
   }, [immersive]);
 
+  // Android's back button closes an open folder before it does anything else.
+  useEffect(() => {
+    if (!folder || immersive || !isFocused) return;
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => { closeFolder(); return true; });
+    return () => subscription.remove();
+  }, [folder, immersive, isFocused, closeFolder]);
+
   useEffect(() => {
     if (!immersive) return;
     const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
@@ -378,7 +405,7 @@ export default function DeckScreen() {
 
   const pageSwipeResponder = PanResponder.create({
     onStartShouldSetPanResponder: () => false,
-    onMoveShouldSetPanResponder: (_, gesture) => Math.abs(gesture.dx) > 38 && Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.4,
+    onMoveShouldSetPanResponder: (_, gesture) => !folder && Math.abs(gesture.dx) > 38 && Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.4,
     onPanResponderRelease: (_, gesture) => {
       const pages = activeProfile?.pages ?? [];
       if (pages.length < 2 || activePageIndex < 0) return;
@@ -386,67 +413,32 @@ export default function DeckScreen() {
       selectPage(pages[nextIndex].id);
     },
   });
-  const widgetSwipeResponder = PanResponder.create({
-    onStartShouldSetPanResponder: () => false,
-    onMoveShouldSetPanResponder: (_, gesture) => Math.abs(gesture.dx) > 32 && Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.4,
-    onPanResponderRelease: (_, gesture) => {
-      const count = widgetArea?.pages.length ?? 0;
-      if (count < 2) return;
-      const key = `${activeProfile?.id}:${activePage?.id}`;
-      setWidgetPageIndices((current) => ({ ...current, [key]: (widgetPageIndex + (gesture.dx < 0 ? 1 : -1) + count) % count }));
-    },
-  });
-
   const connected = status === 'connected';
   const isPlaying = playbackState === 'playing';
-  const columns = activePage?.columns ?? 3;
-  const rows = activePage?.rows ?? Math.max(1, Math.ceil((activePage?.buttons.length ?? 0) / columns));
-  const hasButtons = !!activePage?.buttons.length;
-  const occupied = activePage ? deckOccupancy(activePage) : new Map<number, DeckButton>();
-  const widgetColumns = widgetArea?.columns ?? 3;
-  const widgetRows = widgetArea?.rows ?? 2;
-  const widgetOccupied = widgetArea && widgetScreen ? widgetPageOccupancy(widgetArea, widgetScreen) : new Map<number, WidgetScreenItem>();
-  // A page with no buttons is a widget-only page even if its saved grid
-  // dimensions were left non-zero by an older desktop editor build.
-  const widgetOnlyMode = !hasButtons && hasWidgetArea;
-  const showWidgetArea = hasWidgetArea && (widgetOnlyMode || widgetOccupied.size > 0);
-  const widgetPlacements = widgetScreen ? [
-    ...widgetScreen.buttons.map((button) => buttonPlacement({ id: widgetScreen.id, name: widgetScreen.name, rows: widgetRows, columns: widgetColumns, buttons: widgetScreen.buttons }, button)),
-    ...widgetScreen.widgets.map((widget) => widget.placement),
-  ] : [];
-  const widgetTopRow = widgetOnlyMode && widgetPlacements.length ? Math.min(...widgetPlacements.map((placement) => placement.row)) : 0;
-  const widgetLeftColumn = widgetOnlyMode && widgetPlacements.length ? Math.min(...widgetPlacements.map((placement) => placement.column)) : 0;
-  const displayWidgetRows = widgetOnlyMode && widgetPlacements.length
-    ? Math.max(...widgetPlacements.map((placement) => placement.row + placement.rowSpan)) - widgetTopRow
-    : widgetRows;
-  const displayWidgetColumns = widgetOnlyMode && widgetPlacements.length
-    ? Math.max(...widgetPlacements.map((placement) => placement.column + placement.columnSpan)) - widgetLeftColumn
-    : widgetColumns;
+  const columns = surface?.columns ?? 3;
+  const rows = surface?.rows ?? 2;
+  const occupied = surface ? surfaceOccupancy(surface) : new Map<number, SurfaceItem>();
+  const hasItems = occupied.size > 0;
+  const hasWidgets = (surface?.widgets.length ?? 0) > 0;
   const regularGap = 9;
   const regularCellWidth = Math.max(0, (regularGridWidth - regularGap * (Math.max(1, columns) - 1)) / Math.max(1, columns));
-  const widgetCellWidth = Math.max(0, (widgetGridWidth - regularGap * (Math.max(1, displayWidgetColumns) - 1)) / Math.max(1, displayWidgetColumns));
   const immersiveGap = 10;
   const immersiveAvailableHeight = Math.max(0, immersiveSize.height - 24);
-  const buttonImmersiveHeight = hasButtons ? immersiveAvailableHeight * (showWidgetArea ? rows / (rows + widgetRows) : 1) : 0;
-  const widgetImmersiveHeight = showWidgetArea ? immersiveAvailableHeight - buttonImmersiveHeight : 0;
   const immersiveCellWidth = Math.max(0, (immersiveSize.width - 24 - immersiveGap * (columns - 1)) / columns);
-  const immersiveCellHeight = Math.max(1, (buttonImmersiveHeight - 24 - immersiveGap * (rows - 1)) / rows);
-  const immersiveWidgetCellWidth = Math.max(0, (immersiveSize.width - 24 - immersiveGap * (displayWidgetColumns - 1)) / displayWidgetColumns);
-  const immersiveWidgetCellHeight = Math.max(1, (widgetImmersiveHeight - 24 - immersiveGap * (displayWidgetRows - 1)) / displayWidgetRows);
+  const immersiveCellHeight = Math.max(1, (immersiveAvailableHeight - 24 - immersiveGap * (rows - 1)) / rows);
   const immersiveIconSize = Math.min(52, Math.max(26, Math.min(immersiveCellHeight, immersiveCellWidth) * 0.34));
-  const immersiveWidgetIconSize = Math.min(52, Math.max(20, Math.min(immersiveWidgetCellHeight, immersiveWidgetCellWidth) * 0.34));
   // Widget keys inset their content by a 1 px border plus clockWidgetKey's 4 px padding.
   const widgetKeyInset = 5;
   const immersiveSurfaceWidth = immersiveSize.width - 24;
-  const immersiveSurfaceHeight = widgetImmersiveHeight - 24;
+  const immersiveSurfaceHeight = immersiveAvailableHeight - 24;
   useEffect(() => {
-    if (!showWidgetArea) return;
+    if (!hasWidgets) return;
     if (immersive) {
       if (immersiveSurfaceWidth > 0 && immersiveSurfaceHeight > 0) reportWidgetSurface({ width: immersiveSurfaceWidth, height: immersiveSurfaceHeight, gap: immersiveGap, inset: widgetKeyInset, fixedRowHeight: null });
-    } else if (widgetGridWidth > 0) {
-      reportWidgetSurface({ width: widgetGridWidth, height: 0, gap: regularGap, inset: widgetKeyInset, fixedRowHeight: 100 });
+    } else if (regularGridWidth > 0) {
+      reportWidgetSurface({ width: regularGridWidth, height: 0, gap: regularGap, inset: widgetKeyInset, fixedRowHeight: 100 });
     }
-  }, [immersive, immersiveSurfaceHeight, immersiveSurfaceWidth, reportWidgetSurface, showWidgetArea, widgetGridWidth]);
+  }, [immersive, immersiveSurfaceHeight, immersiveSurfaceWidth, reportWidgetSurface, hasWidgets, regularGridWidth]);
   const actionErrorText = actionError === 'accessibility_permission_required' ? 'Allow Freeze in Mac Accessibility settings'
     : actionError === 'app_launch_failed' ? 'PC could not launch this app. Check its target path'
     : actionError === 'stale_revision' ? 'Deck changed. Wait for sync, then try again'
@@ -454,6 +446,10 @@ export default function DeckScreen() {
     : actionError ? 'PC could not perform control' : '';
 
   const press = (button: DeckButton, label: string) => {
+    if (button.action.type === 'open_folder') {
+      openFolder(button.action.folderId);
+      return;
+    }
     if (!connected) {
       router.push('/connect');
       return;
@@ -496,7 +492,7 @@ export default function DeckScreen() {
   // Clock and PC stats widgets are drawn by one WebView layer over the widget area (web-widgets.tsx);
   // their tiles provide only the border and background. Each rectangle is a tile's content area.
   const webWidgets = (frame: (placement: DeckPlacement) => { left: number; top: number; width: number; height: number }): WebWidget[] =>
-    (widgetScreen?.widgets ?? []).flatMap((widget): WebWidget[] => {
+    (surface?.widgets ?? []).flatMap((widget): WebWidget[] => {
       if (widget.type !== 'clock' && widget.type !== 'pc_stats') return [];
       const box = frame(widget.placement);
       const rect = { id: widget.id, x: box.left + widgetKeyInset, y: box.top + widgetKeyInset, width: Math.max(1, box.width - 2 * widgetKeyInset), height: Math.max(1, box.height - 2 * widgetKeyInset) };
@@ -504,6 +500,43 @@ export default function DeckScreen() {
         ? [{ ...rect, kind: 'clock', face: widget.face, color: widget.color }]
         : [{ ...rect, kind: 'stats', face: widget.face, metric: widget.metric, color: widget.color, gpu: widget.gpu, columns: widget.placement.columnSpan, rows: widget.placement.rowSpan }];
     });
+
+  // Every cell of the grid, buttons and widgets alike. `big` draws it for landscape mode.
+  const renderCells = (big: boolean) => {
+    const cellWidth = big ? immersiveCellWidth : regularCellWidth;
+    const cellHeight = big ? immersiveCellHeight : 100;
+    const gap = big ? immersiveGap : regularGap;
+    const inset = big ? 12 : 0;
+    const iconSize = big ? immersiveIconSize : 21;
+    const frame = (placement: DeckPlacement) => cellFrame(placement.row, placement.column, placement.rowSpan, placement.columnSpan, cellWidth, cellHeight, gap, inset);
+    return Array.from({ length: rows * columns }, (_, index) => {
+      const row = Math.floor(index / columns);
+      const column = index % columns;
+      const item = occupied.get(index);
+      if (!item) {
+        const emptyFrame = cellFrame(row, column, 1, 1, cellWidth, cellHeight, gap, inset);
+        return big
+          ? <Pressable key={`empty-${index}`} onPress={revealImmersiveTools} style={[styles.immersiveEmptyKey, emptyFrame]} accessibilityLabel="Empty deck slot. Tap to show deck controls" />
+          : <View key={`empty-${index}`} style={[styles.key, styles.emptyKey, emptyFrame]} />;
+      }
+      if (item.type === 'widget') {
+        const placement = item.widget.placement;
+        if (placement.row !== row || placement.column !== column) return null;
+        return <View key={item.widget.id} style={[big ? styles.immersiveKey : styles.key, styles.clockWidgetKey, frame(placement)]}>{item.widget.type === 'clock' || item.widget.type === 'pc_stats' ? null : item.widget.type === 'now_playing' ? <LiveNowPlaying connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} seekMedia={seekMedia} /> : item.widget.type === 'lyrics' ? <LiveLyrics connected={connected} focused={isFocused} seekMedia={seekMedia} /> : <PluginTextWidget widget={item.widget} immersive={big} />}</View>;
+      }
+      const button = item.button;
+      const placement = buttonPlacement(columns, button, surface?.buttons.indexOf(button) ?? 0);
+      if (placement.row !== row || placement.column !== column) return null;
+      const isFolder = button.action.type === 'open_folder';
+      const dynamicPlay = button.icon === 'auto' && button.action.type === 'media' && button.action.command === 'play_pause';
+      const label = dynamicPlay ? (isPlaying ? 'Pause' : 'Play') : button.label;
+      const Icon = controlIcon(button, playbackState);
+      return <Pressable key={button.id} style={({ pressed }) => [big ? styles.immersiveKey : styles.key, frame(placement), pressed && styles.keyPressed, !connected && !isFolder && styles.keyDisabled]} onPress={() => press(button, label)} disabled={!connected && !isFolder} accessibilityRole="button" accessibilityLabel={isFolder ? `${label}, folder` : label}>
+        {button.appIconData ? <Image source={{ uri: button.appIconData }} style={big ? { width: iconSize, height: iconSize } : styles.appIcon} resizeMode="contain" /> : button.iconSvg && button.icon !== 'auto' ? <SvgXml xml={button.iconSvg} width={iconSize} height={iconSize} /> : <Icon size={iconSize} color={colors.text} strokeWidth={1.7} />}
+        {big ? null : <Text style={styles.keyLabel} numberOfLines={2}>{label}</Text>}
+      </Pressable>;
+    });
+  };
 
   if (immersive) {
     return <>
@@ -514,50 +547,13 @@ export default function DeckScreen() {
       }}>
         <Pressable style={styles.immersiveBackdrop} onPress={revealImmersiveTools} accessibilityLabel="Deck background. Tap for controls" />
         <View style={styles.immersiveGrid} pointerEvents="box-none">
-          {activePage && hasButtons ? <View style={[styles.immersiveDeckCanvas, { top: 12, height: buttonImmersiveHeight }]} {...pageSwipeResponder.panHandlers}>
-          {Array.from({ length: rows * columns }, (_, index) => {
-            const row = Math.floor(index / columns);
-            const column = index % columns;
-            const item = occupied.get(index);
-            if (!item) return <Pressable key={`empty-${index}`} onPress={revealImmersiveTools} style={[styles.immersiveEmptyKey, cellFrame(row, column, 1, 1, immersiveCellWidth, immersiveCellHeight, immersiveGap, 12)]} accessibilityLabel="Empty deck slot. Tap to show deck controls" />;
-            const button = item as DeckButton;
-            const placement = buttonPlacement(activePage!, button);
-            if (placement.row !== row || placement.column !== column) return null;
-            const dynamicPlay = button.icon === 'auto' && button.action.type === 'media' && button.action.command === 'play_pause';
-            const label = dynamicPlay ? (isPlaying ? 'Pause' : 'Play') : button.label;
-            const Icon = controlIcon(button, playbackState);
-            return <Pressable key={button.id} style={({ pressed }) => [styles.immersiveKey, cellFrame(placement.row, placement.column, placement.rowSpan, placement.columnSpan, immersiveCellWidth, immersiveCellHeight, immersiveGap, 12), pressed && styles.keyPressed, !connected && styles.keyDisabled]} onPress={() => press(button, label)} disabled={!connected} accessibilityRole="button" accessibilityLabel={label}>
-              {button.appIconData ? <Image source={{ uri: button.appIconData }} style={{ width: immersiveIconSize, height: immersiveIconSize }} resizeMode="contain" /> : button.iconSvg && button.icon !== 'auto' ? <SvgXml xml={button.iconSvg} width={immersiveIconSize} height={immersiveIconSize} /> : <Icon size={immersiveIconSize} color={colors.text} strokeWidth={1.7} />}
-            </Pressable>;
-          })}
-          </View> : null}
-          {showWidgetArea && widgetArea && widgetScreen ? <View style={[styles.immersiveWidgetCanvas, { top: widgetOnlyMode ? 12 : 12 + buttonImmersiveHeight, height: widgetImmersiveHeight }]} {...widgetSwipeResponder.panHandlers}>
-            {Array.from({ length: displayWidgetRows * displayWidgetColumns }, (_, index) => {
-              const row = Math.floor(index / displayWidgetColumns);
-              const column = index % displayWidgetColumns;
-              const sourceRow = row + widgetTopRow;
-              const sourceColumn = column + widgetLeftColumn;
-              const item = widgetOccupied.get(sourceRow * widgetColumns + sourceColumn);
-              if (!item) return null;
-              if (item.type === 'widget') {
-                const placement = item.widget.placement;
-                if (placement.row !== sourceRow || placement.column !== sourceColumn) return null;
-                return <View key={item.widget.id} style={[styles.immersiveKey, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12, 0)]}>{item.widget.type === 'clock' || item.widget.type === 'pc_stats' ? null : item.widget.type === 'now_playing' ? <LiveNowPlaying connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} seekMedia={seekMedia} /> : item.widget.type === 'lyrics' ? <LiveLyrics connected={connected} focused={isFocused} seekMedia={seekMedia} /> : <PluginTextWidget widget={item.widget} immersive />}</View>;
-              }
-              const button = item.button;
-              const placement = buttonPlacement({ id: widgetScreen.id, name: widgetScreen.name, rows: widgetRows, columns: widgetColumns, buttons: widgetScreen.buttons }, button);
-              if (placement.row !== sourceRow || placement.column !== sourceColumn) return null;
-              const label = button.icon === 'auto' && button.action.type === 'media' && button.action.command === 'play_pause' ? (isPlaying ? 'Pause' : 'Play') : button.label;
-              const Icon = controlIcon(button, playbackState);
-              return <Pressable key={button.id} style={({ pressed }) => [styles.immersiveKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12), pressed && styles.keyPressed, !connected && styles.keyDisabled]} onPress={() => press(button, label)} disabled={!connected} accessibilityRole="button" accessibilityLabel={label}>
-                {button.appIconData ? <Image source={{ uri: button.appIconData }} style={{ width: immersiveWidgetIconSize, height: immersiveWidgetIconSize }} resizeMode="contain" /> : button.iconSvg && button.icon !== 'auto' ? <SvgXml xml={button.iconSvg} width={immersiveWidgetIconSize} height={immersiveWidgetIconSize} /> : <Icon size={immersiveWidgetIconSize} color={colors.text} strokeWidth={1.7} />}
-              </Pressable>;
-            })}
-            <WebWidgetLayer focused={isFocused} widgets={webWidgets((p) => cellFrame(p.row - widgetTopRow, p.column - widgetLeftColumn, p.rowSpan, p.columnSpan, immersiveWidgetCellWidth, immersiveWidgetCellHeight, immersiveGap, 12, 0))} />
-            {(widgetArea.pages.length > 1) ? <View style={styles.immersiveWidgetPageIndicator} pointerEvents="none"><Text style={styles.pageTabText}>{widgetPageIndex + 1} / {widgetArea.pages.length}</Text></View> : null}
+          {surface ? <View style={[styles.immersiveDeckCanvas, { top: 12, height: immersiveAvailableHeight }]} {...pageSwipeResponder.panHandlers}>
+            {renderCells(true)}
+            <WebWidgetLayer focused={isFocused} widgets={webWidgets((p) => cellFrame(p.row, p.column, p.rowSpan, p.columnSpan, immersiveCellWidth, immersiveCellHeight, immersiveGap, 12, 0))} />
           </View> : null}
         </View>
         {showImmersiveTools ? <View style={styles.immersiveTools}>
+          {folder ? <Pressable style={styles.immersiveExit} onPress={() => { closeFolder(); revealImmersiveTools(); }} accessibilityRole="button" accessibilityLabel="Close folder"><ChevronLeft size={19} color={colors.text} /></Pressable> : null}
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.immersivePageTools}>
             {(activeProfile?.pages ?? []).map((page, index) => <Pressable key={page.id} onPress={() => { selectPage(page.id); revealImmersiveTools(); }} style={[styles.immersivePageButton, index === activePageIndex && styles.pageTabActive]} accessibilityRole="button" accessibilityLabel={`Show ${page.name} page`} accessibilityState={{ selected: index === activePageIndex }}>
               <Text style={[styles.pageTabText, index === activePageIndex && styles.pageTabTextActive]}>{page.name}</Text>
@@ -574,7 +570,7 @@ export default function DeckScreen() {
   return (
     <SafeAreaView {...power.touchProps} style={styles.safe} edges={['top']}>
       <StatusBar style="light" />
-      <ScrollView contentContainerStyle={[styles.content, widgetOnlyMode && styles.widgetOnlyContent]} showsVerticalScrollIndicator={false}>
+      <ScrollView contentContainerStyle={[styles.content, { paddingBottom: bottomClearance }]} showsVerticalScrollIndicator={false}>
         <View style={styles.header}>
           <View style={styles.brand}><Snowflake size={19} color={colors.text} strokeWidth={1.8} /><Text style={styles.brandName}>Freeze</Text></View>
           <View style={styles.headerActions}>
@@ -589,16 +585,11 @@ export default function DeckScreen() {
 
         <View style={styles.titleRow}>
           <Text style={styles.title}>Deck</Text>
-          <View style={styles.subtitleRow}>
-            <Text style={styles.subtitle}>{activeProfile?.name ?? (deckConfig ? 'No active profile' : 'Waiting for PC deck')}</Text>
-          </View>
+          {activeProfile ? null : <Text style={styles.subtitle}>{deckConfig ? 'No active profile' : 'Waiting for PC deck'}</Text>}
         </View>
 
-        {activeProfile ? <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.pageTabs}>
-          {activeProfile.pages.map((page) => <Pressable key={page.id} style={[styles.pageTab, page.id === activePage?.id && styles.pageTabActive]} onPress={() => selectPage(page.id)} accessibilityRole="button" accessibilityState={{ selected: page.id === activePage?.id }}>
-              <Text style={[styles.pageTabText, page.id === activePage?.id && styles.pageTabTextActive]}>{page.name}</Text>
-          </Pressable>)}
-        </ScrollView> : null}
+        {deckConfig && deckConfig.profiles.length > 1 ? <ChipRow label="Profile" items={deckConfig.profiles} selectedId={activeProfile?.id} onSelect={(id) => void selectProfile(id)} /> : null}
+        {activeProfile ? <ChipRow label="Page" items={activeProfile.pages} selectedId={activePage?.id} onSelect={(id) => void selectPage(id)} /> : null}
 
         {!connected && <Pressable style={styles.connectBanner} onPress={() => router.push('/connect')} accessibilityRole="button">
           <Monitor size={18} color={colors.muted} />
@@ -606,64 +597,19 @@ export default function DeckScreen() {
           <ChevronRight size={16} color={colors.faint} />
         </Pressable>}
 
-        {activePage && hasButtons ? <>
-          <Text style={styles.sectionTitle}>{activePage.name}</Text>
-          <View style={[styles.grid, { height: rows * 100 + Math.max(0, rows - 1) * regularGap }]} onLayout={(event) => {
+        {surface ? <>
+          {folder ? <View style={styles.sectionRow}>
+            <Pressable style={styles.backButton} onPress={closeFolder} accessibilityRole="button" accessibilityLabel={`Back to ${activePage?.name}`}><ChevronLeft size={16} color={colors.muted} /><Text style={styles.backText} numberOfLines={1}>{activePage?.name}</Text></Pressable>
+            <Text style={styles.sectionTitle} numberOfLines={1}>{folder.name}</Text>
+          </View> : null}
+          {hasItems ? <View style={[styles.grid, { height: rows * 100 + Math.max(0, rows - 1) * regularGap }]} onLayout={(event) => {
             const width = event.nativeEvent.layout.width;
             setRegularGridWidth((current) => Math.abs(current - width) < 0.5 ? current : width);
           }} {...pageSwipeResponder.panHandlers}>
-            {Array.from({ length: rows * columns }, (_, index) => {
-              const row = Math.floor(index / columns);
-              const column = index % columns;
-              const item = occupied.get(index);
-              if (!item) return <View key={`empty-${index}`} style={[styles.key, styles.emptyKey, cellFrame(row, column)]} />;
-              const button = item as DeckButton;
-              const placement = buttonPlacement(activePage!, button);
-              if (placement.row !== row || placement.column !== column) return null;
-              const dynamicPlay = button.icon === 'auto' && button.action.type === 'media' && button.action.command === 'play_pause';
-              const label = dynamicPlay ? (isPlaying ? 'Pause' : 'Play') : button.label;
-              const Icon = controlIcon(button, playbackState);
-              return <Pressable key={button.id} style={({ pressed }) => [styles.key, cellFrame(placement.row, placement.column, placement.rowSpan, placement.columnSpan), pressed && styles.keyPressed, !connected && styles.keyDisabled]} onPress={() => press(button, label)} disabled={!connected} accessibilityRole="button" accessibilityLabel={label}>
-                {button.appIconData ? <Image source={{ uri: button.appIconData }} style={styles.appIcon} resizeMode="contain" /> : button.iconSvg && button.icon !== 'auto' ? <SvgXml xml={button.iconSvg} width={21} height={21} /> : <Icon size={21} color={colors.text} strokeWidth={1.7} />}
-                <Text style={styles.keyLabel} numberOfLines={2}>{label}</Text>
-              </Pressable>;
-            })}
-          </View>
-        </> : !widgetOnlyMode ? <View style={styles.emptyDeck}><Command size={20} color={colors.faint} /><Text style={styles.feedbackText}>{connected ? 'The desktop has no active deck page.' : 'Connect to a PC to load its deck.'}</Text></View> : null}
-
-        {showWidgetArea && widgetArea && widgetScreen ? <View style={[styles.widgetArea, widgetOnlyMode && styles.widgetOnlyArea]} {...widgetSwipeResponder.panHandlers}>
-          <View style={styles.widgetAreaHeading}><Text style={styles.widgetAreaTitle}>Widgets</Text>{widgetArea.pages.length > 1 ? <Text style={styles.widgetAreaPage}>{widgetPageIndex + 1} / {widgetArea.pages.length}</Text> : null}</View>
-          {widgetOccupied.size === 0 ? <View pointerEvents="none" style={styles.widgetOnlyEmpty}><Command size={20} color={colors.faint} /><Text style={styles.feedbackText}>Add widgets to this page in the desktop editor.</Text></View> : null}
-          <View style={[styles.grid, { height: displayWidgetRows * 100 + Math.max(0, displayWidgetRows - 1) * regularGap }]} onLayout={(event) => {
-            const width = event.nativeEvent.layout.width;
-            setWidgetGridWidth((current) => Math.abs(current - width) < 0.5 ? current : width);
-          }}>
-            {Array.from({ length: displayWidgetRows * displayWidgetColumns }, (_, index) => {
-              const row = Math.floor(index / displayWidgetColumns);
-              const column = index % displayWidgetColumns;
-              const sourceRow = row + widgetTopRow;
-              const sourceColumn = column + widgetLeftColumn;
-              const item = widgetOccupied.get(sourceRow * widgetColumns + sourceColumn);
-              const widgetCellHeight = 100;
-              if (!item) return <View key={`widget-empty-${index}`} style={[styles.key, styles.emptyKey, cellFrame(row, column, 1, 1, widgetCellWidth, widgetCellHeight)]} />;
-              if (item.type === 'widget') {
-                const placement = item.widget.placement;
-                if (placement.row !== sourceRow || placement.column !== sourceColumn) return null;
-                return <View key={item.widget.id} style={[styles.key, styles.clockWidgetKey, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, widgetCellWidth, widgetCellHeight)]}>{item.widget.type === 'clock' || item.widget.type === 'pc_stats' ? null : item.widget.type === 'now_playing' ? <LiveNowPlaying connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} seekMedia={seekMedia} /> : item.widget.type === 'lyrics' ? <LiveLyrics connected={connected} focused={isFocused} seekMedia={seekMedia} /> : <PluginTextWidget widget={item.widget} />}</View>;
-              }
-              const button = item.button;
-              const placement = buttonPlacement({ id: widgetScreen.id, name: widgetScreen.name, rows: widgetRows, columns: widgetColumns, buttons: widgetScreen.buttons }, button);
-              if (placement.row !== sourceRow || placement.column !== sourceColumn) return null;
-              const label = button.icon === 'auto' && button.action.type === 'media' && button.action.command === 'play_pause' ? (isPlaying ? 'Pause' : 'Play') : button.label;
-              const Icon = controlIcon(button, playbackState);
-              return <Pressable key={button.id} style={({ pressed }) => [styles.key, cellFrame(placement.row - widgetTopRow, placement.column - widgetLeftColumn, placement.rowSpan, placement.columnSpan, widgetCellWidth, widgetCellHeight), pressed && styles.keyPressed, !connected && styles.keyDisabled]} onPress={() => press(button, label)} disabled={!connected} accessibilityRole="button" accessibilityLabel={label}>
-                {button.appIconData ? <Image source={{ uri: button.appIconData }} style={styles.appIcon} resizeMode="contain" /> : button.iconSvg && button.icon !== 'auto' ? <SvgXml xml={button.iconSvg} width={21} height={21} /> : <Icon size={21} color={colors.text} strokeWidth={1.7} />}
-                <Text style={styles.keyLabel} numberOfLines={2}>{label}</Text>
-              </Pressable>;
-            })}
-            <WebWidgetLayer focused={isFocused} widgets={webWidgets((p) => cellFrame(p.row - widgetTopRow, p.column - widgetLeftColumn, p.rowSpan, p.columnSpan, widgetCellWidth, 100))} />
-          </View>
-        </View> : null}
+            {renderCells(false)}
+            <WebWidgetLayer focused={isFocused} widgets={webWidgets((p) => cellFrame(p.row, p.column, p.rowSpan, p.columnSpan, regularCellWidth, 100))} />
+          </View> : <View style={styles.emptyDeck} {...pageSwipeResponder.panHandlers}><Command size={20} color={colors.faint} /><Text style={styles.emptyDeckText}>{folder ? 'This folder is empty.' : 'This page is empty.'}{'\n'}Add buttons and widgets in the desktop editor.</Text></View>}
+        </> : <View style={styles.emptyDeck}><Command size={20} color={colors.faint} /><Text style={styles.emptyDeckText}>{connected ? 'The desktop has no active deck page.' : 'Connect to a PC to load its deck.'}</Text></View>}
 
         <View style={styles.feedbackRow}>
           {actionError ? <><Wifi size={13} color={colors.faint} /><Text style={styles.feedbackText}>{actionErrorText}</Text></> : feedback ? <><View style={styles.feedbackDot} /><Text style={styles.feedbackText}>{feedback}</Text></> : <><Wifi size={13} color={colors.faint} /><Text style={styles.feedbackText}>{connected ? 'Ready to send controls' : 'Connect to enable controls'}</Text></>}
@@ -681,8 +627,6 @@ const styles = StyleSheet.create({
   immersiveBackdrop: { ...StyleSheet.absoluteFill },
   immersiveGrid: { ...StyleSheet.absoluteFill },
   immersiveDeckCanvas: { position: 'absolute', left: 0, right: 0 },
-  immersiveWidgetCanvas: { position: 'absolute', left: 0, right: 0 },
-  immersiveWidgetPageIndicator: { position: 'absolute', top: 0, right: 12, paddingHorizontal: 7, paddingVertical: 3, borderRadius: 8, backgroundColor: colors.panel },
   immersiveKey: { borderRadius: 10, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panel, alignItems: 'center', justifyContent: 'center' },
   clockWidgetKey: { padding: 4, alignItems: 'center', justifyContent: 'center' },
   pluginWidgetContent: { flex: 1, width: '100%', alignItems: 'center', justifyContent: 'center', gap: 4, paddingHorizontal: 3, overflow: 'hidden' },
@@ -729,25 +673,25 @@ const styles = StyleSheet.create({
   immersivePageButton: { height: 30, justifyContent: 'center', paddingHorizontal: 10, borderRadius: 5 },
   immersiveExit: { width: 34, height: 34, borderRadius: 6, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border },
   content: { flexGrow: 1, paddingHorizontal: 18, paddingBottom: 24 },
-  widgetOnlyContent: { flexGrow: 0 },
-  header: { height: 52, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  headerActions: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  immersiveToggle: { width: 34, height: 34, borderWidth: 1, borderColor: colors.border, borderRadius: 6, backgroundColor: colors.panel, alignItems: 'center', justifyContent: 'center' },
-  brand: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  header: { minHeight: 52, flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', gap: 12 },
+  headerActions: { flexShrink: 1, minWidth: 0, flexDirection: 'row', alignItems: 'center', gap: 8 },
+  immersiveToggle: { flexShrink: 0, width: 34, height: 34, borderWidth: 1, borderColor: colors.border, borderRadius: 6, backgroundColor: colors.panel, alignItems: 'center', justifyContent: 'center' },
+  brand: { flexShrink: 0, flexDirection: 'row', alignItems: 'center', gap: 8 },
   brandName: { color: colors.text, fontWeight: '600', fontSize: 14 },
-  connectionPill: { maxWidth: '62%', borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panel, borderRadius: 6, paddingHorizontal: 9, height: 34, flexDirection: 'row', alignItems: 'center', gap: 7 },
+  connectionPill: { flexShrink: 1, minWidth: 0, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panel, borderRadius: 6, paddingHorizontal: 9, minHeight: 34, flexDirection: 'row', alignItems: 'center', gap: 7 },
   dot: { width: 7, height: 7, borderRadius: 5 },
   dotOnline: { backgroundColor: colors.mint },
   dotOffline: { backgroundColor: colors.faint },
-  connectionText: { maxWidth: 150, flexShrink: 1, fontSize: 13, color: colors.muted, fontWeight: '500' },
-  titleRow: { marginTop: 18, marginBottom: 17 },
+  connectionText: { flexShrink: 1, minWidth: 0, fontSize: 13, color: colors.muted, fontWeight: '500' },
+  titleRow: { marginTop: 18, marginBottom: 15 },
   title: { color: colors.text, fontWeight: '600', fontSize: 23, letterSpacing: -0.3 },
   subtitle: { color: colors.muted, fontSize: 14, marginTop: 5 },
   subtitleRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
   managePages: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingVertical: 5, paddingHorizontal: 7, borderRadius: 5, borderWidth: 1, borderColor: colors.border },
   managePagesText: { color: colors.muted, fontSize: 12 },
+  pageTabsScroll: { flexGrow: 0, flexShrink: 0 },
   pageTabs: { flexDirection: 'row', gap: 6, paddingBottom: 16 },
-  pageTab: { height: 29, justifyContent: 'center', paddingHorizontal: 10, borderRadius: 5, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panel },
+  pageTab: { minHeight: 29, maxWidth: 180, justifyContent: 'center', paddingHorizontal: 10, borderRadius: 5, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panel },
   pageTabActive: { backgroundColor: colors.pressed, borderColor: '#52525b' },
   pageTabText: { color: colors.muted, fontSize: 13, fontWeight: '500' },
   pageTabTextActive: { color: colors.text },
@@ -755,13 +699,10 @@ const styles = StyleSheet.create({
   bannerCopy: { flex: 1 },
   bannerTitle: { color: colors.text, fontSize: 14, fontWeight: '600' },
   bannerSub: { color: colors.muted, fontSize: 12, marginTop: 4 },
-  sectionTitle: { color: colors.muted, fontSize: 14, fontWeight: '500', marginBottom: 10 },
-  widgetArea: { marginTop: 18, padding: 12, borderWidth: 1, borderColor: colors.border, borderRadius: 10, backgroundColor: colors.panel },
-  widgetOnlyArea: { position: 'relative', marginTop: 0 },
-  widgetOnlyEmpty: { ...StyleSheet.absoluteFill, zIndex: 1, alignItems: 'center', justifyContent: 'center', gap: 8, padding: 20 },
-  widgetAreaHeading: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 },
-  widgetAreaTitle: { color: colors.text, fontSize: 14, fontWeight: '600' },
-  widgetAreaPage: { color: colors.muted, fontSize: 12, fontVariant: ['tabular-nums'] },
+  sectionTitle: { flexShrink: 1, color: colors.muted, fontSize: 14, fontWeight: '500' },
+  sectionRow: { flexDirection: 'row', alignItems: 'center', gap: 10, marginBottom: 10 },
+  backButton: { flexDirection: 'row', alignItems: 'center', gap: 2, paddingVertical: 4, paddingRight: 8 },
+  backText: { flexShrink: 1, maxWidth: 140, color: colors.muted, fontSize: 14 },
   grid: { position: 'relative' },
   key: { minHeight: 100, borderRadius: 7, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panel, padding: 11, justifyContent: 'space-between' },
   emptyKey: { borderStyle: 'dashed', backgroundColor: 'transparent', opacity: 0.45 },
@@ -773,7 +714,8 @@ const styles = StyleSheet.create({
   addKey: { alignItems: 'flex-start', justifyContent: 'space-between', borderStyle: 'dashed', backgroundColor: 'transparent' },
   addLabel: { color: colors.muted, fontSize: 13, fontWeight: '500' },
   feedbackRow: { minHeight: 40, marginTop: 15, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 7 },
-  emptyDeck: { minHeight: 150, alignItems: 'center', justifyContent: 'center', gap: 10, borderWidth: 1, borderColor: colors.border, borderRadius: 7, backgroundColor: colors.panel },
+  emptyDeckText: { color: colors.muted, fontSize: 13, lineHeight: 19, textAlign: 'center' },
+  emptyDeck: { minHeight: 150, alignItems: 'center', justifyContent: 'center', gap: 10, paddingHorizontal: 24, paddingVertical: 28, borderWidth: 1, borderColor: colors.border, borderRadius: 7, backgroundColor: colors.panel },
   feedbackDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: colors.mint },
   feedbackText: { color: colors.faint, fontSize: 13 },
 });

@@ -2,6 +2,7 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import { useRef, useState } from 'react';
 import { KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { useTabBarClearance } from '../../tab-inset';
 import { Camera, Check, ChevronDown, ChevronRight, Monitor, QrCode, RefreshCw, ShieldCheck, Trash2 } from 'lucide-react-native';
 import { connectionId, PcConnection, usePcConnection } from '../../connection';
 import { colors } from '../../theme';
@@ -34,6 +35,7 @@ function decodePairingCode(data: string): PcConnection | null {
 
 export default function ConnectScreen() {
   const { connection, pairedDevices, status, protocolError, connect, disconnect, removePairedDevice } = usePcConnection();
+  const bottomClearance = useTabBarClearance();
   const [permission, requestPermission] = useCameraPermissions();
   const [draft, setDraft] = useState<{ host: string; port: string; token: string; deviceName: string } | null>(null);
   const [error, setError] = useState('');
@@ -103,7 +105,7 @@ export default function ConnectScreen() {
   return (
     <SafeAreaView style={styles.safe} edges={['top']}>
       <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-        <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+        <ScrollView contentContainerStyle={[styles.content, { paddingBottom: bottomClearance }]} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
           <Text style={styles.title}>Connect</Text>
           <Text style={styles.description}>Pair this phone with the Freeze app running on your PC.</Text>
 

@@ -131,6 +131,10 @@ struct DeckConfig {
     legacy_auto_switch_enabled: bool,
     #[serde(default)]
     fallback_profile_id: String,
+    /// What the last automatic conversion changed (e.g. widget areas becoming pages). The Deck page shows
+    /// it once; saving a config with it cleared dismisses it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    migration_notes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -144,6 +148,9 @@ struct DeckProfile {
     auto_switch_apps: Vec<String>,
     #[serde(default)]
     auto_switch_enabled: bool,
+    /// The page this profile opens on when Freeze starts. Empty means the first page.
+    #[serde(default)]
+    default_page_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     widget_screen: Option<DeckWidgetScreen>,
 }
@@ -245,8 +252,28 @@ struct DeckPage {
     #[serde(default)]
     columns: u8,
     buttons: Vec<DeckButton>,
+    /// Widgets share the page grid with the buttons.
+    #[serde(default)]
+    widgets: Vec<DeckWidget>,
+    #[serde(default)]
+    folders: Vec<DeckFolder>,
+    /// Legacy: converted into pages by `normalize_deck_layout` and never written back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     widget_area: Option<DeckWidgetArea>,
+}
+
+/// A grid opened by an `open_folder` button on its page. One level deep: folders hold no folder buttons.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeckFolder {
+    id: String,
+    name: String,
+    rows: u8,
+    columns: u8,
+    #[serde(default)]
+    buttons: Vec<DeckButton>,
+    #[serde(default)]
+    widgets: Vec<DeckWidget>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -346,7 +373,8 @@ struct DeckPlacement {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+// The clients (desktop UI and phone) write camelCase fields; the snake_case spellings are still read.
+#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 enum DeckAction {
     Media {
         command: MediaCommand,
@@ -365,11 +393,15 @@ enum DeckAction {
     },
     RunScript {
         path: String,
+        #[serde(alias = "allow_on_pc")]
         allow_on_pc: bool,
     },
     PluginAction {
+        #[serde(alias = "plugin_id")]
         plugin_id: String,
+        #[serde(alias = "action_id")]
         action_id: String,
+        #[serde(alias = "allow_on_pc")]
         allow_on_pc: bool,
         #[serde(default)]
         inputs: HashMap<String, String>,
@@ -378,10 +410,16 @@ enum DeckAction {
         steps: Vec<DeckStep>,
     },
     SelectProfile {
+        #[serde(alias = "profile_id")]
         profile_id: String,
     },
     SelectPage {
+        #[serde(alias = "page_id")]
         page_id: String,
+    },
+    OpenFolder {
+        #[serde(alias = "folder_id")]
+        folder_id: String,
     },
 }
 
@@ -500,16 +538,20 @@ fn default_deck_config() -> DeckConfig {
                 rows: 2,
                 columns: 3,
                 buttons,
+                widgets: Vec::new(),
+                folders: Vec::new(),
                 widget_area: None,
             }],
             active_page_id: "main".to_owned(),
             auto_switch_apps: Vec::new(),
             auto_switch_enabled: false,
+            default_page_id: "main".to_owned(),
             widget_screen: None,
         }],
         active_profile_id: "default".to_owned(),
         legacy_auto_switch_enabled: false,
         fallback_profile_id: "default".to_owned(),
+        migration_notes: Vec::new(),
     }
 }
 
@@ -527,8 +569,8 @@ fn validate_deck_config(config: &DeckConfig) -> Result<(), String> {
         {
             return Err("Profile IDs and names must be valid and unique".into());
         }
-        if profile.pages.is_empty() || profile.pages.len() > 8 {
-            return Err("Each profile must contain 1–8 pages".into());
+        if profile.pages.is_empty() || profile.pages.len() > MAX_PAGES {
+            return Err("Each profile must contain 1–32 pages".into());
         }
         let mut page_ids = std::collections::HashSet::new();
         let mut page_names = std::collections::HashSet::new();
@@ -541,107 +583,44 @@ fn validate_deck_config(config: &DeckConfig) -> Result<(), String> {
             {
                 return Err("Page IDs and names must be valid and unique".into());
             }
-            let widget_only = page.rows == 0 && page.columns == 0 && page.buttons.is_empty();
-            if !widget_only && (!(1..=6).contains(&page.rows) || !(1..=6).contains(&page.columns)) {
+            if !(1..=MAX_GRID).contains(&page.rows) || !(1..=MAX_GRID).contains(&page.columns) {
                 return Err("Page rows and columns must be between 1 and 6".into());
             }
-            if page.buttons.len() > usize::from(page.rows) * usize::from(page.columns) {
-                return Err("A page cannot contain more buttons than its grid slots".into());
+            if page.widget_area.is_some() {
+                return Err("Widget areas must be converted to pages before saving".into());
             }
-            validate_page_layout(page)?;
-            for button in &page.buttons {
-                validate_deck_button(button, &mut button_ids)?;
+            validate_grid(page.rows, page.columns, &page.buttons, &page.widgets, &mut button_ids)?;
+            if page.folders.len() > MAX_FOLDERS_PER_PAGE {
+                return Err("A page can have up to 12 folders".into());
             }
-            if let Some(area) = &page.widget_area {
-                if !(1..=6).contains(&area.rows) || !(1..=6).contains(&area.columns) {
-                    return Err("Widget area rows and columns must be between 1 and 6".into());
+            let mut folder_names = std::collections::HashSet::new();
+            for folder in &page.folders {
+                if !valid_id(&folder.id)
+                    || !button_ids.insert(folder.id.clone())
+                    || !valid_label(&folder.name, 24)
+                    || !folder_names.insert(folder.name.to_lowercase())
+                {
+                    return Err("Folder IDs and names must be valid and unique".into());
                 }
-                if area.pages.is_empty() || area.pages.len() > 9 {
-                    return Err("A widget area must contain 1–9 pages".into());
+                if !(1..=MAX_GRID).contains(&folder.rows) || !(1..=MAX_GRID).contains(&folder.columns) {
+                    return Err("Folder rows and columns must be between 1 and 6".into());
                 }
-                let mut widget_page_ids = std::collections::HashSet::new();
-                let mut widget_page_names = std::collections::HashSet::new();
-                for widget_page in &area.pages {
-                    if !valid_id(&widget_page.id)
-                        || !widget_page_ids.insert(&widget_page.id)
-                        || !valid_label(&widget_page.name, 24)
-                        || !widget_page_names.insert(widget_page.name.to_lowercase())
-                    {
-                        return Err("Widget page IDs and names must be valid and unique".into());
-                    }
-                    if widget_page.buttons.len() + widget_page.widgets.len()
-                        > usize::from(area.rows) * usize::from(area.columns)
-                    {
-                        return Err(
-                            "A widget page cannot contain more items than its grid slots".into(),
-                        );
-                    }
-                    for button in &widget_page.buttons {
-                        validate_deck_button(button, &mut button_ids)?;
-                    }
-                    let mut placements =
-                        Vec::with_capacity(widget_page.buttons.len() + widget_page.widgets.len());
-                    placements.extend(
-                        widget_page
-                            .buttons
-                            .iter()
-                            .map(|button| {
-                                button.placement.ok_or_else(|| {
-                                    "Every widget button must have a grid position".to_owned()
-                                })
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
-                    );
-                    for widget in &widget_page.widgets {
-                        if !valid_id(&widget.id) || !button_ids.insert(widget.id.clone()) {
-                            return Err(
-                                "Widget IDs must be valid and unique within a profile".into()
-                            );
-                        }
-                        validate_deck_widget(widget)?;
-                        placements.push(widget.placement);
-                    }
-                    validate_layout(area.rows, area.columns, &placements)?;
-                }
-            }
-        }
-        if let Some(screen) = &profile.widget_screen {
-            if !(1..=6).contains(&screen.rows) || !(1..=6).contains(&screen.columns) {
-                return Err("Widget screen rows and columns must be between 1 and 6".into());
-            }
-            if screen.buttons.len() + screen.widgets.len()
-                > usize::from(screen.rows) * usize::from(screen.columns)
-            {
-                return Err(
-                    "The widget screen cannot contain more items than its grid slots".into(),
-                );
-            }
-            for button in &screen.buttons {
-                validate_deck_button(button, &mut button_ids)?;
-            }
-            let mut placements = Vec::with_capacity(screen.buttons.len() + screen.widgets.len());
-            placements.extend(
-                screen
+                if folder
                     .buttons
                     .iter()
-                    .map(|button| {
-                        button.placement.ok_or_else(|| {
-                            "Every widget screen button must have a grid position".to_owned()
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
-            for widget in &screen.widgets {
-                if !valid_id(&widget.id) || !button_ids.insert(widget.id.clone()) {
-                    return Err("Widget IDs must be valid and unique within a profile".into());
+                    .any(|button| matches!(button.action, DeckAction::OpenFolder { .. }))
+                {
+                    return Err("Folders cannot contain folders".into());
                 }
-                validate_deck_widget(widget)?;
-                placements.push(widget.placement);
+                validate_grid(folder.rows, folder.columns, &folder.buttons, &folder.widgets, &mut button_ids)?;
             }
-            validate_layout(screen.rows, screen.columns, &placements)?;
         }
-        if !page_ids.contains(&profile.active_page_id) {
-            return Err("The active page must exist in its profile".into());
+    }
+    for profile in &config.profiles {
+        if !profile.default_page_id.is_empty()
+            && !profile.pages.iter().any(|page| page.id == profile.default_page_id)
+        {
+            return Err("The default page must exist in its profile".into());
         }
     }
     if !profile_ids.contains(&config.active_profile_id) {
@@ -670,39 +649,70 @@ fn validate_deck_config(config: &DeckConfig) -> Result<(), String> {
     for profile in &config.profiles {
         let page_ids: std::collections::HashSet<_> =
             profile.pages.iter().map(|page| page.id.as_str()).collect();
-        for button in profile.pages.iter().flat_map(|page| {
-            page.buttons.iter().chain(
-                page.widget_area
-                    .iter()
-                    .flat_map(|area| &area.pages)
-                    .flat_map(|widget_page| &widget_page.buttons),
-            )
-        }) {
-            match &button.action {
-                DeckAction::SelectProfile { profile_id } if !profile_ids.contains(profile_id) => {
-                    return Err("A button references an unknown profile".into())
+        for page in &profile.pages {
+            let mut opened = std::collections::HashSet::new();
+            for button in page
+                .buttons
+                .iter()
+                .chain(page.folders.iter().flat_map(|folder| &folder.buttons))
+            {
+                match &button.action {
+                    DeckAction::SelectProfile { profile_id } if !profile_ids.contains(profile_id) => {
+                        return Err("A button references an unknown profile".into())
+                    }
+                    DeckAction::SelectPage { page_id } if !page_ids.contains(page_id.as_str()) => {
+                        return Err("A button references an unknown page".into())
+                    }
+                    DeckAction::OpenFolder { folder_id } => {
+                        if !page.folders.iter().any(|folder| folder.id == *folder_id)
+                            || !opened.insert(folder_id.as_str())
+                        {
+                            return Err("A folder button must open one folder on its own page".into());
+                        }
+                    }
+                    _ => (),
                 }
-                DeckAction::SelectPage { page_id } if !page_ids.contains(page_id.as_str()) => {
-                    return Err("A button references an unknown page".into())
-                }
-                _ => (),
+            }
+            if page.folders.iter().any(|folder| !opened.contains(folder.id.as_str())) {
+                return Err("Every folder needs a button that opens it".into());
             }
         }
     }
     Ok(())
 }
 
-fn validate_page_layout(page: &DeckPage) -> Result<(), String> {
-    let placements = page
-        .buttons
-        .iter()
-        .map(|button| {
+const MAX_GRID: u8 = 6;
+const MAX_PAGES: usize = 32;
+const MAX_FOLDERS_PER_PAGE: usize = 12;
+
+/// Buttons and widgets on one grid: they must fit, not overlap, and share the profile's unique id set.
+fn validate_grid(
+    rows: u8,
+    columns: u8,
+    buttons: &[DeckButton],
+    widgets: &[DeckWidget],
+    ids: &mut std::collections::HashSet<String>,
+) -> Result<(), String> {
+    if buttons.len() + widgets.len() > usize::from(rows) * usize::from(columns) {
+        return Err("A grid cannot contain more items than its slots".into());
+    }
+    let mut placements = Vec::with_capacity(buttons.len() + widgets.len());
+    for button in buttons {
+        validate_deck_button(button, ids)?;
+        placements.push(
             button
                 .placement
-                .ok_or_else(|| "Every button must have a grid position".to_owned())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    validate_layout(page.rows, page.columns, &placements)
+                .ok_or_else(|| "Every button must have a grid position".to_owned())?,
+        );
+    }
+    for widget in widgets {
+        if !valid_id(&widget.id) || !ids.insert(widget.id.clone()) {
+            return Err("Widget IDs must be valid and unique within a profile".into());
+        }
+        validate_deck_widget(widget)?;
+        placements.push(widget.placement);
+    }
+    validate_layout(rows, columns, &placements)
 }
 
 fn validate_deck_widget(widget: &DeckWidget) -> Result<(), String> {
@@ -878,6 +888,7 @@ fn validate_deck_button(
 }
 
 fn normalize_deck_layout(config: &mut DeckConfig) {
+    let mut notes: Vec<String> = Vec::new();
     for profile in &mut config.profiles {
         if let Some(legacy) = profile.widget_screen.take() {
             let target_page_index = profile
@@ -981,15 +992,132 @@ fn normalize_deck_layout(config: &mut DeckConfig) {
             }
         }
 
+        convert_widget_areas(profile, &mut notes);
         for page in &mut profile.pages {
+            if !(1..=MAX_GRID).contains(&page.rows) || !(1..=MAX_GRID).contains(&page.columns) {
+                // An older page with its button grid turned off: give it the default 2×3 grid.
+                page.rows = if page.rows == 0 { 2 } else { page.rows.min(MAX_GRID) };
+                page.columns = if page.columns == 0 { 3 } else { page.columns.min(MAX_GRID) };
+            }
             normalize_button_placements(&mut page.buttons, page.rows, page.columns);
-            if let Some(area) = &mut page.widget_area {
-                for widget_page in &mut area.pages {
-                    normalize_button_placements(&mut widget_page.buttons, area.rows, area.columns);
-                }
+            clean_folders(page);
+            for folder in &mut page.folders {
+                folder.rows = folder.rows.clamp(1, MAX_GRID);
+                folder.columns = folder.columns.clamp(1, MAX_GRID);
+                normalize_button_placements(&mut folder.buttons, folder.rows, folder.columns);
             }
         }
     }
+    config.migration_notes.extend(notes);
+}
+
+/// Widget areas are gone: the first widget page of a page with no buttons becomes the page's own grid,
+/// and every other non-empty widget page becomes a page of its own, right after the page it came from.
+fn convert_widget_areas(profile: &mut DeckProfile, notes: &mut Vec<String>) {
+    if profile.pages.iter().all(|page| page.widget_area.is_none()) {
+        return;
+    }
+    let originals = std::mem::take(&mut profile.pages);
+    let total = originals.len();
+    let mut names: std::collections::HashSet<String> = originals.iter().map(|page| page.name.to_lowercase()).collect();
+    let mut ids: std::collections::HashSet<String> = originals.iter().map(|page| page.id.clone()).collect();
+    let mut result: Vec<DeckPage> = Vec::with_capacity(total);
+    for (index, mut page) in originals.into_iter().enumerate() {
+        let mut extra = Vec::new();
+        if let Some(area) = page.widget_area.take() {
+            let (rows, columns) = (area.rows.clamp(1, MAX_GRID), area.columns.clamp(1, MAX_GRID));
+            let mut pending: Vec<DeckWidgetPage> = area
+                .pages
+                .into_iter()
+                .filter(|widget_page| !widget_page.buttons.is_empty() || !widget_page.widgets.is_empty())
+                .collect();
+            if page.buttons.is_empty() && page.widgets.is_empty() && !pending.is_empty() {
+                let first = pending.remove(0);
+                page.rows = rows;
+                page.columns = columns;
+                page.buttons = first.buttons;
+                page.widgets = first.widgets;
+            }
+            let mut moved = 0;
+            let mut dropped = 0;
+            for widget_page in pending {
+                if result.len() + 1 + extra.len() + (total - index - 1) >= MAX_PAGES {
+                    dropped += 1;
+                    continue;
+                }
+                let name = unique_page_name(&page.name, &mut names);
+                let id = unique_page_id(&page.id, &mut ids);
+                extra.push(DeckPage {
+                    id,
+                    name,
+                    rows,
+                    columns,
+                    buttons: widget_page.buttons,
+                    widgets: widget_page.widgets,
+                    folders: Vec::new(),
+                    widget_area: None,
+                });
+                moved += 1;
+            }
+            if moved > 0 || dropped > 0 {
+                let mut note = format!("“{}”: {} widget page{} became {}.", page.name, moved, if moved == 1 { "" } else { "s" }, if moved == 1 { "its own page" } else { "their own pages" });
+                if !area.enabled {
+                    note.push_str(" They were hidden on the phone and are now visible.");
+                }
+                if dropped > 0 {
+                    note.push_str(&format!(" {dropped} more could not be kept because a profile holds up to {MAX_PAGES} pages."));
+                }
+                notes.push(note);
+            }
+        }
+        result.push(page);
+        result.extend(extra);
+    }
+    profile.pages = result;
+}
+
+/// "Page widgets", then "Page widgets 2"…; the page name is shortened so the label stays within 24 bytes.
+fn unique_page_name(base: &str, names: &mut std::collections::HashSet<String>) -> String {
+    for number in 1usize.. {
+        let suffix = if number == 1 { " widgets".to_owned() } else { format!(" widgets {number}") };
+        let mut stem = base.to_owned();
+        while stem.len() + suffix.len() > 24 {
+            stem.pop();
+        }
+        let candidate = format!("{}{}", stem.trim_end(), suffix);
+        if names.insert(candidate.to_lowercase()) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+fn unique_page_id(base: &str, ids: &mut std::collections::HashSet<String>) -> String {
+    for number in 1usize.. {
+        let suffix = format!("-w{number}");
+        let stem: String = base.chars().take(64 - suffix.len()).collect();
+        let candidate = format!("{stem}{suffix}");
+        if ids.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+/// Keeps folders and their buttons in step: no folder inside a folder, no button for a missing folder,
+/// no folder without a button, and one button per folder.
+fn clean_folders(page: &mut DeckPage) {
+    for folder in &mut page.folders {
+        folder.buttons.retain(|button| !matches!(button.action, DeckAction::OpenFolder { .. }));
+    }
+    page.folders.truncate(MAX_FOLDERS_PER_PAGE);
+    let known: std::collections::HashSet<String> = page.folders.iter().map(|folder| folder.id.clone()).collect();
+    let mut opened = std::collections::HashSet::new();
+    page.buttons.retain(|button| match &button.action {
+        DeckAction::OpenFolder { folder_id } => known.contains(folder_id) && opened.insert(folder_id.clone()),
+        _ => true,
+    });
+    page.folders.retain(|folder| opened.contains(&folder.id));
 }
 
 fn normalize_button_placements(buttons: &mut [DeckButton], rows: u8, columns: u8) {
@@ -1053,7 +1181,8 @@ fn validate_action(action: &DeckAction) -> Result<(), String> {
     match action {
         DeckAction::Media { .. }
         | DeckAction::SelectProfile { .. }
-        | DeckAction::SelectPage { .. } => Ok(()),
+        | DeckAction::SelectPage { .. }
+        | DeckAction::OpenFolder { .. } => Ok(()),
         DeckAction::Hotkey { keys } => validate_hotkey(keys),
         DeckAction::LaunchApp { app } => validate_app_target(app),
         DeckAction::LaunchFile { path } => validate_file_target(path),
@@ -1341,16 +1470,12 @@ fn plugin_is_used(config: &DeckConfig, plugin_id: &str) -> bool {
             widget.kind == DeckWidgetType::Plugin
                 && widget.plugin_id.as_deref() == Some(plugin_id)
         };
-        profile.widget_screen.as_ref().is_some_and(|screen| {
-            screen.buttons.iter().any(button_uses_plugin)
-                || screen.widgets.iter().any(widget_uses_plugin)
-        }) || profile.pages.iter().any(|page| {
+        profile.pages.iter().any(|page| {
             page.buttons.iter().any(button_uses_plugin)
-                || page.widget_area.as_ref().is_some_and(|area| {
-                    area.pages.iter().any(|widget_page| {
-                        widget_page.buttons.iter().any(button_uses_plugin)
-                            || widget_page.widgets.iter().any(widget_uses_plugin)
-                    })
+                || page.widgets.iter().any(widget_uses_plugin)
+                || page.folders.iter().any(|folder| {
+                    folder.buttons.iter().any(button_uses_plugin)
+                        || folder.widgets.iter().any(widget_uses_plugin)
                 })
         })
     })
@@ -1385,7 +1510,65 @@ fn get_deck_config(state: &AppState) -> Option<DeckConfig> {
     state.deck_config.read().ok().map(|config| config.clone())
 }
 
+/// The deck config as a phone speaking `protocol` understands it. Protocol 2 gets the config as stored,
+/// minus what only the PC needs. Protocol 1 phones know nothing of widgets on the page grid or of folders:
+/// widgets move into a one-page widget area of the same size, and folder buttons are left out.
+fn config_for_protocol(config: &DeckConfig, protocol: u32) -> serde_json::Value {
+    use serde_json::{json, Value};
+    let mut value = serde_json::to_value(config).unwrap_or(Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.remove("migrationNotes");
+    }
+    if protocol >= 2 {
+        return value;
+    }
+    let Some(profiles) = value.get_mut("profiles").and_then(Value::as_array_mut) else {
+        return value;
+    };
+    for profile in profiles {
+        let Some(pages) = profile.get_mut("pages").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        // Older phones accept up to 8 pages.
+        pages.truncate(8);
+        for page in pages {
+            let Some(page) = page.as_object_mut() else { continue };
+            let widgets = page.remove("widgets").unwrap_or_else(|| json!([]));
+            page.remove("folders");
+            if let Some(buttons) = page.get_mut("buttons").and_then(Value::as_array_mut) {
+                buttons.retain(|button| button.pointer("/action/type").and_then(Value::as_str) != Some("open_folder"));
+            }
+            let has_widgets = widgets.as_array().is_some_and(|items| !items.is_empty());
+            let has_buttons = page.get("buttons").and_then(Value::as_array).is_some_and(|items| !items.is_empty());
+            if has_widgets {
+                let (rows, columns) = (page.get("rows").cloned().unwrap_or(json!(2)), page.get("columns").cloned().unwrap_or(json!(3)));
+                page.insert(
+                    "widgetArea".into(),
+                    json!({ "enabled": true, "rows": rows, "columns": columns, "pages": [{ "id": "widgets-1", "name": "Page 1", "buttons": [], "widgets": widgets }] }),
+                );
+                if !has_buttons {
+                    // The old way to say "widgets only".
+                    page.insert("rows".into(), json!(0));
+                    page.insert("columns".into(), json!(0));
+                }
+            }
+        }
+        // Selections and defaults must name a page this phone still sees.
+        let first = profile.pointer("/pages/0/id").cloned();
+        for key in ["activePageId", "defaultPageId"] {
+            let known = profile.get(key).is_some_and(|id| profile.get("pages").and_then(Value::as_array).is_some_and(|pages| pages.iter().any(|page| page.get("id") == Some(id))));
+            if !known {
+                if let (Some(first), Some(object)) = (first.clone(), profile.as_object_mut()) {
+                    object.insert(key.into(), first);
+                }
+            }
+        }
+    }
+    value
+}
+
 fn device_deck_snapshot(
+    protocol: u32,
     config: &DeckConfig,
     independent: bool,
     profile_id: &mut String,
@@ -1400,8 +1583,8 @@ fn device_deck_snapshot(
             .unwrap_or_default();
         return serde_json::json!({
             "type": "deck_snapshot",
-            "protocolVersion": 1,
-            "config": config,
+            "protocolVersion": protocol,
+            "config": config_for_protocol(config, protocol),
             "independentNavigation": false,
             "selection": { "profileId": config.active_profile_id, "pageId": active_page_id }
         });
@@ -1420,7 +1603,7 @@ fn device_deck_snapshot(
         .find(|profile| profile.id == *profile_id)
     else {
         *profile_id = config.profiles[0].id.clone();
-        return device_deck_snapshot(config, independent, profile_id, page_id);
+        return device_deck_snapshot(protocol, config, independent, profile_id, page_id);
     };
     if !profile.pages.iter().any(|page| page.id == *page_id) {
         *page_id = profile.active_page_id.clone();
@@ -1430,8 +1613,8 @@ fn device_deck_snapshot(
     }
     serde_json::json!({
         "type": "deck_snapshot",
-        "protocolVersion": 1,
-        "config": config,
+        "protocolVersion": protocol,
+        "config": config_for_protocol(config, protocol),
         "independentNavigation": true,
         "selection": { "profileId": profile_id, "pageId": page_id }
     })
@@ -1531,6 +1714,15 @@ fn load_deck_config(path: &Path) -> DeckConfig {
                         }
                     }
                     normalize_deck_layout(&mut config);
+                    // Freeze opens on the default profile and each profile's default page.
+                    for profile in &mut config.profiles {
+                        if profile.pages.iter().any(|page| page.id == profile.default_page_id) {
+                            profile.active_page_id = profile.default_page_id.clone();
+                        }
+                    }
+                    if config.profiles.iter().any(|profile| profile.id == config.fallback_profile_id) {
+                        config.active_profile_id = config.fallback_profile_id.clone();
+                    }
                     for button in config
                         .profiles
                         .iter_mut()
@@ -2006,6 +2198,8 @@ fn import_legacy_deck(
                 rows: 4,
                 columns: 3,
                 buttons: buttons?,
+                widgets: Vec::new(),
+                folders: Vec::new(),
                 widget_area: None,
             })
         })
@@ -2018,6 +2212,7 @@ fn import_legacy_deck(
         id: profile_id,
         name: profile_name,
         pages,
+        default_page_id: active_page_id.clone(),
         active_page_id,
         auto_switch_apps: Vec::new(),
         auto_switch_enabled: false,
@@ -2247,6 +2442,78 @@ fn switch_profile_for_foreground(state: &AppState, foreground: &ForegroundApp) {
     }
     let _ = state.deck_updates.send(config.clone());
     let _ = state.auto_profile_updates.send(target_id);
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+struct InstalledApp {
+    name: String,
+    path: String,
+}
+
+/// Apps found under `roots`: `.app` bundles on macOS, Start Menu `.lnk` shortcuts on Windows. Folders are
+/// searched `depth` levels down; bundles are not entered. Helper shortcuts (uninstallers, readmes, help)
+/// are left out, and when two entries share a name the first one found wins.
+fn scan_apps(roots: &[PathBuf], extension: &str, depth: usize, skip_helpers: bool) -> Vec<InstalledApp> {
+    const HELPER_WORDS: &[&str] = &["uninstall", "readme", "release notes", "documentation", "help", "website", "manual", "license", "changelog"];
+    fn visit(dir: &Path, extension: &str, depth: usize, skip_helpers: bool, found: &mut Vec<InstalledApp>) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let matches = path.extension().and_then(|value| value.to_str()).is_some_and(|value| value.eq_ignore_ascii_case(extension));
+            if matches {
+                let name = path.file_stem().and_then(|value| value.to_str()).unwrap_or_default().trim().to_owned();
+                let lower = name.to_lowercase();
+                if name.is_empty() || (skip_helpers && HELPER_WORDS.iter().any(|word| lower.contains(word))) {
+                    continue;
+                }
+                if let Some(text) = path.to_str().filter(|text| text.len() <= 512 && !text.chars().any(char::is_control)) {
+                    found.push(InstalledApp { name, path: text.to_owned() });
+                }
+            } else if depth > 0 && path.is_dir() && !path.is_symlink() {
+                visit(&path, extension, depth - 1, skip_helpers, found);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    for root in roots {
+        visit(root, extension, depth, skip_helpers, &mut found);
+    }
+    let mut seen = std::collections::HashSet::new();
+    found.retain(|app| seen.insert(app.name.to_lowercase()));
+    found.sort_by_key(|app| app.name.to_lowercase());
+    found.truncate(2000);
+    found
+}
+
+#[tauri::command]
+async fn list_installed_apps() -> Result<Vec<InstalledApp>, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        #[cfg(target_os = "macos")]
+        {
+            let mut roots = vec![PathBuf::from("/Applications"), PathBuf::from("/System/Applications")];
+            if let Some(home) = std::env::var_os("HOME") {
+                roots.push(PathBuf::from(home).join("Applications"));
+            }
+            scan_apps(&roots, "app", 2, false)
+        }
+        #[cfg(windows)]
+        {
+            let roots: Vec<PathBuf> = ["ProgramData", "APPDATA"]
+                .iter()
+                .filter_map(|name| std::env::var_os(name))
+                .map(|base| PathBuf::from(base).join(r"Microsoft\Windows\Start Menu\Programs"))
+                .collect();
+            scan_apps(&roots, "lnk", 4, true)
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            Vec::new()
+        }
+    })
+    .await
+    .map_err(|_| "Could not read the installed apps".to_owned())
 }
 
 #[tauri::command]
@@ -2556,6 +2823,8 @@ async fn upgrade_socket(
 
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let mut authenticated = false;
+    // 1: phones that know buttons and widget areas only. 2: phones that draw widgets on the page grid and open folders.
+    let mut protocol: u32 = 1;
     let mut supports_independent_navigation = false;
     let mut selected_profile_id = String::new();
     let mut selected_page_id = String::new();
@@ -2593,7 +2862,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                             selected_profile_id = config.active_profile_id.clone();
                             selected_page_id = config.profiles.iter().find(|profile| profile.id == selected_profile_id).map(|profile| profile.active_page_id.clone()).unwrap_or_default();
                         }
-                        let message = device_deck_snapshot(&config, state.independent_navigation.load(Ordering::Relaxed), &mut selected_profile_id, &mut selected_page_id);
+                        let message = device_deck_snapshot(protocol, &config, state.independent_navigation.load(Ordering::Relaxed), &mut selected_profile_id, &mut selected_page_id);
                         if socket.send(Message::Text(message.to_string().into())).await.is_err() { break; }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -2602,7 +2871,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                 selected_profile_id = config.active_profile_id.clone();
                                 selected_page_id = config.profiles.iter().find(|profile| profile.id == selected_profile_id).map(|profile| profile.active_page_id.clone()).unwrap_or_default();
                             }
-                            let message = device_deck_snapshot(&config, state.independent_navigation.load(Ordering::Relaxed), &mut selected_profile_id, &mut selected_page_id);
+                            let message = device_deck_snapshot(protocol, &config, state.independent_navigation.load(Ordering::Relaxed), &mut selected_profile_id, &mut selected_page_id);
                             if socket.send(Message::Text(message.to_string().into())).await.is_err() { break; }
                         }
                     }
@@ -2613,7 +2882,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             mode = navigation_updates.recv(), if authenticated => {
                 match mode {
                     Ok(true) if !supports_independent_navigation => {
-                        let _ = socket.send(Message::Text(r#"{"type":"error","message":"update_required","protocolVersion":1}"#.into())).await;
+                        let _ = socket.send(Message::Text(r#"{"type":"error","message":"update_required","protocolVersion":2}"#.into())).await;
                         break;
                     }
                     Ok(enabled) => {
@@ -2622,14 +2891,14 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                 selected_profile_id = config.active_profile_id.clone();
                                 selected_page_id = config.profiles.iter().find(|profile| profile.id == selected_profile_id).map(|profile| profile.active_page_id.clone()).unwrap_or_default();
                             }
-                            let message = device_deck_snapshot(&config, enabled, &mut selected_profile_id, &mut selected_page_id);
+                            let message = device_deck_snapshot(protocol, &config, enabled, &mut selected_profile_id, &mut selected_page_id);
                             if socket.send(Message::Text(message.to_string().into())).await.is_err() { break; }
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         if let Some(config) = get_deck_config(&state) {
                             let enabled = state.independent_navigation.load(Ordering::Relaxed);
-                            let message = device_deck_snapshot(&config, enabled, &mut selected_profile_id, &mut selected_page_id);
+                            let message = device_deck_snapshot(protocol, &config, enabled, &mut selected_profile_id, &mut selected_page_id);
                             if socket.send(Message::Text(message.to_string().into())).await.is_err() { break; }
                         }
                     }
@@ -2642,7 +2911,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     Ok(profile_id) => {
                         selected_profile_id = profile_id;
                         if let Some(config) = get_deck_config(&state) {
-                            let message = device_deck_snapshot(&config, true, &mut selected_profile_id, &mut selected_page_id);
+                            let message = device_deck_snapshot(protocol, &config, true, &mut selected_profile_id, &mut selected_page_id);
                             if socket.send(Message::Text(message.to_string().into())).await.is_err() { break; }
                         }
                     }
@@ -2650,7 +2919,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                         if let Some(config) = get_deck_config(&state) {
                             selected_profile_id = config.active_profile_id.clone();
                             selected_page_id = config.profiles.iter().find(|profile| profile.id == selected_profile_id).map(|profile| profile.active_page_id.clone()).unwrap_or_default();
-                            let message = device_deck_snapshot(&config, true, &mut selected_profile_id, &mut selected_page_id);
+                            let message = device_deck_snapshot(protocol, &config, true, &mut selected_profile_id, &mut selected_page_id);
                             if socket.send(Message::Text(message.to_string().into())).await.is_err() { break; }
                         }
                     }
@@ -2755,10 +3024,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 selected_profile_id: requested_profile_id,
                 selected_page_id: requested_page_id,
             } if !authenticated => {
-                if protocol_version != Some(1) {
+                if !matches!(protocol_version, Some(1 | 2)) {
                     let _ = socket
                         .send(Message::Text(
-                            r#"{"type":"error","message":"update_required","protocolVersion":1}"#
+                            r#"{"type":"error","message":"update_required","protocolVersion":2}"#
                                 .into(),
                         ))
                         .await;
@@ -2781,13 +3050,14 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 if independent && !supports_navigation {
                     let _ = socket
                         .send(Message::Text(
-                            r#"{"type":"error","message":"update_required","protocolVersion":1}"#
+                            r#"{"type":"error","message":"update_required","protocolVersion":2}"#
                                 .into(),
                         ))
                         .await;
                     break;
                 }
                 supports_independent_navigation = supports_navigation;
+                protocol = protocol_version.unwrap_or(1);
                 if let Some(config) = get_deck_config(&state) {
                     selected_profile_id = requested_profile_id
                         .filter(|id| valid_id(id))
@@ -2856,6 +3126,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 }
                 if let Some(config) = get_deck_config(&state) {
                     let message = device_deck_snapshot(
+                        protocol,
                         &config,
                         independent,
                         &mut selected_profile_id,
@@ -2942,6 +3213,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 if stale_revision {
                     if let Some(config) = get_deck_config(&state) {
                         let snapshot = device_deck_snapshot(
+                            protocol,
                             &config,
                             state.independent_navigation.load(Ordering::Relaxed),
                             &mut selected_profile_id,
@@ -2959,6 +3231,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 {
                     if let Some(config) = get_deck_config(&state) {
                         let snapshot = device_deck_snapshot(
+                            protocol,
                             &config,
                             true,
                             &mut selected_profile_id,
@@ -3069,6 +3342,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 if independent && succeeded {
                     if let Some(config) = get_deck_config(&state) {
                         let snapshot = device_deck_snapshot(
+                            protocol,
                             &config,
                             true,
                             &mut selected_profile_id,
@@ -3086,6 +3360,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 if stale_revision {
                     if let Some(config) = get_deck_config(&state) {
                         let snapshot = device_deck_snapshot(
+                            protocol,
                             &config,
                             independent,
                             &mut selected_profile_id,
@@ -3136,6 +3411,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 if independent && succeeded {
                     if let Some(config) = get_deck_config(&state) {
                         let snapshot = device_deck_snapshot(
+                            protocol,
                             &config,
                             true,
                             &mut selected_profile_id,
@@ -3153,6 +3429,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 if stale_revision {
                     if let Some(config) = get_deck_config(&state) {
                         let snapshot = device_deck_snapshot(
+                            protocol,
                             &config,
                             independent,
                             &mut selected_profile_id,
@@ -3394,14 +3671,7 @@ fn invoke_button(
     let button = page
         .buttons
         .iter()
-        .chain(
-            page.widget_area
-                .as_ref()
-                .filter(|area| area.enabled)
-                .into_iter()
-                .flat_map(|area| &area.pages)
-                .flat_map(|widget_page| &widget_page.buttons),
-        )
+        .chain(page.folders.iter().flat_map(|folder| &folder.buttons))
         .find(|button| button.id == button_id)
         .ok_or_else(|| "unknown_button".to_owned())?;
     let changed_selection = matches!(
@@ -3507,6 +3777,8 @@ fn run_deck_action(
                 update_selection(state, revision, None, Some(page_id))
             }
         }
+        // The phone shows the folder itself; the PC has nothing to run.
+        DeckAction::OpenFolder { .. } => Ok(()),
     }
 }
 
@@ -4058,6 +4330,7 @@ pub fn run() {
             get_system_media_state,
             pc_stats_history,
             extract_app_icon,
+            list_installed_apps,
             extract_file_thumbnail,
             pending_legacy_imports,
             request_legacy_deck_import,
@@ -4220,3 +4493,224 @@ mod playback_timing {
         });
     }
 }
+
+#[cfg(test)]
+mod deck_layout_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn button(id: &str, row: u8, column: u8) -> Value {
+        json!({ "id": id, "label": id, "icon": "command", "placement": { "row": row, "column": column, "rowSpan": 1, "columnSpan": 1 }, "action": { "type": "media", "command": "play_pause" } })
+    }
+
+    fn clock(id: &str, row: u8, column: u8) -> Value {
+        json!({ "id": id, "type": "clock", "placement": { "row": row, "column": column, "rowSpan": 1, "columnSpan": 2 } })
+    }
+
+    fn config(pages: Vec<Value>) -> DeckConfig {
+        let first = pages[0]["id"].as_str().unwrap().to_owned();
+        serde_json::from_value(json!({
+            "schemaVersion": 1, "revision": 1, "activeProfileId": "p", "fallbackProfileId": "p",
+            "profiles": [{ "id": "p", "name": "P", "pages": pages, "activePageId": first, "defaultPageId": first }]
+        }))
+        .unwrap()
+    }
+
+    fn page(id: &str, name: &str, buttons: Vec<Value>, area: Option<Value>) -> Value {
+        let mut page = json!({ "id": id, "name": name, "rows": 2, "columns": 3, "buttons": buttons });
+        if let Some(area) = area {
+            page["widgetArea"] = area;
+        }
+        page
+    }
+
+    fn area(enabled: bool, pages: Vec<Value>) -> Value {
+        json!({ "enabled": enabled, "rows": 2, "columns": 4, "pages": pages })
+    }
+
+    fn widget_page(id: &str, buttons: Vec<Value>, widgets: Vec<Value>) -> Value {
+        json!({ "id": id, "name": id, "buttons": buttons, "widgets": widgets })
+    }
+
+    #[test]
+    fn widget_pages_become_pages_after_their_page() {
+        let mut deck = config(vec![
+            page("a", "Alpha", vec![button("b1", 0, 0)], Some(area(true, vec![
+                widget_page("w1", vec![], vec![clock("c1", 0, 0)]),
+                widget_page("w2", vec![button("b2", 0, 0)], vec![]),
+                widget_page("w3", vec![], vec![]),
+            ]))),
+            page("z", "Zulu", vec![], None),
+        ]);
+        normalize_deck_layout(&mut deck);
+        validate_deck_config(&deck).unwrap();
+        let names: Vec<_> = deck.profiles[0].pages.iter().map(|page| page.name.as_str()).collect();
+        assert_eq!(names, ["Alpha", "Alpha widgets", "Alpha widgets 2", "Zulu"]);
+        let converted = &deck.profiles[0].pages[1];
+        assert_eq!((converted.rows, converted.columns, converted.widgets.len()), (2, 4, 1));
+        assert!(deck.profiles[0].pages.iter().all(|page| page.widget_area.is_none()));
+        assert_eq!(deck.migration_notes.len(), 1);
+        // Idempotent: a second pass changes nothing.
+        let before = serde_json::to_value(&deck).unwrap();
+        normalize_deck_layout(&mut deck);
+        assert_eq!(before, serde_json::to_value(&deck).unwrap());
+    }
+
+    #[test]
+    fn widget_only_page_keeps_its_first_widget_page() {
+        let mut deck = config(vec![{
+            let mut only = page("a", "Alpha", vec![], Some(area(false, vec![widget_page("w1", vec![], vec![clock("c1", 0, 0)])])));
+            only["rows"] = json!(0);
+            only["columns"] = json!(0);
+            only
+        }]);
+        normalize_deck_layout(&mut deck);
+        validate_deck_config(&deck).unwrap();
+        let only = &deck.profiles[0].pages[0];
+        assert_eq!((deck.profiles[0].pages.len(), only.rows, only.columns, only.widgets.len()), (1, 2, 4, 1));
+        assert!(deck.migration_notes.is_empty());
+    }
+
+    #[test]
+    fn hidden_widget_area_is_noted_and_long_names_fit() {
+        let name = "A very long page name here";
+        let mut deck = config(vec![page("a", &name[..24], vec![button("b1", 0, 0)], Some(area(false, vec![widget_page("w1", vec![], vec![clock("c1", 0, 0)])])))]);
+        normalize_deck_layout(&mut deck);
+        validate_deck_config(&deck).unwrap();
+        assert!(deck.profiles[0].pages[1].name.len() <= 24);
+        assert!(deck.migration_notes[0].contains("hidden"));
+    }
+
+    #[test]
+    fn conversion_stops_at_the_page_limit() {
+        let pages = (0..MAX_PAGES - 1)
+            .map(|index| page(&format!("p{index}"), &format!("P{index}"), vec![], None))
+            .chain(std::iter::once(page("last", "Last", vec![button("b", 0, 0)], Some(area(true, vec![
+                widget_page("w1", vec![], vec![clock("c1", 0, 0)]),
+                widget_page("w2", vec![], vec![clock("c2", 0, 0)]),
+            ])))))
+            .collect();
+        let mut deck = config(pages);
+        normalize_deck_layout(&mut deck);
+        validate_deck_config(&deck).unwrap();
+        assert_eq!(deck.profiles[0].pages.len(), MAX_PAGES);
+        assert!(deck.migration_notes[0].contains("could not be kept"));
+    }
+
+    fn folder_button(id: &str, folder: &str, row: u8, column: u8) -> Value {
+        let mut value = button(id, row, column);
+        value["action"] = json!({ "type": "open_folder", "folderId": folder });
+        value
+    }
+
+    fn with_folder(buttons: Vec<Value>, folders: Vec<Value>) -> DeckConfig {
+        let mut value = page("a", "Alpha", buttons, None);
+        value["folders"] = json!(folders);
+        config(vec![value])
+    }
+
+    fn folder(id: &str, buttons: Vec<Value>) -> Value {
+        json!({ "id": id, "name": id, "rows": 2, "columns": 2, "buttons": buttons, "widgets": [] })
+    }
+
+    #[test]
+    fn folders_validate_and_clean_up() {
+        let mut deck = with_folder(vec![folder_button("fb", "f1", 0, 0)], vec![folder("f1", vec![button("inner", 0, 0)])]);
+        normalize_deck_layout(&mut deck);
+        validate_deck_config(&deck).unwrap();
+
+        // A folder button for a missing folder and a folder without a button are both dropped.
+        let mut deck = with_folder(vec![folder_button("fb", "gone", 0, 0), button("b", 0, 1)], vec![folder("orphan", vec![])]);
+        normalize_deck_layout(&mut deck);
+        validate_deck_config(&deck).unwrap();
+        assert_eq!((deck.profiles[0].pages[0].buttons.len(), deck.profiles[0].pages[0].folders.len()), (1, 0));
+
+        // Two buttons for one folder: the second goes.
+        let mut deck = with_folder(vec![folder_button("fb", "f1", 0, 0), folder_button("fb2", "f1", 0, 1)], vec![folder("f1", vec![])]);
+        normalize_deck_layout(&mut deck);
+        validate_deck_config(&deck).unwrap();
+        assert_eq!(deck.profiles[0].pages[0].buttons.len(), 1);
+
+        // A folder button inside a folder is removed.
+        let mut deck = with_folder(vec![folder_button("fb", "f1", 0, 0)], vec![folder("f1", vec![folder_button("deep", "f1", 0, 0)])]);
+        normalize_deck_layout(&mut deck);
+        validate_deck_config(&deck).unwrap();
+        assert!(deck.profiles[0].pages[0].folders[0].buttons.is_empty());
+    }
+
+    #[test]
+    fn invalid_folders_are_rejected() {
+        // Reusing an id across the page and a folder.
+        let deck = with_folder(vec![folder_button("fb", "f1", 0, 0)], vec![folder("f1", vec![button("fb", 0, 0)])]);
+        assert!(validate_deck_config(&deck).is_err());
+        // A folder button that was never normalized and points nowhere.
+        let deck = with_folder(vec![folder_button("fb", "gone", 0, 0)], vec![]);
+        assert!(validate_deck_config(&deck).is_err());
+        // An overlapping item in a folder.
+        let deck = with_folder(vec![folder_button("fb", "f1", 0, 0)], vec![folder("f1", vec![button("x", 0, 0), button("y", 0, 0)])]);
+        assert!(validate_deck_config(&deck).is_err());
+        // Widgets and buttons overlapping on a page.
+        let mut value = page("a", "Alpha", vec![button("b", 0, 0)], None);
+        value["widgets"] = json!([clock("c", 0, 0)]);
+        assert!(validate_deck_config(&config(vec![value])).is_err());
+    }
+
+    #[test]
+    fn older_phones_get_widgets_in_an_area_and_no_folders() {
+        let mut value = page("a", "Alpha", vec![folder_button("fb", "f1", 0, 0), button("b", 0, 1)], None);
+        value["folders"] = json!([folder("f1", vec![button("inner", 0, 0)])]);
+        value["widgets"] = json!([clock("c", 1, 0)]);
+        let mut widgets_only = page("b", "Beta", vec![], None);
+        widgets_only["widgets"] = json!([clock("c2", 0, 0)]);
+        let mut deck = config(vec![value, widgets_only]);
+        normalize_deck_layout(&mut deck);
+        validate_deck_config(&deck).unwrap();
+
+        let old = config_for_protocol(&deck, 1);
+        let pages = old["profiles"][0]["pages"].as_array().unwrap();
+        assert_eq!(pages[0]["buttons"].as_array().unwrap().len(), 1);
+        assert!(pages[0].get("folders").is_none() && pages[0].get("widgets").is_none());
+        assert_eq!(pages[0]["widgetArea"]["pages"][0]["widgets"].as_array().unwrap().len(), 1);
+        assert_eq!((pages[1]["rows"].clone(), pages[1]["columns"].clone()), (json!(0), json!(0)));
+        assert!(old.get("migrationNotes").is_none());
+
+        let new = config_for_protocol(&deck, 2);
+        assert!(new["profiles"][0]["pages"][0]["folders"].is_array());
+    }
+
+    #[test]
+    fn older_phones_keep_a_valid_selection_when_pages_are_cut() {
+        let pages = (0..10).map(|index| page(&format!("p{index}"), &format!("P{index}"), vec![], None)).collect();
+        let mut deck = config(pages);
+        deck.profiles[0].active_page_id = "p9".into();
+        deck.profiles[0].default_page_id = "p9".into();
+        let old = config_for_protocol(&deck, 1);
+        assert_eq!(old["profiles"][0]["pages"].as_array().unwrap().len(), 8);
+        assert_eq!(old["profiles"][0]["activePageId"], "p0");
+        assert_eq!(old["profiles"][0]["defaultPageId"], "p0");
+    }
+}
+
+#[cfg(test)]
+mod installed_apps_tests {
+    use super::*;
+
+    #[test]
+    fn scans_bundles_and_skips_helpers() {
+        let root = std::env::temp_dir().join(format!("freeze-apps-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for path in ["Alpha.app/Contents", "Utilities/Beta.app/Contents", "Deep/One/Two/Three/Gamma.app", "alpha.app", "Folder/Readme.app", "Uninstall Alpha.app"] {
+            fs::create_dir_all(root.join(path)).unwrap();
+        }
+        let names = |helpers: bool, depth: usize| scan_apps(&[root.clone()], "app", depth, helpers).into_iter().map(|app| app.name).collect::<Vec<_>>();
+        // Bundles are found in folders, not entered, and the same name is listed once.
+        assert_eq!(names(false, 2), ["Alpha", "Beta", "Readme", "Uninstall Alpha"]);
+        // Helper shortcuts are dropped on request, and depth limits how far folders are searched.
+        assert_eq!(names(true, 2), ["Alpha", "Beta"]);
+        assert_eq!(names(true, 4), ["Alpha", "Beta", "Gamma"]);
+        // A missing root is just empty.
+        assert!(scan_apps(&[root.join("missing")], "app", 2, false).is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+

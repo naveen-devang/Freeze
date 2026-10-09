@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Check, X } from 'lucide-react';
 import { ColorField } from '../clock-faces/ClockSettings';
+import { PanelSection } from '../SettingsPanel';
+import { DeckSelect } from '../DeckSelect';
 import { DEFAULT_CLOCK_COLOR } from '../clock-faces';
 import { PcStatsPreview } from './PcStatsPreview';
 import { FreezeStats, PC_STATS_SIZES, pcStatsStyle, usePcStatsSample, type PcGpu, type PcStatsSample, type PcStatsSize } from '.';
@@ -20,31 +22,28 @@ export function PcStatsSettings({ style, metric, color, gpu, block, columns, row
   const sample = usePcStatsSample(['cputemp', 'gpu']);
   const gpus = sample?.gpus ?? [];
   const usesGpu = shown.dashboard || !!FreezeStats.metrics.find((item) => item.id === (metric ?? 'cpu'))?.gpu;
-  return <div className="clock-settings">
-    <div className="clock-settings-preview"><PcStatsPreview style={info.id} metric={metric} color={current} gpu={gpu} width={block.width} height={block.height} columns={columns} rows={rows} /></div>
-    <div className="clock-settings-row">
-      <div><span className="clock-settings-label">Style</span><strong>{info.name}</strong><small>{shown.id === info.id ? PC_STATS_SIZES.find(([id]) => id === info.size)?.[1] : `Needs ${info.span.join(' × ')}; showing ${shown.name} until it’s bigger`}</small></div>
-      <button type="button" className="secondary-button" onClick={() => setBrowsing(true)} disabled={busy}>Change style…</button>
-    </div>
-    {shown.dashboard ? <p className="clock-settings-note">Dashboards show CPU, GPU, memory and temperatures together. On a PC with two GPUs, Overview shows both.</p> : <label className="clock-settings-color">
-      <span className="clock-settings-label">Reading</span>
-      <select value={metric ?? 'cpu'} disabled={busy} onChange={(event) => onChange({ metric: event.target.value })}>
-        {FreezeStats.metrics.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-      </select>
-    </label>}
-    {usesGpu && (gpus.length > 1 || (gpu && !gpus.some((item) => item.id === gpu))) ? <label className="clock-settings-color">
-      <span className="clock-settings-label">GPU</span>
-      <select value={gpu ?? 'auto'} disabled={busy} onChange={(event) => onChange({ gpu: event.target.value === 'auto' ? undefined : event.target.value })}>
-        <option value="auto">Automatic: the discrete GPU while it’s in use</option>
-        {gpus.map((item) => <option key={item.id} value={item.id}>{gpuLabel(item)}</option>)}
-        {gpu && !gpus.some((item) => item.id === gpu) ? <option value={gpu}>A GPU that isn’t in this PC now</option> : null}
-      </select>
-    </label> : null}
-    <ColorField color={current} busy={busy} onPick={(value) => onChange({ color: value })} />
-    <p className="clock-settings-note">Temperatures turn amber at 70 °C and red at 85 °C. “≈” marks an estimate.</p>
+  return <>
+    <div className="panel-preview"><PcStatsPreview style={info.id} metric={metric} color={current} gpu={gpu} width={block.width} height={block.height} columns={columns} rows={rows} /></div>
+    <PanelSection title="Appearance">
+      <div className="panel-tile">
+        <div><strong>{info.name}</strong><small>{shown.id === info.id ? PC_STATS_SIZES.find(([id]) => id === info.size)?.[1] : `Needs ${info.span.join(' × ')}. Showing ${shown.name} for now.`}</small></div>
+        <button type="button" className="secondary-button" onClick={() => setBrowsing(true)} disabled={busy}>Change</button>
+      </div>
+      <ColorField color={current} busy={busy} onPick={(value) => onChange({ color: value })} />
+    </PanelSection>
+    <PanelSection title="Data">
+      {shown.dashboard ? <p className="panel-note">Dashboards show CPU, GPU, memory and temperatures together. On a PC with two GPUs, Overview shows both.</p> : <div className="panel-field"><span className="clock-settings-label">Reading</span>
+        <DeckSelect value={metric ?? 'cpu'} disabled={busy} options={FreezeStats.metrics.map((item) => ({ value: item.id, label: item.name }))} onChange={(value) => onChange({ metric: value })} />
+      </div>}
+      {usesGpu && (gpus.length > 1 || (gpu && !gpus.some((item) => item.id === gpu))) ? <div className="panel-field"><span className="clock-settings-label">GPU</span>
+        <DeckSelect value={gpu ?? 'auto'} disabled={busy} options={[{ value: 'auto', label: 'Automatic' }, ...gpus.map((item) => ({ value: item.id, label: gpuLabel(item) })), ...(gpu && !gpus.some((item) => item.id === gpu) ? [{ value: gpu, label: 'A GPU that isn’t in this PC now' }] : [])]} onChange={(value) => onChange({ gpu: value === 'auto' ? undefined : value })} />
+        {gpu === undefined ? <small className="panel-note">Uses the discrete GPU while it’s in use.</small> : null}
+      </div> : null}
+      <p className="panel-note">Temperatures turn amber at 70 °C and red at 85 °C. “≈” marks an estimate.</p>
+    </PanelSection>
     <SensorSources sample={sample} />
     {browsing ? <PcStatsBrowser selected={info.id} metric={metric} color={current} gpu={gpu} block={block} columns={columns} rows={rows} onClose={() => setBrowsing(false)} onChoose={(id) => { onChange({ face: id }); setBrowsing(false); }} /> : null}
-  </div>;
+  </>;
 }
 
 const VENDORS: Record<PcGpu['vendor'], string> = { nvidia: 'NVIDIA', amd: 'AMD', intel: 'Intel', apple: 'Apple', other: 'GPU' };

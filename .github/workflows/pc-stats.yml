@@ -57,3 +57,7 @@ jobs:
       - run: node scripts/check-clock-faces.ts
       - run: node scripts/check-web-fonts.ts
       - run: node scripts/check-web-widgets.ts
+      - run: node scripts/check-deck-surface.ts
+      - run: node scripts/check-deck-icons.ts
+      - run: node scripts/check-deck-grid.ts
+      - run: node scripts/check-deck-move.ts

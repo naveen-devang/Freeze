@@ -1,10 +1,12 @@
-import type { DeckButton, DeckPage, DeckPlacement, DeckWidget, DeckWidgetArea, DeckWidgetPage } from './connection';
+import type { DeckButton, DeckPlacement, DeckWidget } from './connection';
 
 type PlacedItem = { id: string; placement?: DeckPlacement };
 
-export function buttonPlacement(page: DeckPage, button: DeckButton, index = page.buttons.findIndex((item) => item.id === button.id)): DeckPlacement {
+// Anything drawn on a grid: a page, or a folder opened from it.
+export type DeckSurface = { rows: number; columns: number; buttons: DeckButton[]; widgets: DeckWidget[] };
+
+export function buttonPlacement(columns: number, button: DeckButton, index: number): DeckPlacement {
   if (button.placement) return button.placement;
-  const columns = page.columns ?? 3;
   return { row: Math.floor(index / columns), column: index % columns, rowSpan: 1, columnSpan: 1 };
 }
 
@@ -27,45 +29,22 @@ function validLayout(rows: number, columns: number, items: PlacedItem[], allowRo
   return true;
 }
 
-export function validDeckPageLayout(page: DeckPage): boolean {
-  if (page.rows === 0 && page.columns === 0) return page.buttons.length === 0;
-  const columns = page.columns ?? 3;
-  const rows = page.rows ?? Math.max(1, Math.ceil(page.buttons.length / columns));
-  return validLayout(rows, columns, page.buttons, true);
+export function validSurfaceLayout(surface: DeckSurface): boolean {
+  const items = [...surface.buttons, ...surface.widgets] as PlacedItem[];
+  return validLayout(surface.rows, surface.columns, items, true);
 }
 
-export function validDeckWidgetAreaLayout(area: DeckWidgetArea): boolean {
-  return area.pages.every((page) => validLayout(area.rows, area.columns, [...page.buttons, ...page.widgets], true));
-}
+export type SurfaceItem = { type: 'button'; button: DeckButton } | { type: 'widget'; widget: DeckWidget };
 
-export function deckOccupancy(page: DeckPage): Map<number, DeckButton> {
-  const occupied = new Map<number, DeckButton>();
-  page.buttons.forEach((button, index) => {
-    const placement = buttonPlacement(page, button, index);
-    const columns = page.columns ?? 3;
+// Which item covers each cell (row * columns + column) of the grid.
+export function surfaceOccupancy(surface: DeckSurface): Map<number, SurfaceItem> {
+  const occupied = new Map<number, SurfaceItem>();
+  const cover = (placement: DeckPlacement, item: SurfaceItem) => {
     for (let row = placement.row; row < placement.row + placement.rowSpan; row++) {
-      for (let column = placement.column; column < placement.column + placement.columnSpan; column++) occupied.set(row * columns + column, button);
+      for (let column = placement.column; column < placement.column + placement.columnSpan; column++) occupied.set(row * surface.columns + column, item);
     }
-  });
-  return occupied;
-}
-
-export type WidgetScreenItem = { type: 'button'; button: DeckButton } | { type: 'widget'; widget: DeckWidget };
-
-export function widgetPageOccupancy(area: DeckWidgetArea, page: DeckWidgetPage): Map<number, WidgetScreenItem> {
-  const occupied = new Map<number, WidgetScreenItem>();
-  const deckPage: DeckPage = { id: page.id, name: page.name, rows: area.rows, columns: area.columns, buttons: page.buttons };
-  page.buttons.forEach((button, index) => {
-    const placement = buttonPlacement(deckPage, button, index);
-    for (let row = placement.row; row < placement.row + placement.rowSpan; row++) {
-      for (let column = placement.column; column < placement.column + placement.columnSpan; column++) occupied.set(row * area.columns + column, { type: 'button', button });
-    }
-  });
-  for (const widget of page.widgets) {
-    const { placement } = widget;
-    for (let row = placement.row; row < placement.row + placement.rowSpan; row++) {
-      for (let column = placement.column; column < placement.column + placement.columnSpan; column++) occupied.set(row * area.columns + column, { type: 'widget', widget });
-    }
-  }
+  };
+  surface.buttons.forEach((button, index) => cover(buttonPlacement(surface.columns, button, index), { type: 'button', button }));
+  surface.widgets.forEach((widget) => cover(widget.placement, { type: 'widget', widget }));
   return occupied;
 }

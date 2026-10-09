@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Check, Search, X } from 'lucide-react';
 import { ClockFacePreview } from './ClockFacePreview';
+import { PanelSection } from '../SettingsPanel';
 import { CLOCK_CATEGORIES, CLOCK_COLOR_PRESETS, ClockCategory, clockFace, DEFAULT_CLOCK_COLOR, FreezeClock } from '.';
 
 const RECENT_KEY = 'freeze.recent-clock-colors';
@@ -21,15 +22,17 @@ export function ClockWidgetSettings({ face, color, block, busy, onChange }: { fa
   const info = clockFace(face);
   const current = color ?? DEFAULT_CLOCK_COLOR;
   const [browsing, setBrowsing] = useState(false);
-  return <div className="clock-settings">
-    <div className="clock-settings-preview"><ClockFacePreview face={info.id} color={current} width={block.width} height={block.height} /></div>
-    <div className="clock-settings-row">
-      <div><span className="clock-settings-label">Face</span><strong>{info.name}</strong><small>{CLOCK_CATEGORIES.find(([id]) => id === info.category)?.[1]}</small></div>
-      <button type="button" className="secondary-button" onClick={() => setBrowsing(true)} disabled={busy}>Change face…</button>
-    </div>
-    {info.color ? <ColorField color={current} busy={busy} onPick={(value) => onChange({ color: value })} /> : <p className="clock-settings-note">This face uses its own fixed colors.</p>}
+  return <>
+    <div className="panel-preview"><ClockFacePreview face={info.id} color={current} width={block.width} height={block.height} /></div>
+    <PanelSection title="Appearance">
+      <div className="panel-tile">
+        <div><strong>{info.name}</strong><small>{CLOCK_CATEGORIES.find(([id]) => id === info.category)?.[1]}</small></div>
+        <button type="button" className="secondary-button" onClick={() => setBrowsing(true)} disabled={busy}>Change</button>
+      </div>
+      {info.color ? <ColorField color={current} busy={busy} onPick={(value) => onChange({ color: value })} /> : <p className="panel-note">This face uses its own fixed colors.</p>}
+    </PanelSection>
     {browsing ? <ClockFaceBrowser selected={info.id} color={current} block={block} onClose={() => setBrowsing(false)} onChoose={(id) => { onChange({ face: id }); setBrowsing(false); }} /> : null}
-  </div>;
+  </>;
 }
 
 // Preset swatches, a custom picker with hex entry, and recently used custom colours. Shared with the PC stats widget.

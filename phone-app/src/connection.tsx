@@ -1,7 +1,7 @@
 import * as SecureStore from 'expo-secure-store';
 import Storage from 'expo-sqlite/kv-store';
 import { loadDeckPages } from './deck';
-import { validDeckPageLayout, validDeckWidgetAreaLayout } from './deck-layout';
+import { validSurfaceLayout } from './deck-layout';
 import { createContext, PropsWithChildren, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { AppState } from 'react-native';
 import type { WidgetSurface } from './now-playing-layout';
@@ -11,13 +11,12 @@ import { countMessage } from './perf-overlay';
 export type PcConnection = { host: string; port: number; token: string; deviceName?: string; transport?: 'wifi' | 'usb' };
 export type DeckMediaCommand = 'play_pause' | 'next_track' | 'previous_track' | 'volume_up' | 'volume_down' | 'mute';
 export type DeckStep = { type: 'media'; command: DeckMediaCommand } | { type: 'hotkey'; keys: string[] } | { type: 'launch_app'; app: string } | { type: 'launch_file'; path: string } | { type: 'launch_folder'; path: string };
-export type DeckAction = DeckStep | { type: 'run_script'; path: string; allowOnPc: boolean } | { type: 'plugin_action'; pluginId: string; actionId: string; allowOnPc: boolean; inputs?: Record<string, string> } | { type: 'sequence'; steps: DeckStep[] } | { type: 'select_profile'; profileId: string } | { type: 'select_page'; pageId: string };
+export type DeckAction = DeckStep | { type: 'run_script'; path: string; allowOnPc: boolean } | { type: 'plugin_action'; pluginId: string; actionId: string; allowOnPc: boolean; inputs?: Record<string, string> } | { type: 'sequence'; steps: DeckStep[] } | { type: 'select_profile'; profileId: string } | { type: 'select_page'; pageId: string } | { type: 'open_folder'; folderId: string };
 export type DeckPlacement = { row: number; column: number; rowSpan: number; columnSpan: number };
 export type DeckButton = { id: string; label: string; icon: string; placement?: DeckPlacement; iconSvg?: string; appIconData?: string; action: DeckAction };
 export type DeckWidget = { id: string; type: 'clock'; placement: DeckPlacement; face?: string; color?: string } | { id: string; type: 'now_playing'; placement: DeckPlacement } | { id: string; type: 'lyrics'; placement: DeckPlacement } | { id: string; type: 'pc_stats'; placement: DeckPlacement; face?: string; metric?: string; color?: string; gpu?: string } | { id: string; type: 'plugin'; pluginId: string; widgetId: string; renderType: string; values: Record<string, string>; placement: DeckPlacement };
-export type DeckWidgetPage = { id: string; name: string; buttons: DeckButton[]; widgets: DeckWidget[] };
-export type DeckWidgetArea = { enabled: boolean; rows: number; columns: number; pages: DeckWidgetPage[] };
-export type DeckPage = { id: string; name: string; rows?: number; columns?: number; buttons: DeckButton[]; widgetArea?: DeckWidgetArea };
+export type DeckFolder = { id: string; name: string; rows: number; columns: number; buttons: DeckButton[]; widgets: DeckWidget[] };
+export type DeckPage = { id: string; name: string; rows: number; columns: number; buttons: DeckButton[]; widgets: DeckWidget[]; folders: DeckFolder[] };
 export type DeckProfile = { id: string; name: string; pages: DeckPage[]; activePageId: string };
 export type DeckConfig = { schemaVersion: number; revision: number; profiles: DeckProfile[]; activeProfileId: string };
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
@@ -132,33 +131,28 @@ function validDeckWidget(value: unknown): value is DeckWidget {
     entries.reduce((total, [, text]) => total + utf8ByteLength(text), 0) <= 8192;
 }
 
-function validWidgetArea(value: unknown): value is DeckWidgetArea {
-  if (!value || typeof value !== 'object') return false;
-  const area = value as Partial<DeckWidgetArea>;
-  return typeof area.enabled === 'boolean' && Number.isInteger(area.rows) && Number.isInteger(area.columns) &&
-    (area.rows ?? 0) >= 1 && (area.rows ?? 0) <= 6 && (area.columns ?? 0) >= 1 && (area.columns ?? 0) <= 6 &&
-    Array.isArray(area.pages) && area.pages.length > 0 && area.pages.length <= 9 &&
-    area.pages.every((page) => page && typeof page.id === 'string' && typeof page.name === 'string' && Array.isArray(page.buttons) && Array.isArray(page.widgets) &&
-      page.buttons.length + page.widgets.length <= (area.rows ?? 0) * (area.columns ?? 0) && page.buttons.every(validDeckButton) && page.widgets.every(validDeckWidget)) &&
-    validDeckWidgetAreaLayout(area as DeckWidgetArea);
+function validSurface(value: { rows?: unknown; columns?: unknown; buttons?: unknown; widgets?: unknown }, allowFolderButtons: boolean): boolean {
+  const { rows, columns, buttons, widgets } = value;
+  return Number.isInteger(rows) && Number.isInteger(columns) && (rows as number) >= 1 && (rows as number) <= 6 && (columns as number) >= 1 && (columns as number) <= 6 &&
+    Array.isArray(buttons) && Array.isArray(widgets) && buttons.length + widgets.length <= (rows as number) * (columns as number) &&
+    buttons.every((button) => validDeckButton(button) && (allowFolderButtons || button.action.type !== 'open_folder')) && widgets.every(validDeckWidget) &&
+    validSurfaceLayout(value as Parameters<typeof validSurfaceLayout>[0]);
 }
 
 function validDeckPage(value: unknown): value is DeckPage {
   if (!value || typeof value !== 'object') return false;
   const page = value as Partial<DeckPage>;
-  return typeof page.id === 'string' && typeof page.name === 'string' &&
-    (page.rows === undefined || (Number.isInteger(page.rows) && page.rows >= 0 && page.rows <= 6)) &&
-    (page.columns === undefined || (Number.isInteger(page.columns) && page.columns >= 0 && page.columns <= 6)) &&
-    Array.isArray(page.buttons) && page.buttons.length <= 36 && page.buttons.every(validDeckButton) &&
-    (page.widgetArea === undefined || validWidgetArea(page.widgetArea)) &&
-    validDeckPageLayout(page as DeckPage);
+  return typeof page.id === 'string' && typeof page.name === 'string' && validSurface({ ...page }, true) &&
+    Array.isArray(page.folders) && page.folders.length <= 12 &&
+    page.folders.every((folder) => folder && typeof folder.id === 'string' && typeof folder.name === 'string' && validSurface({ ...folder }, false)) &&
+    (page.buttons ?? []).every((button) => button.action.type !== 'open_folder' || (page.folders ?? []).some((folder) => folder.id === (button.action as { folderId?: string }).folderId));
 }
 
 function validDeckConfig(value: unknown): value is DeckConfig {
   if (!value || typeof value !== 'object') return false;
   const config = value as Partial<DeckConfig>;
   return config.schemaVersion === 1 && Number.isSafeInteger(config.revision) && Array.isArray(config.profiles) && config.profiles.length > 0 && config.profiles.length <= 32 &&
-    config.profiles.every((profile) => profile && typeof profile.id === 'string' && typeof profile.name === 'string' && Array.isArray(profile.pages) && profile.pages.length > 0 && profile.pages.length <= 8 &&
+    config.profiles.every((profile) => profile && typeof profile.id === 'string' && typeof profile.name === 'string' && Array.isArray(profile.pages) && profile.pages.length > 0 && profile.pages.length <= 32 &&
       profile.pages.every(validDeckPage));
 }
 
@@ -309,10 +303,10 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
             const parsed = savedSelection ? JSON.parse(savedSelection) as Partial<{ profileId: string; pageId: string }> : null;
             if (typeof parsed?.profileId === 'string' && typeof parsed.pageId === 'string') selection = { profileId: parsed.profileId, pageId: parsed.pageId };
           } catch { void Storage.removeItem(`${DEVICE_SELECTION_KEY}.${connectionId(next)}`); }
-          if (socketRef.current === socket) socket.send(JSON.stringify({ type: 'authenticate', token: next.token, protocolVersion: 1, legacyDeckAvailable: Boolean(legacyDeck), supportsIndependentNavigation: true, ...(selection ? { selectedProfileId: selection.profileId, selectedPageId: selection.pageId } : {}), ...(legacyDeck ? { legacySourceId: legacyDeck.sourceId } : {}) }));
+          if (socketRef.current === socket) socket.send(JSON.stringify({ type: 'authenticate', token: next.token, protocolVersion: 2, legacyDeckAvailable: Boolean(legacyDeck), supportsIndependentNavigation: true, ...(selection ? { selectedProfileId: selection.profileId, selectedPageId: selection.pageId } : {}), ...(legacyDeck ? { legacySourceId: legacyDeck.sourceId } : {}) }));
           else socket.close();
         }).catch(() => {
-          if (socketRef.current === socket) socket.send(JSON.stringify({ type: 'authenticate', token: next.token, protocolVersion: 1, supportsIndependentNavigation: true }));
+          if (socketRef.current === socket) socket.send(JSON.stringify({ type: 'authenticate', token: next.token, protocolVersion: 2, supportsIndependentNavigation: true }));
         });
       };
       socket.onmessage = async (event) => {
@@ -387,7 +381,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
           if (message.type === 'deck_snapshot') {
             const snapshot = JSON.parse(event.data) as { protocolVersion?: number; config?: unknown; independentNavigation?: boolean; selection?: { profileId?: string; pageId?: string } };
             const config = snapshot.config;
-            if (snapshot.protocolVersion === 1 && validDeckConfig(config)) {
+            if (snapshot.protocolVersion === 2 && validDeckConfig(config)) {
               setDeckConfig(config);
               const selectedProfile = config.profiles.find((profile) => profile.id === snapshot.selection?.profileId) ?? config.profiles.find((profile) => profile.id === config.activeProfileId);
               const selectedPage = selectedProfile?.pages.find((page) => page.id === snapshot.selection?.pageId) ?? selectedProfile?.pages.find((page) => page.id === selectedProfile.activePageId);
