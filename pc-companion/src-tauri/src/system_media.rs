@@ -11,6 +11,8 @@ const MAX_ARTWORK_BYTES: u64 = 2 * 1024 * 1024;
 #[serde(rename_all = "camelCase")]
 pub(super) struct SystemMediaState {
     pub(super) source_app_id: Option<String>,
+    /// A readable name for the app, such as "Spotify".
+    pub(super) source_name: Option<String>,
     pub(super) title: Option<String>,
     pub(super) artist: Option<String>,
     pub(super) album: Option<String>,
@@ -29,6 +31,7 @@ impl SystemMediaState {
     pub(super) fn unavailable() -> Self {
         Self {
             source_app_id: None,
+            source_name: None,
             title: None,
             artist: None,
             album: None,
@@ -134,6 +137,13 @@ pub(super) fn spawn_system_media_monitor(
                 &mut last_artwork_attempt,
             )
             .await;
+            // Where the system reports one app only (macOS), that app is the only player; Windows lists
+            // every player itself while reading.
+            #[cfg(not(windows))]
+            crate::media_players::resolve_and_publish(
+                crate::media_players::single_player(snapshot.source_app_id.as_deref(), snapshot.playback_state, snapshot.title.as_deref(), snapshot.artist.as_deref()),
+                snapshot.source_app_id.as_deref(),
+            );
             let updated = updates.send_if_modified(|current| {
                 if *current == snapshot {
                     false
@@ -178,6 +188,123 @@ pub(super) fn spawn_system_media_monitor(
 }
 
 #[cfg(windows)]
+mod windows_players {
+    use windows::Media::Control::{
+        GlobalSystemMediaTransportControlsSession as Session,
+        GlobalSystemMediaTransportControlsSessionManager as Manager,
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status,
+    };
+
+    use super::bounded_text;
+    use crate::media_players::{self, PlayerInfo, Preference};
+    use crate::{MediaCommand, PlaybackState};
+
+    pub(super) fn state_of(session: &Session) -> PlaybackState {
+        session
+            .GetPlaybackInfo()
+            .and_then(|info| info.PlaybackStatus())
+            .map(|status| match status {
+                Status::Playing => PlaybackState::Playing,
+                Status::Paused | Status::Opened | Status::Changing => PlaybackState::Paused,
+                Status::Closed | Status::Stopped => PlaybackState::Stopped,
+                _ => PlaybackState::Unavailable,
+            })
+            .unwrap_or(PlaybackState::Unavailable)
+    }
+
+    fn read_text(session: &Session) -> (Option<String>, Option<String>) {
+        let Some(properties) = session.TryGetMediaPropertiesAsync().ok().and_then(|operation| operation.join().ok()) else {
+            return (None, None);
+        };
+        (
+            properties.Title().ok().and_then(|value| bounded_text(value.to_string(), 120)),
+            properties.Artist().ok().and_then(|value| bounded_text(value.to_string(), 120)),
+        )
+    }
+
+    pub(super) struct Selection {
+        /// The session the controls and the playback state follow.
+        pub(super) session: Option<Session>,
+        /// The app Windows itself calls current.
+        pub(super) windows_current: Option<String>,
+    }
+
+    /// Lists every media app, resolves which one to follow, and picks its session. The full read (`with_text`)
+    /// also reads titles and publishes the list for the phones; the quick one only needs the playback state.
+    pub(super) fn select(manager: &Manager, with_text: bool) -> Selection {
+        let current = manager.GetCurrentSession().ok();
+        let windows_current = current
+            .as_ref()
+            .and_then(|session| session.SourceAppUserModelId().ok())
+            .and_then(|id| bounded_text(id.to_string(), 256));
+        let mut pairs: Vec<(Session, PlayerInfo)> = Vec::new();
+        if let Ok(list) = manager.GetSessions() {
+            for index in 0..list.Size().unwrap_or(0) {
+                let Ok(session) = list.GetAt(index) else { continue };
+                let Some(id) = session.SourceAppUserModelId().ok().and_then(|id| bounded_text(id.to_string(), 256)) else { continue };
+                // Several windows of one app share an id; the first stands for all.
+                if pairs.iter().any(|(_, known)| known.id == id) {
+                    continue;
+                }
+                let (title, artist) = if with_text { read_text(&session) } else { (None, None) };
+                let info = PlayerInfo { name: media_players::friendly_name(&id), state: state_of(&session), id, title, artist };
+                pairs.push((session, info));
+            }
+        }
+        let infos: Vec<PlayerInfo> = pairs.iter().map(|(_, info)| info.clone()).collect();
+        let controlling = if with_text {
+            media_players::resolve_and_publish(infos, windows_current.as_deref()).controlling
+        } else {
+            media_players::build_snapshot(&media_players::preference(), infos, windows_current.as_deref(), true).0.controlling
+        };
+        let session = controlling
+            .and_then(|id| pairs.into_iter().find(|(_, info)| info.id == id).map(|(session, _)| session))
+            .or(current);
+        Selection { session, windows_current }
+    }
+
+    /// Sends a playback command straight to the chosen player when the system media keys would reach a
+    /// different one (a pinned player, or Auto following another app). `None` means: use the media keys.
+    pub(crate) fn control(command: MediaCommand) -> Option<Result<(), String>> {
+        let manager = Manager::RequestAsync().ok()?.join().ok()?;
+        let selection = select(&manager, false);
+        let session = selection.session?;
+        let chosen = session.SourceAppUserModelId().ok().and_then(|id| bounded_text(id.to_string(), 256));
+        let pinned = matches!(media_players::preference(), Preference::Pinned(_));
+        if !pinned && chosen == selection.windows_current {
+            return None;
+        }
+        let accepted = match command {
+            MediaCommand::PlayPause => session.TryTogglePlayPauseAsync().ok()?.join().ok()?,
+            MediaCommand::NextTrack => session.TrySkipNextAsync().ok()?.join().ok()?,
+            MediaCommand::PreviousTrack => session.TrySkipPreviousAsync().ok()?.join().ok()?,
+            _ => return None,
+        };
+        accepted.then_some(Ok(()))
+    }
+}
+
+#[cfg(windows)]
+pub(super) use windows_players::control as control_selected_player;
+
+/// The playback state of the player the controls follow.
+#[cfg(windows)]
+pub(super) async fn selected_playback_state() -> PlaybackState {
+    use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager as SessionManager;
+
+    let Ok(operation) = SessionManager::RequestAsync() else {
+        return PlaybackState::Unavailable;
+    };
+    let Ok(manager) = operation.await else {
+        return PlaybackState::Unavailable;
+    };
+    match windows_players::select(&manager, false).session {
+        Some(session) => windows_players::state_of(&session),
+        None => PlaybackState::Stopped,
+    }
+}
+
+#[cfg(windows)]
 async fn read_system_media_state(
     manager: &mut Option<windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager>,
     artwork_track_key: &mut Option<(String, std::time::Instant)>,
@@ -202,7 +329,7 @@ async fn read_system_media_state(
     let Some(manager) = manager.as_ref() else {
         return SystemMediaState::unavailable();
     };
-    let Ok(session) = manager.GetCurrentSession() else {
+    let Some(session) = windows_players::select(manager, true).session else {
         return SystemMediaState::unavailable();
     };
     let Ok(properties_operation) = session.TryGetMediaPropertiesAsync() else {
@@ -322,6 +449,7 @@ async fn read_system_media_state(
         .unwrap_or((None, None));
 
     SystemMediaState {
+        source_name: source_app_id.as_deref().map(crate::media_players::friendly_name),
         source_app_id,
         title,
         artist,
@@ -488,7 +616,7 @@ pub(super) async fn seek(position_ms: u64) -> Result<(), String> {
         .map_err(|error| error.to_string())?
         .await
         .map_err(|error| error.to_string())?;
-    let session = manager.GetCurrentSession().map_err(|error| error.to_string())?;
+    let session = windows_players::select(&manager, false).session.ok_or("No media player is running")?;
     let start = session
         .GetTimelineProperties()
         .and_then(|timeline| timeline.StartTime())
@@ -739,6 +867,7 @@ fn adapter_media_state(
     };
     SystemMediaState {
         source_app_id: Some(now_playing.bundle_id.clone()),
+        source_name: Some(crate::media_players::friendly_name(&now_playing.bundle_id)),
         title: Some(now_playing.title.clone()),
         artist: now_playing.artist.clone(),
         album: now_playing.album.clone(),

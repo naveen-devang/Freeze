@@ -1,6 +1,6 @@
 [package]
 name = "freeze-pc"
-version = "1.1.0"
+version = "1.2.0"
 description = "Local PC companion for Freeze"
 authors = ["Freeze"]
 edition = "2021"
@@ -38,9 +38,10 @@ tauri-plugin-single-instance = "2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 sha2 = "0.10"
 zip = { version = "4", default-features = false, features = ["deflate"] }
+png = "0.17"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = ["Media_Control", "Storage_Streams", "Wdk_Graphics_Direct3D", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Foundation", "Win32_Graphics_Dxgi", "Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com", "Win32_System_Performance", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62.2", features = ["Foundation_Collections", "Media_Control", "Storage_Streams", "Wdk_Graphics_Direct3D", "Win32_Devices_DeviceAndDriverInstallation", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_UI_Shell", "Win32_Graphics_Dxgi", "Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com", "Win32_System_Performance", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 # GPU vendor libraries (NVML, AMD ADLX/ADL, Intel IGCL) are loaded at runtime; none is required.
 nvml-wrapper = "0.13.0"
 libloading = "0.8"

@@ -61,3 +61,5 @@ jobs:
       - run: node scripts/check-deck-icons.ts
       - run: node scripts/check-deck-grid.ts
       - run: node scripts/check-deck-move.ts
+      - run: node scripts/check-media-players.ts
+      - run: node scripts/check-quiet-processes.ts

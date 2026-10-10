@@ -17,6 +17,8 @@ import { buttonPlacement, surfaceOccupancy, type SurfaceItem } from '../../deck-
 import { colors } from '../../theme';
 import { TabBarHiddenContext } from '../../navigation/tab-bar-context';
 import { useTabBarClearance } from '../../tab-inset';
+import { MediaToastView, PlayerSheet, SourceChip, useMediaSource } from '../../media-source';
+import { playerColor, type PlayersState } from '../../media-players';
 
 const shortcutIcons: Record<string, typeof Command> = {
   command: Command,
@@ -205,7 +207,7 @@ function useLivePosition(media: SystemMediaState) {
   return livePositionMs(media, now);
 }
 
-function NowPlayingWidget({ media, connected, sendCommand, sendVolume, seekMedia }: { media: SystemMediaState; connected: boolean; sendCommand: (command: DeckMediaCommand) => boolean; sendVolume: (volumePercent: number) => boolean; seekMedia: (positionMs: number) => boolean }) {
+function NowPlayingWidget({ media, connected, sendCommand, sendVolume, seekMedia, source }: { media: SystemMediaState; connected: boolean; sendCommand: (command: DeckMediaCommand) => boolean; sendVolume: (volumePercent: number) => boolean; seekMedia: (positionMs: number) => boolean; source?: { players: PlayersState | null; multiple: boolean; interactive: boolean; onPress: () => void } }) {
   const [size, setSize] = useState({ width: 0, height: 0 });
   const [scrubPosition, setScrubPosition] = useState<number | null>(null);
   const [volumeOpen, setVolumeOpen] = useState(false);
@@ -225,6 +227,10 @@ function NowPlayingWidget({ media, connected, sendCommand, sendVolume, seekMedia
   useEffect(() => () => {
     if (volumeTimer.current) clearTimeout(volumeTimer.current);
   }, []);
+  // Who is playing: the player the PC says the controls follow, else the app named in the media state.
+  const controlled = source?.players?.players.find((player) => player.id === source.players?.controlling);
+  const sourceName = controlled?.name ?? media.sourceName;
+  const sourceInfo = source && sourceName ? { name: sourceName, color: playerColor(controlled?.id ?? media.sourceAppId ?? sourceName) } : null;
   const on = (row: NowPlayingRow) => layout.show.includes(row);
   const stacked = layout.mode !== 'row';
   const textAlign = stacked ? 'center' : 'left';
@@ -249,6 +255,7 @@ function NowPlayingWidget({ media, connected, sendCommand, sendVolume, seekMedia
       <View pointerEvents="none" style={styles.nowPlayingBackdropFrame}><Image source={{ uri: media.artworkDataUrl }} style={styles.nowPlayingBackdrop} blurRadius={24} resizeMode="cover" /></View>
       <View pointerEvents="none" style={styles.nowPlayingBackdropTint} />
     </> : null}
+    {sourceInfo && size.width >= 150 && size.height >= 90 ? <View pointerEvents="box-none" style={styles.sourceChipWrap}><SourceChip name={sourceInfo.name} color={sourceInfo.color} multiple={source?.multiple ?? false} interactive={source?.interactive ?? false} onPress={source!.onPress} /></View> : null}
     <View style={[styles.nowPlayingContent, { flexDirection: stacked ? 'column' : 'row', padding: layout.padding, gap: layout.gap }]}>
       {media.artworkDataUrl ? <Image source={{ uri: media.artworkDataUrl }} style={[styles.nowPlayingArtwork, { width: layout.artSize, height: layout.artSize, borderRadius: artRadius }]} resizeMode="cover" /> : <View style={[styles.nowPlayingFallback, { width: layout.artSize, height: layout.artSize, borderRadius: artRadius }]}><Music size={Math.max(12, layout.artSize * 0.43)} color="#93c5fd" strokeWidth={1.7} /></View>}
       <View style={[styles.nowPlayingColumn, stacked ? styles.nowPlayingColumnStacked : styles.nowPlayingColumnRow, { gap: layout.gap }]}>
@@ -324,6 +331,7 @@ export default function DeckScreen() {
   const [openFolders, setOpenFolders] = useState<Record<string, string>>({});
   const [regularGridWidth, setRegularGridWidth] = useState(0);
   const bottomClearance = useTabBarClearance();
+  const mediaSource = useMediaSource();
   const feedbackTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const immersiveToolsTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const activeProfile = deckConfig?.profiles.find((profile) => profile.id === (independentNavigation ? selectedProfileId : deckConfig.activeProfileId));
@@ -522,16 +530,18 @@ export default function DeckScreen() {
       if (item.type === 'widget') {
         const placement = item.widget.placement;
         if (placement.row !== row || placement.column !== column) return null;
-        return <View key={item.widget.id} style={[big ? styles.immersiveKey : styles.key, styles.clockWidgetKey, frame(placement)]}>{item.widget.type === 'clock' || item.widget.type === 'pc_stats' ? null : item.widget.type === 'now_playing' ? <LiveNowPlaying connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} seekMedia={seekMedia} /> : item.widget.type === 'lyrics' ? <LiveLyrics connected={connected} focused={isFocused} seekMedia={seekMedia} /> : <PluginTextWidget widget={item.widget} immersive={big} />}</View>;
+        return <View key={item.widget.id} style={[big ? styles.immersiveKey : styles.key, styles.clockWidgetKey, frame(placement)]}>{item.widget.type === 'clock' || item.widget.type === 'pc_stats' ? null : item.widget.type === 'now_playing' ? <LiveNowPlaying connected={connected} sendCommand={sendMediaCommand} sendVolume={sendSystemVolume} seekMedia={seekMedia} source={{ players: mediaSource.players, multiple: mediaSource.multiple, interactive: mediaSource.canSwitch, onPress: mediaSource.openSheet }} /> : item.widget.type === 'lyrics' ? <LiveLyrics connected={connected} focused={isFocused} seekMedia={seekMedia} /> : <PluginTextWidget widget={item.widget} immersive={big} />}</View>;
       }
       const button = item.button;
       const placement = buttonPlacement(columns, button, surface?.buttons.indexOf(button) ?? 0);
       if (placement.row !== row || placement.column !== column) return null;
       const isFolder = button.action.type === 'open_folder';
+      const isMediaKey = button.action.type === 'media' && ['play_pause', 'next_track', 'previous_track'].includes(button.action.command);
       const dynamicPlay = button.icon === 'auto' && button.action.type === 'media' && button.action.command === 'play_pause';
       const label = dynamicPlay ? (isPlaying ? 'Pause' : 'Play') : button.label;
       const Icon = controlIcon(button, playbackState);
-      return <Pressable key={button.id} style={({ pressed }) => [big ? styles.immersiveKey : styles.key, frame(placement), pressed && styles.keyPressed, !connected && !isFolder && styles.keyDisabled]} onPress={() => press(button, label)} disabled={!connected && !isFolder} accessibilityRole="button" accessibilityLabel={isFolder ? `${label}, folder` : label}>
+      return <Pressable key={button.id} style={({ pressed }) => [big ? styles.immersiveKey : styles.key, frame(placement), pressed && styles.keyPressed, !connected && !isFolder && styles.keyDisabled]} onPress={() => press(button, label)} onLongPress={isMediaKey && connected && mediaSource.canSwitch ? mediaSource.openSheet : undefined} delayLongPress={450} disabled={!connected && !isFolder} accessibilityRole="button" accessibilityLabel={isFolder ? `${label}, folder` : label} accessibilityHint={isMediaKey && mediaSource.multiple ? 'Long press to choose a media player' : undefined}>
+        {isMediaKey && mediaSource.multiple ? <View pointerEvents="none" style={styles.mediaKeyDot} /> : null}
         {button.appIconData ? <Image source={{ uri: button.appIconData }} style={big ? { width: iconSize, height: iconSize } : styles.appIcon} resizeMode="contain" /> : button.iconSvg && button.icon !== 'auto' ? <SvgXml xml={button.iconSvg} width={iconSize} height={iconSize} /> : <Icon size={iconSize} color={colors.text} strokeWidth={1.7} />}
         {big ? null : <Text style={styles.keyLabel} numberOfLines={2}>{label}</Text>}
       </Pressable>;
@@ -561,6 +571,8 @@ export default function DeckScreen() {
           </ScrollView>
           <Pressable style={styles.immersiveExit} onPress={() => { setImmersive(false); setShowImmersiveTools(false); }} accessibilityRole="button" accessibilityLabel="Exit immersive mode"><Minimize2 size={19} color={colors.text} /></Pressable>
         </View> : null}
+        <MediaToastView toast={mediaSource.toast} bottom={12} onSwitch={(player) => mediaSource.choose(player.id, player.name)} onDismiss={mediaSource.dismissToast} />
+        <PlayerSheet visible={mediaSource.sheetOpen} landscape state={mediaSource.players} onChoose={mediaSource.choose} onClose={mediaSource.closeSheet} />
       </SafeAreaView>
       <PerfOverlay />
       {power.overlay}
@@ -615,6 +627,8 @@ export default function DeckScreen() {
           {actionError ? <><Wifi size={13} color={colors.faint} /><Text style={styles.feedbackText}>{actionErrorText}</Text></> : feedback ? <><View style={styles.feedbackDot} /><Text style={styles.feedbackText}>{feedback}</Text></> : <><Wifi size={13} color={colors.faint} /><Text style={styles.feedbackText}>{connected ? 'Ready to send controls' : 'Connect to enable controls'}</Text></>}
         </View>
       </ScrollView>
+      <MediaToastView toast={mediaSource.toast} bottom={bottomClearance} onSwitch={(player) => mediaSource.choose(player.id, player.name)} onDismiss={mediaSource.dismissToast} />
+      <PlayerSheet visible={mediaSource.sheetOpen} landscape={false} state={mediaSource.players} onChoose={mediaSource.choose} onClose={mediaSource.closeSheet} />
       <PerfOverlay />
       {power.overlay}
     </SafeAreaView>
@@ -634,6 +648,8 @@ const styles = StyleSheet.create({
   pluginWidgetTitle: { width: '100%', flexShrink: 1, color: colors.text, fontWeight: '600', textAlign: 'center', includeFontPadding: false },
   pluginWidgetBody: { width: '100%', flexShrink: 1, color: colors.muted, textAlign: 'center', includeFontPadding: false },
   pluginWidgetUnavailable: { color: colors.muted, fontSize: 10, textAlign: 'center' },
+  sourceChipWrap: { position: 'absolute', top: 6, right: 6, zIndex: 5 },
+  mediaKeyDot: { position: 'absolute', top: 7, right: 7, width: 7, height: 7, borderRadius: 4, backgroundColor: '#facc15' },
   nowPlayingWidget: { flex: 1, width: '100%', minWidth: 0, minHeight: 0, overflow: 'hidden', borderRadius: 6 },
   nowPlayingContent: { flex: 1, minWidth: 0, minHeight: 0, alignItems: 'center', justifyContent: 'center' },
   nowPlayingBackdropFrame: { ...StyleSheet.absoluteFill, overflow: 'hidden' },

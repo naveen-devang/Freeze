@@ -30,8 +30,12 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
 mod adb;
+mod icon_png;
+mod media_players;
 mod pc_stats;
 mod system_media;
+#[cfg(windows)]
+mod win_icon;
 
 const PORT: u16 = 39421;
 const MAX_DECK_CONFIG_BYTES: usize = 1_048_576;
@@ -90,6 +94,18 @@ impl WidgetSurface {
                 .fixed_row_height
                 .is_none_or(|height| in_range(height, 2_000.0) && height > 0.0)
     }
+}
+
+/// Keeps a process Freeze starts from opening a console window on Windows. Every helper process goes through
+/// this (scripts/check-quiet-processes.ts fails the build when one does not); elsewhere it does nothing.
+fn quiet(command: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -1831,6 +1847,11 @@ enum ClientMessage {
         #[serde(rename = "positionMs")]
         position_ms: u64,
     },
+    /// The phone chose which media player to control; none means Auto.
+    SelectMediaPlayer {
+        #[serde(default, rename = "playerId")]
+        player_id: Option<String>,
+    },
 }
 
 enum ClientAction {
@@ -2516,10 +2537,41 @@ async fn list_installed_apps() -> Result<Vec<InstalledApp>, String> {
     .map_err(|_| "Could not read the installed apps".to_owned())
 }
 
-#[tauri::command]
+static ICON_CACHE: std::sync::Mutex<Option<icon_png::IconCache>> = std::sync::Mutex::new(None);
+
+/// Reads an icon once per file and version of that file. Runs on a worker thread, never the window's.
+fn cached_icon(path: &str, variant: bool, read: impl FnOnce() -> Result<String, String>) -> Result<String, String> {
+    let modified = fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_nanos());
+    let key = icon_png::IconCache::key(path, variant, modified);
+    let hit = ICON_CACHE.lock().ok().and_then(|cache| cache.as_ref().and_then(|entries| entries.get(&key)));
+    if let Some(icon) = hit {
+        return Ok(icon);
+    }
+    let icon = read()?;
+    if let Ok(mut cache) = ICON_CACHE.lock() {
+        cache.get_or_insert_with(Default::default).insert(key, icon.clone());
+    }
+    Ok(icon)
+}
+
 // The flag is Windows-only; renaming it would change the argument name the front end sends.
+#[tauri::command]
+async fn extract_app_icon(app: String, use_shortcut_icon: bool) -> Result<String, String> {
+    // A PowerShell or shell call can take a second, so it runs off the window's thread.
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = app.clone();
+        cached_icon(&path, use_shortcut_icon, || read_app_icon(app, use_shortcut_icon))
+    })
+    .await
+    .map_err(|_| "Could not read the application icon".to_owned())?
+}
+
 #[cfg_attr(not(windows), allow(unused_variables))]
-fn extract_app_icon(app: String, use_shortcut_icon: bool) -> Result<String, String> {
+fn read_app_icon(app: String, use_shortcut_icon: bool) -> Result<String, String> {
     if app.trim().is_empty() || app.len() > 512 || app.chars().any(char::is_control) {
         return Err("Enter a valid app path".into());
     }
@@ -2527,6 +2579,19 @@ fn extract_app_icon(app: String, use_shortcut_icon: bool) -> Result<String, Stri
     {
         if !Path::new(&app).is_file() {
             return Err("Choose an existing application file".into());
+        }
+        // The shell reads the icon in this process: no console window, no wait for PowerShell to start. Only a
+        // shortcut's *target* icon (the "reset to app icon" case) still needs the script below, as does any
+        // file the shell cannot read.
+        let is_shortcut = Path::new(&app).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"));
+        if use_shortcut_icon || !is_shortcut {
+            if let Ok(png) = win_icon::app_icon_png(&app) {
+                use base64::Engine;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(png);
+                if encoded.len() <= 65_500 {
+                    return Ok(format!("data:image/png;base64,{encoded}"));
+                }
+            }
         }
         let script = r#"
 Add-Type -AssemblyName System.Drawing
@@ -2576,7 +2641,7 @@ $stream.Dispose()
 if ($iconHandle -ne [IntPtr]::Zero) { $null = [FreezeIconExtractor]::DestroyIcon($iconHandle) }
 if ($smallHandle -ne [IntPtr]::Zero) { $null = [FreezeIconExtractor]::DestroyIcon($smallHandle) }
 "#;
-        let output = Command::new("powershell.exe")
+        let output = quiet(&mut Command::new("powershell.exe"))
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .env("FREEZE_APP_PATH", &app)
             .env(
@@ -2769,7 +2834,7 @@ fn machine_name() -> String {
         .or_else(|_| std::env::var("HOSTNAME"))
         .ok()
         .or_else(|| {
-            Command::new("hostname")
+            quiet(&mut Command::new("hostname"))
                 .output()
                 .ok()
                 .filter(|output| output.status.success())
@@ -2841,6 +2906,10 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let mut next_playback_check = tokio::time::Instant::now();
     let mut fast_checks_until = tokio::time::Instant::now();
     let mut last_playback_state = None;
+    // The phone is told the state again every few seconds even when it has not changed, so a wrong guess it
+    // made when a control was pressed cannot last.
+    let mut last_playback_sent_at: Option<std::time::Instant> = None;
+    let mut last_players_sent: Option<media_players::PlayersSnapshot> = None;
     // The last playback position this phone was sent; positions in between it counts forward itself.
     let mut progress_sent: Option<system_media::ProgressSent> = None;
     // False while the phone app is in the background (it sends set_streaming): nothing is sent and
@@ -2948,12 +3017,25 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     continue;
                 }
                 let playback_state = current_playback_state().await;
-                if last_playback_state != Some(playback_state) {
+                let resend_due = last_playback_sent_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(3));
+                if last_playback_state != Some(playback_state) || resend_due {
                     let message = serde_json::json!({ "type": "playback_state", "state": playback_state });
                     if socket.send(Message::Text(message.to_string().into())).await.is_err() {
                         break;
                     }
                     last_playback_state = Some(playback_state);
+                    last_playback_sent_at = Some(std::time::Instant::now());
+                }
+                // Which media players there are and which one the controls go to, whenever that changes.
+                if let Some(players) = media_players::snapshot() {
+                    if last_players_sent.as_ref() != Some(&players) {
+                        let mut message = serde_json::to_value(&players).unwrap_or_default();
+                        message["type"] = serde_json::json!("media_players");
+                        if socket.send(Message::Text(message.to_string().into())).await.is_err() {
+                            break;
+                        }
+                        last_players_sent = Some(players);
+                    }
                 }
                 continue;
             }
@@ -3484,6 +3566,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 if resuming {
                     // Back in the foreground: one fresh snapshot of everything.
                     last_playback_state = None;
+                    last_players_sent = None;
                     progress_sent = Some(system_media::ProgressSent::new(&state.media_state.borrow(), std::time::Instant::now()));
                     pc_stats_history_sent = false;
                     next_playback_check = tokio::time::Instant::now();
@@ -3493,6 +3576,16 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                     if socket.send(Message::Text(message.to_string().into())).await.is_err() {
                         break;
                     }
+                }
+            }
+            ClientMessage::SelectMediaPlayer { player_id } if authenticated => {
+                if player_id.as_deref().is_none_or(media_players::valid_player_id) {
+                    media_players::set_preference(player_id);
+                    // Read the players again right away and tell this phone what changed.
+                    state.media_refresh.notify_one();
+                    last_players_sent = None;
+                    fast_checks_until = tokio::time::Instant::now() + Duration::from_secs(2);
+                    next_playback_check = tokio::time::Instant::now() + Duration::from_millis(150);
                 }
             }
             ClientMessage::PcStatsSubscribe { needs } if authenticated => {
@@ -3784,29 +3877,7 @@ fn run_deck_action(
 
 #[cfg(windows)]
 async fn current_playback_state() -> PlaybackState {
-    use windows::Media::Control::{
-        GlobalSystemMediaTransportControlsSessionManager as SessionManager,
-        GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status,
-    };
-
-    let Ok(operation) = SessionManager::RequestAsync() else {
-        return PlaybackState::Unavailable;
-    };
-    let Ok(manager) = operation.await else {
-        return PlaybackState::Unavailable;
-    };
-    let Ok(session) = manager.GetCurrentSession() else {
-        return PlaybackState::Stopped;
-    };
-    let Ok(info) = session.GetPlaybackInfo() else {
-        return PlaybackState::Unavailable;
-    };
-    match info.PlaybackStatus() {
-        Ok(Status::Playing) => PlaybackState::Playing,
-        Ok(Status::Paused | Status::Opened | Status::Changing) => PlaybackState::Paused,
-        Ok(Status::Closed | Status::Stopped) => PlaybackState::Stopped,
-        _ => PlaybackState::Unavailable,
-    }
+    system_media::selected_playback_state().await
 }
 
 #[cfg(target_os = "macos")]
@@ -3882,6 +3953,12 @@ fn run_action(action: ClientAction) -> Result<(), String> {
                     return Ok(());
                 }
             }
+            // On Windows the media keys reach whichever app Windows calls current; when the phone chose another
+            // player, the command goes to that player instead.
+            #[cfg(windows)]
+            if let Some(result) = system_media::control_selected_player(command) {
+                return result;
+            }
             let mut enigo = Enigo::new(&Settings::default()).map_err(|error| error.to_string())?;
             let key = match command {
                 MediaCommand::PlayPause => Key::MediaPlayPause,
@@ -3952,7 +4029,8 @@ fn run_script(path: &str, args: &[String]) -> Result<(), String> {
         command.arg(path);
         command
     };
-    command
+    // A script runs in the background; a console window for it would only get in the way.
+    quiet(&mut command)
         .args(args)
         .spawn()
         .map(|_| ())
@@ -4069,7 +4147,16 @@ fn launch_file(path: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn extract_file_thumbnail(path: String) -> Result<String, String> {
+async fn extract_file_thumbnail(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let key = path.clone();
+        cached_icon(&key, false, || read_file_thumbnail(path))
+    })
+    .await
+    .map_err(|_| "Could not read a thumbnail from that file".to_owned())?
+}
+
+fn read_file_thumbnail(path: String) -> Result<String, String> {
     validate_file_target(&path)?;
     let path = PathBuf::from(path.trim());
     if !path.exists() {
@@ -4116,7 +4203,7 @@ $bitmap.Dispose()
 $stream.Dispose()
 $null = [FreezeShellThumbnail]::DeleteObject($hbitmap)
 "#;
-        let output = Command::new("powershell.exe")
+        let output = quiet(&mut Command::new("powershell.exe"))
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .env("FREEZE_FILE_PATH", &path)
             .output()

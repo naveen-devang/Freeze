@@ -2,6 +2,7 @@ import * as SecureStore from 'expo-secure-store';
 import Storage from 'expo-sqlite/kv-store';
 import { loadDeckPages } from './deck';
 import { validSurfaceLayout } from './deck-layout';
+import { expire, parsePlayers, settle, type PlayersState } from './media-players';
 import { createContext, PropsWithChildren, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { AppState } from 'react-native';
 import type { WidgetSurface } from './now-playing-layout';
@@ -21,7 +22,7 @@ export type DeckProfile = { id: string; name: string; pages: DeckPage[]; activeP
 export type DeckConfig = { schemaVersion: number; revision: number; profiles: DeckProfile[]; activeProfileId: string };
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 export type PlaybackState = 'playing' | 'paused' | 'stopped' | 'unavailable';
-export type SystemMediaState = { sourceAppId?: string; title?: string; artist?: string; album?: string; playbackState: PlaybackState; positionMs?: number; durationMs?: number; artworkDataUrl?: string; volumePercent?: number; canSeek?: boolean; playbackRate?: number;
+export type SystemMediaState = { sourceAppId?: string; sourceName?: string; title?: string; artist?: string; album?: string; playbackState: PlaybackState; positionMs?: number; durationMs?: number; artworkDataUrl?: string; volumePercent?: number; canSeek?: boolean; playbackRate?: number;
   /** When positionMs was reported (Date.now()); while playing, the position has moved on since. */
   receivedAt?: number };
 export type ActionError = 'accessibility_permission_required' | 'app_launch_failed' | 'stale_revision' | 'unknown_button' | 'control_failed';
@@ -32,6 +33,10 @@ type ConnectionContextValue = {
   status: ConnectionStatus;
   protocolError: string | null;
   playbackState: PlaybackState;
+  /** Every media player on the PC and which one the controls follow; null until the PC reports. */
+  mediaPlayers: PlayersState | null;
+  /** Follow this player, or Auto when null. */
+  selectMediaPlayer: (playerId: string | null) => boolean;
   deckConfig: DeckConfig | null;
   independentNavigation: boolean;
   selectedProfileId: string | null;
@@ -212,6 +217,10 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
   // were sent before the press took effect and are ignored; the PC confirms within ~300 ms.
   const playbackRef = useRef<PlaybackState>('unavailable');
   const expectedPlaybackRef = useRef<{ state: PlaybackState; until: number } | null>(null);
+  // What the PC last said, so a press the PC never confirmed does not leave the wrong state showing.
+  const lastReportedPlaybackRef = useRef<PlaybackState | null>(null);
+  const expiryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [mediaPlayers, setMediaPlayers] = useState<PlayersState | null>(null);
   const [deckConfig, setDeckConfig] = useState<DeckConfig | null>(null);
   const [independentNavigation, setIndependentNavigation] = useState(false);
   const [selectedProfileId, setSelectedProfileId] = useState<string | null>(null);
@@ -230,10 +239,10 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
   }, []);
   // The playback state to show for a report from the PC, or null to keep the pressed state.
   const settlePlayback = (reported: PlaybackState): PlaybackState | null => {
-    const expected = expectedPlaybackRef.current;
-    if (!expected) return reported;
-    if (Date.now() > expected.until) { expectedPlaybackRef.current = null; return reported; }
-    return reported === expected.state ? reported : null;
+    lastReportedPlaybackRef.current = reported;
+    const result = settle(expectedPlaybackRef.current, reported, Date.now());
+    expectedPlaybackRef.current = result.expected;
+    return result.show;
   };
 
   const persistPairedDevices = useCallback((devices: PcConnection[]) => {
@@ -263,6 +272,8 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
       setSelectedPageId(null);
       setProtocolError(null);
       setPlaybackState('unavailable');
+      setMediaPlayers(null);
+      lastReportedPlaybackRef.current = null;
       setMediaState(EMPTY_MEDIA_STATE);
       setActionError(null);
       clearPcStats();
@@ -332,6 +343,10 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
               setMediaState((current) => current.playbackState === settled || current.playbackState === 'unavailable' ? current : { ...current, playbackState: settled });
             }
           }
+          if (message.type === 'media_players') {
+            const parsed = parsePlayers(message);
+            if (parsed) setMediaPlayers(parsed);
+          }
           if (message.type === 'media_state') {
             const state = message.state;
             if (!state || typeof state !== 'object' || Array.isArray(state)) {
@@ -346,6 +361,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
               const settled = settlePlayback(reported);
               setMediaState((current) => ({
                 sourceAppId: text('sourceAppId', 256),
+                sourceName: text('sourceName', 64),
                 title: text('title', 512),
                 artist: text('artist', 512),
                 album: text('album', 512),
@@ -518,6 +534,8 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
     setConnection(null);
     setStatus('disconnected');
     setPlaybackState('unavailable');
+    setMediaPlayers(null);
+    lastReportedPlaybackRef.current = null;
     setMediaState(EMPTY_MEDIA_STATE);
     setIndependentNavigation(false);
     setSelectedProfileId(null);
@@ -554,6 +572,19 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
     expectedPlaybackRef.current = { state: next, until: Date.now() + 1500 };
     setPlaybackState(next);
     setMediaState((current) => ({ ...current, playbackState: next, positionMs: livePositionMs(current), receivedAt: Date.now() }));
+    // If the PC has not confirmed the press by then, go back to what it last reported.
+    if (expiryTimerRef.current) clearTimeout(expiryTimerRef.current);
+    expiryTimerRef.current = setTimeout(() => {
+      expiryTimerRef.current = null;
+      const result = expire(expectedPlaybackRef.current, lastReportedPlaybackRef.current, Date.now());
+      if (result.expected === expectedPlaybackRef.current) return;
+      expectedPlaybackRef.current = result.expected;
+      const back = result.show;
+      if (back) {
+        setPlaybackState(back);
+        setMediaState((current) => ({ ...current, playbackState: back, positionMs: livePositionMs(current), receivedAt: Date.now() }));
+      }
+    }, 1600);
   }, []);
   const sendButton = useCallback((buttonId: string) => {
     const sent = sendRequest('invoke_button', 'buttonId', buttonId);
@@ -567,6 +598,16 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
   }, [sendRequest, showPlayPausePressed]);
   const sendSystemVolume = useCallback((volumePercent: number) => sendRequest('set_system_volume', 'volumePercent', Math.round(Math.max(0, Math.min(100, volumePercent)))), [sendRequest]);
   const seekMedia = useCallback((positionMs: number) => sendRequest('seek_media', 'positionMs', Math.round(Math.max(0, positionMs))), [sendRequest]);
+  const selectMediaPlayer = useCallback((playerId: string | null) => {
+    const socket = socketRef.current;
+    if (status !== 'connected' || socket?.readyState !== WebSocket.OPEN) return false;
+    try {
+      socket.send(JSON.stringify({ type: 'select_media_player', playerId }));
+      return true;
+    } catch {
+      return false;
+    }
+  }, [status]);
   const selectProfile = useCallback((profileId: string) => sendRequest('select_profile', 'profileId', profileId), [sendRequest]);
   const selectPage = useCallback((pageId: string) => sendRequest('select_page', 'pageId', pageId), [sendRequest]);
   // Tells the desktop how big the phone's widget area is, so its Now Playing preview matches.
@@ -580,7 +621,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
   }, [status]);
 
   return (
-    <ConnectionContext.Provider value={{ connection, pairedDevices, status, protocolError, playbackState, deckConfig, independentNavigation, selectedProfileId, selectedPageId, actionError, connect, disconnect, removePairedDevice, sendButton, sendMediaCommand, sendSystemVolume, seekMedia, selectProfile, selectPage, reportWidgetSurface }}>
+    <ConnectionContext.Provider value={{ connection, pairedDevices, status, protocolError, playbackState, mediaPlayers, selectMediaPlayer, deckConfig, independentNavigation, selectedProfileId, selectedPageId, actionError, connect, disconnect, removePairedDevice, sendButton, sendMediaCommand, sendSystemVolume, seekMedia, selectProfile, selectPage, reportWidgetSurface }}>
       {children}
     </ConnectionContext.Provider>
   );

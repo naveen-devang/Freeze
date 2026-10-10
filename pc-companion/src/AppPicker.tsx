@@ -5,26 +5,42 @@ import { AppWindow, Search } from 'lucide-react';
 
 type InstalledApp = { name: string; path: string };
 
-// App icons come from the PC one at a time, only for rows that scroll into view.
+// App icons come from the PC, only for rows that are on screen. Rows scrolled past before their turn drop out of
+// the queue, and the newest visible row goes first, so scrolling a long list never builds up a backlog.
 const iconCache = new Map<string, string | null>();
-const waiting: (() => void)[] = [];
+type Waiting = { path: string; run: () => void; cancelled: boolean };
+const waiting: Waiting[] = [];
 let loading = 0;
+const MAX_PARALLEL = 3;
 
-async function loadIcon(path: string): Promise<string | null> {
-  if (iconCache.has(path)) return iconCache.get(path) ?? null;
-  if (loading >= 2) await new Promise<void>((resolve) => waiting.push(resolve));
-  loading++;
-  try {
-    const data = await invoke<string>('extract_app_icon', { app: path, useShortcutIcon: true });
-    iconCache.set(path, data);
-    return data;
-  } catch {
-    iconCache.set(path, null);
-    return null;
-  } finally {
-    loading--;
-    waiting.shift()?.();
+function pump() {
+  while (loading < MAX_PARALLEL) {
+    const next = waiting.pop();
+    if (!next) return;
+    if (!next.cancelled) next.run();
   }
+}
+
+// Asks for an icon; the returned function withdraws the request if it has not started.
+function requestIcon(path: string, done: (icon: string | null) => void): () => void {
+  if (iconCache.has(path)) {
+    done(iconCache.get(path) ?? null);
+    return () => {};
+  }
+  const entry: Waiting = {
+    path,
+    cancelled: false,
+    run: () => {
+      loading++;
+      invoke<string>('extract_app_icon', { app: path, useShortcutIcon: true })
+        .then((data) => { iconCache.set(path, data); return data; })
+        .catch(() => { iconCache.set(path, null); return null; })
+        .then((data) => { loading--; done(data); pump(); });
+    },
+  };
+  waiting.push(entry);
+  pump();
+  return () => { entry.cancelled = true; };
 }
 
 function AppRow({ app, onPick }: { app: InstalledApp; onPick: (app: InstalledApp) => void }) {
@@ -33,14 +49,16 @@ function AppRow({ app, onPick }: { app: InstalledApp; onPick: (app: InstalledApp
   useEffect(() => {
     const element = row.current;
     if (!element || iconCache.has(app.path)) return;
+    let withdraw = () => {};
     let alive = true;
     const observer = new IntersectionObserver((entries) => {
-      if (!entries.some((entry) => entry.isIntersecting)) return;
-      observer.disconnect();
-      void loadIcon(app.path).then((data) => { if (alive) setIcon(data); });
+      const visible = entries.some((entry) => entry.isIntersecting);
+      withdraw();
+      withdraw = () => {};
+      if (visible) withdraw = requestIcon(app.path, (data) => { if (alive) setIcon(data); });
     });
     observer.observe(element);
-    return () => { alive = false; observer.disconnect(); };
+    return () => { alive = false; withdraw(); observer.disconnect(); };
   }, [app.path]);
   return <button ref={row} type="button" className="app-picker-row" onClick={() => onPick(app)}>
     <span className="app-picker-icon">{icon ? <img src={icon} alt="" /> : <AppWindow size={16} />}</span>
