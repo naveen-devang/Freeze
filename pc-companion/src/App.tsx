@@ -64,6 +64,7 @@ import { buttonPlacement, canPlaceWidgetItem, defaultSpan, firstWidgetPlacement,
 import { widgetBlockSize, type WidgetSurface } from "./now-playing-layout";
 import { version } from "../package.json";
 import { UpdatesSetting, useUpdater } from "./updates";
+import { AppearanceSetting, inkIcon, useTheme } from "./theme";
 
 type ConnectionInfo = {
   host: string;
@@ -74,6 +75,7 @@ type ConnectionInfo = {
   serverOnline: boolean;
   isMacos: boolean;
   androidUsbEnabled: boolean;
+  androidUsb: { status: string; phone: string; detail: string };
   widgetSurface: WidgetSurface | null;
 };
 
@@ -137,6 +139,22 @@ function occupiedWidgetCells(screen: WidgetScreen): Map<number, WidgetCanvasItem
     }
   }
   return occupied;
+}
+
+// What the USB tab says. The phone pairs itself over the cable, so there is nothing to scan.
+function usbMessage(usb: { status: string; phone: string; detail: string } | undefined, enabled: boolean): string {
+  const phone = usb?.phone ? usb.phone : 'the phone';
+  if (!enabled || !usb || usb.status === 'off') return 'Press Set up USB first';
+  switch (usb.status) {
+    case 'no_adb': return 'Download the Android USB tool first';
+    case 'no_phone': return 'Plug your Android phone into this PC';
+    case 'unauthorized': return 'Unlock the phone and tap Allow USB debugging';
+    case 'pairing': return `Pairing with ${phone}…`;
+    case 'connected': return `${usb.phone || 'Your phone'} is connected by USB`;
+    case 'idle': return `${usb.phone || 'The phone'} is plugged in but not connected. Open Freeze on it, or press Retry`;
+    case 'failed': return `Could not pair with ${phone}${usb.detail ? `. ${usb.detail}` : ''}`;
+    default: return usb.detail || 'Checking the USB connection…';
+  }
 }
 
 function App() {
@@ -407,6 +425,7 @@ function App() {
           </section> : null}
           {screen === 'deck' ? <DesktopDeckEditor config={deckConfig} onSaved={setDeckConfig} playbackState={playbackState} mediaState={mediaState} isMacos={connection?.isMacos ?? false} plugins={freezePlugins} widgetSurface={connection?.widgetSurface ?? null} /> : screen === 'settings' ? <>
           <div className="page-heading"><div><h1>Settings</h1><p>Manage updates, device navigation and Freeze plugins.</p></div></div>
+          <AppearanceSetting />
           <UpdatesSetting updater={updater} />
           <section className="device-navigation-setting">
             <div className="device-navigation-copy"><h2>Independent device navigation</h2><p>Let each connected phone use its own profile and page. Turn this off to mirror navigation across all phones.</p></div>
@@ -476,7 +495,7 @@ function App() {
                 </button>
               </div>
               {usbError ? <p className="usb-error" role="alert">{usbError}</p> : null}
-              {transport === 'usb' && usbEnabled ? <p className="pair-note">Connect the Android phone by USB, then scan this code. Keep USB debugging enabled while using Freeze.</p> : null}
+              {transport === 'usb' && usbEnabled ? <p className="pair-note">Plug the Android phone in and Freeze pairs it by itself. Keep USB debugging enabled while using Freeze.</p> : null}
               {transport === 'usb' ? <p className="pair-note">On the phone: Settings → About phone → tap Build number 7 times → Developer options → turn on USB debugging, then tap Allow when asked.</p> : null}
               <p className="pair-note">iPhone USB data control needs a compatible MFi accessory. Use Wi-Fi on iOS.</p>
               <button className="secondary-button reset-pairing-button" onClick={() => void rotatePairingKey()}>Reset pairing key</button>
@@ -497,7 +516,13 @@ function App() {
                 <button className={transport === 'usb' ? 'transport-tab selected' : 'transport-tab'} onClick={() => setTransport('usb')}>Android USB</button>
               </div>
               <div className="qr-frame">
-                {connection && online && (transport === 'wifi' || usbEnabled) ? (
+                {transport === 'usb' ? (
+                  <div className="qr-placeholder usb-status" role="status">
+                    <Smartphone size={24} />
+                    <span>{usbMessage(connection?.androidUsb, usbEnabled)}</span>
+                    {usbEnabled && ['idle', 'failed'].includes(connection?.androidUsb?.status ?? '') ? <button className="secondary-button" onClick={() => void invoke('retry_android_usb')}>Retry</button> : null}
+                  </div>
+                ) : connection && online ? (
                   <QRCodeSVG
                     value={pairingQr}
                     size={184}
@@ -508,11 +533,11 @@ function App() {
                 ) : (
                   <div className="qr-placeholder">
                     <QrCode size={24} />
-                  <span>{loadError ? "QR unavailable" : transport === 'usb' && !usbEnabled ? "Set up USB first" : "Starting…"}</span>
+                  <span>{loadError ? "QR unavailable" : "Starting…"}</span>
                   </div>
                 )}
               </div>
-              <span className="qr-caption">{transport === 'usb' ? 'Android USB pairing' : 'Wi-Fi pairing'}</span>
+              <span className="qr-caption">{transport === 'usb' ? 'Pairs by cable, no code to scan' : 'Wi-Fi pairing'}</span>
             </div>
           </section>
 
@@ -593,6 +618,7 @@ function FreezePluginSettings({ plugins, warnings, onChange }: { plugins: Freeze
 }
 
 function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaState, isMacos, plugins, widgetSurface }: { config: DeckConfig | null; onSaved: (config: DeckConfig) => void; playbackState: PlaybackState; mediaState: SystemMediaState; isMacos: boolean; plugins: FreezePlugin[]; widgetSurface: WidgetSurface | null }) {
+  const theme = useTheme();
   const [workingConfig, setWorkingConfig] = useState<DeckConfig | null>(savedConfig);
   const [profileId, setProfileId] = useState('');
   const [pageId, setPageId] = useState('');
@@ -1295,6 +1321,8 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
     const id = `profile-${Date.now()}`;
     const nextProfile: DeckProfile = { id, name: `Profile ${deck.profiles.length + 1}`, pages: [{ id: `${id}-main`, name: 'Main', rows: 2, columns: 3, buttons: [], widgets: [], folders: [] }], activePageId: `${id}-main`, defaultPageId: `${id}-main`, autoSwitchApps: [], autoSwitchEnabled: false };
     const next = { ...deck, activeProfileId: id, profiles: [...deck.profiles, nextProfile] };
+    // The new profile must be in the editor's config before it is selected, or the selection falls back to the first one.
+    setWorkingConfig(next);
     setProfileId(id);
     setPageId(nextProfile.activePageId);
     setButtonId('');
@@ -1414,13 +1442,15 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
     let number = target.pages.length + 1;
     while (taken.has(`page ${number}`)) number++;
     const nextPage: DeckPage = { id, name: `Page ${number}`, rows: 2, columns: 3, buttons: [], widgets: [], folders: [] };
+    const next = { ...deck, activeProfileId: target.id, profiles: deck.profiles.map((entry) => entry.id === target.id ? { ...entry, pages: [...entry.pages, nextPage], activePageId: id } : entry) };
+    setWorkingConfig(next);
     setProfileId(target.id);
     setPageId(id);
     setButtonId('');
     setWidgetId('');
     setRenaming({ kind: 'page', id, profileId: target.id });
     setRenameDraft(nextPage.name);
-    void save({ ...deck, activeProfileId: target.id, profiles: deck.profiles.map((entry) => entry.id === target.id ? { ...entry, pages: [...entry.pages, nextPage], activePageId: id } : entry) });
+    void save(next);
   }
 
   function startRename(kind: 'profile' | 'page', id: string, profileOwner: string, name: string) {
@@ -1528,11 +1558,13 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
     setMenu(null);
     if (target.pages.length >= 8) return setError('Profiles can have up to 8 pages.');
     const copy = clonePage(source, copyName(source.name, target.pages.map((item) => item.name), 24));
+    const next = { ...deck, activeProfileId: target.id, profiles: deck.profiles.map((entry) => entry.id === target.id ? { ...entry, pages: [...entry.pages, copy], activePageId: copy.id } : entry) };
+    setWorkingConfig(next);
     setProfileId(target.id);
     setPageId(copy.id);
     setButtonId('');
     setWidgetId('');
-    void save({ ...deck, activeProfileId: target.id, profiles: deck.profiles.map((entry) => entry.id === target.id ? { ...entry, pages: [...entry.pages, copy], activePageId: copy.id } : entry) });
+    void save(next);
   }
 
   function duplicateProfile(source: DeckProfile) {
@@ -1552,11 +1584,13 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
     // Switch buttons that pointed at a page of the source now point at the matching page of the copy.
     const ids = new Map(source.pages.map((item, index) => [item.id, pages[index].id]));
     const [rewritten] = rewriteButtons([copy], (button) => button.action.type === 'select_page' && ids.has(button.action.pageId) ? { ...button, action: { type: 'select_page', pageId: ids.get(button.action.pageId)! } } : button);
+    const next = { ...deck, activeProfileId: rewritten.id, profiles: [...deck.profiles, rewritten] };
+    setWorkingConfig(next);
     setProfileId(rewritten.id);
     setPageId(rewritten.activePageId);
     setButtonId('');
     setWidgetId('');
-    void save({ ...deck, activeProfileId: rewritten.id, profiles: [...deck.profiles, rewritten] });
+    void save(next);
   }
 
   // --- Reordering and moving pages and profiles.
@@ -1820,7 +1854,7 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
                 const grid = { columns: widgetScreen.columns, rows: widgetScreen.rows };
                 const folderOf = item.type === 'button' && item.button.action.type === 'open_folder' ? page.folders.find((entry) => entry.id === (item.button.action as { folderId: string }).folderId) : undefined;
                 return <button key={itemId} type="button" data-deck-item={itemId} data-deck-cell="true" data-surface="widgets" data-row={placement.row} data-column={placement.column} className={`deck-button ${item.type === 'widget' ? 'clock-widget' : ''} ${folderOf ? 'deck-folder' : ''} ${item.type === 'widget' && (item.widget.type === 'now_playing' || item.widget.type === 'lyrics' || item.widget.type === 'clock' || item.widget.type === 'pc_stats') ? 'now-playing-widget-preview' : ''} ${item.type === 'button' && selected?.id === itemId ? 'selected' : ''} ${item.type === 'widget' && selectedWidget?.id === itemId ? 'selected' : ''} ${dragOverButtonId === itemId ? 'drop-target' : ''} ${draggingButtonId === itemId ? 'dragging' : ''} ${preview && !preview.valid ? 'resize-invalid' : ''}`} style={{ gridColumn: `${placement.column + 1} / span ${previewColumns}`, gridRow: `${placement.row + 1} / span ${previewRows}` }} onClick={() => { if (item.type === 'button') selectButton(item.button.id); else selectWidgetItem(item.widget.id); setPanel('settings'); }} onDoubleClick={() => { if (folderOf) openFolder(folderOf.id); }} onPointerDown={(event) => item.type === 'button' ? startButtonDrag(event, item.button.id, 'widgets') : startWidgetDrag(event, item.widget.id)} onPointerMove={moveButtonDrag} onPointerUp={finishButtonDrag} onPointerCancel={cancelButtonDrag} onLostPointerCapture={cancelButtonDrag}>
-                  {item.type === 'button' ? <><span>{iconForButton(item.button, playbackState)}</span><strong>{buttonLabel(item.button, playbackState)}</strong>{folderOf ? <small>Folder · {folderOf.buttons.length + folderOf.widgets.length} items</small> : null}</> : item.widget.type === 'clock' ? (() => { const block = widgetBlockSize(widgetSurface ?? REFERENCE_WIDGET_SURFACE, grid.columns, grid.rows, previewColumns, previewRows); return <ClockFacePreview face={item.widget.face ?? 'digital'} color={item.widget.color} width={block.width} height={block.height} />; })() : item.widget.type === 'pc_stats' ? (() => { const block = widgetBlockSize(widgetSurface ?? REFERENCE_WIDGET_SURFACE, grid.columns, grid.rows, previewColumns, previewRows); return <PcStatsPreview style={item.widget.face ?? 'ring'} metric={item.widget.metric} color={item.widget.color} gpu={item.widget.gpu} width={block.width} height={block.height} columns={previewColumns} rows={previewRows} />; })() : item.widget.type === 'now_playing' ? <NowPlayingPreview media={mediaState} surface={widgetSurface ?? REFERENCE_WIDGET_SURFACE} columns={grid.columns} rows={grid.rows} columnSpan={previewColumns} rowSpan={previewRows} /> : item.widget.type === 'lyrics' ? <LyricsPreview media={mediaState} surface={widgetSurface ?? REFERENCE_WIDGET_SURFACE} columns={grid.columns} rows={grid.rows} columnSpan={previewColumns} rowSpan={previewRows} /> : item.widget.renderType === 'text' ? <><span className="clock-widget-icon"><Package size={18} /></span><strong>{item.widget.values.title || item.widget.widgetId}</strong><small>{item.widget.values.body || 'Text widget'}</small></> : <><span className="clock-widget-icon"><Package size={18} /></span><strong>Unavailable widget</strong><small>{item.widget.renderType}</small></>}
+                  {item.type === 'button' ? <><span>{iconForButton(item.button, playbackState, theme)}</span><strong>{buttonLabel(item.button, playbackState)}</strong>{folderOf ? <small>Folder · {folderOf.buttons.length + folderOf.widgets.length} items</small> : null}</> : item.widget.type === 'clock' ? (() => { const block = widgetBlockSize(widgetSurface ?? REFERENCE_WIDGET_SURFACE, grid.columns, grid.rows, previewColumns, previewRows); return <ClockFacePreview face={item.widget.face ?? 'digital'} color={item.widget.color} width={block.width} height={block.height} />; })() : item.widget.type === 'pc_stats' ? (() => { const block = widgetBlockSize(widgetSurface ?? REFERENCE_WIDGET_SURFACE, grid.columns, grid.rows, previewColumns, previewRows); return <PcStatsPreview style={item.widget.face ?? 'ring'} metric={item.widget.metric} color={item.widget.color} gpu={item.widget.gpu} width={block.width} height={block.height} columns={previewColumns} rows={previewRows} />; })() : item.widget.type === 'now_playing' ? <NowPlayingPreview media={mediaState} surface={widgetSurface ?? REFERENCE_WIDGET_SURFACE} columns={grid.columns} rows={grid.rows} columnSpan={previewColumns} rowSpan={previewRows} /> : item.widget.type === 'lyrics' ? <LyricsPreview media={mediaState} surface={widgetSurface ?? REFERENCE_WIDGET_SURFACE} columns={grid.columns} rows={grid.rows} columnSpan={previewColumns} rowSpan={previewRows} /> : item.widget.renderType === 'text' ? <><span className="clock-widget-icon"><Package size={18} /></span><strong>{item.widget.values.title || item.widget.widgetId}</strong><small>{item.widget.values.body || 'Text widget'}</small></> : <><span className="clock-widget-icon"><Package size={18} /></span><strong>Unavailable widget</strong><small>{item.widget.renderType}</small></>}
                   <span className="deck-button-size">{preview ? `${shown.columnSpan}×${shown.rowSpan}` : placement.rowSpan > 1 || placement.columnSpan > 1 ? `${placement.columnSpan}×${placement.rowSpan}` : null}</span>
                   <span className="deck-resize-handle" aria-hidden="true" onPointerDown={(event) => item.type === 'button' ? startResize(event, item.button, 'button') : startResize(event, item.widget, 'widget')} onPointerMove={moveResize} onPointerUp={finishResize} onPointerCancel={cancelResize} onLostPointerCapture={cancelResize} />
                 </button>;
@@ -1987,9 +2021,9 @@ function buttonLabel(button: DeckButton, playback: PlaybackState) {
     : button.label;
 }
 
-function iconForButton(button: DeckButton, playback: PlaybackState) {
+function iconForButton(button: DeckButton, playback: PlaybackState, theme: 'light' | 'dark') {
   if (button.appIconData) return <img className="deck-button-app-icon" src={button.appIconData} alt="" />;
-  if (button.iconSvg && button.icon !== 'auto') return <img className="deck-button-svg-icon" src={`data:image/svg+xml,${encodeURIComponent(button.iconSvg)}`} alt="" />;
+  if (button.iconSvg && button.icon !== 'auto') return <img className="deck-button-svg-icon" src={`data:image/svg+xml,${encodeURIComponent(inkIcon(button.iconSvg, theme))}`} alt="" />;
   const aliases: Record<string, typeof Command> = { command: Command, monitor: Monitor, music: Music, mic: Mic, headphones: Headphones, 'app-window': AppWindow };
   const Icon = button.icon === 'auto' ? autoIcon(button.action, playback) : aliases[button.icon] ?? Command;
   return <Icon size={18} />;

@@ -1,5 +1,6 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import "./theme";
 import App from "./App";
 import "./fonts/fonts.css";
 

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Check, Search, X } from 'lucide-react';
 import { ClockFacePreview } from './ClockFacePreview';
 import { PanelSection } from '../SettingsPanel';
+import { useTheme } from '../theme';
 import { CLOCK_CATEGORIES, CLOCK_COLOR_PRESETS, ClockCategory, clockFace, DEFAULT_CLOCK_COLOR, FreezeClock } from '.';
 
 const RECENT_KEY = 'freeze.recent-clock-colors';
@@ -39,6 +40,7 @@ export function ClockWidgetSettings({ face, color, block, busy, onChange }: { fa
 export function ColorField({ color, busy, onPick }: { color: string; busy: boolean; onPick: (color: string) => void }) {
   const [hex, setHex] = useState(color);
   const [recent, setRecent] = useState(readRecent);
+  useTheme(); // swatches show the color as drawn in this theme, so they redraw when it changes
   useEffect(() => setHex(color), [color]);
   const pick = (next: string, remember = false) => {
     const value = next.toLowerCase();
@@ -52,12 +54,12 @@ export function ColorField({ color, busy, onPick }: { color: string; busy: boole
   };
   return <div className="clock-settings-color">
     <span className="clock-settings-label">Color</span>
-    <div className="clock-swatches">{CLOCK_COLOR_PRESETS.map((swatch) => <button key={swatch} type="button" className={`clock-swatch ${swatch === color ? 'selected' : ''}`} style={{ background: swatch }} aria-label={`Use ${swatch}`} aria-pressed={swatch === color} disabled={busy} onClick={() => pick(swatch)} />)}</div>
+    <div className="clock-swatches">{CLOCK_COLOR_PRESETS.map((swatch) => <button key={swatch} type="button" className={`clock-swatch ${swatch === color ? 'selected' : ''}`} style={{ background: FreezeClock.tint(swatch) }} aria-label={`Use ${swatch}`} aria-pressed={swatch === color} disabled={busy} onClick={() => pick(swatch)} />)}</div>
     <div className="clock-custom-color">
       <input type="color" aria-label="Custom color" value={color} disabled={busy} onChange={(event) => pick(event.target.value)} onBlur={(event) => pick(event.target.value, true)} />
       <input className="clock-hex" aria-label="Hex color" value={hex} spellCheck={false} disabled={busy} onChange={(event) => setHex(event.target.value)} onBlur={() => HEX.test(hex) ? pick(hex, true) : setHex(color)} onKeyDown={(event) => { if (event.key === 'Enter') (event.target as HTMLInputElement).blur(); }} />
     </div>
-    {recent.length ? <div className="clock-recent"><span>Recent</span>{recent.map((swatch) => <button key={swatch} type="button" className={`clock-swatch small ${swatch === color ? 'selected' : ''}`} style={{ background: swatch }} aria-label={`Use ${swatch}`} disabled={busy} onClick={() => pick(swatch)} />)}</div> : null}
+    {recent.length ? <div className="clock-recent"><span>Recent</span>{recent.map((swatch) => <button key={swatch} type="button" className={`clock-swatch small ${swatch === color ? 'selected' : ''}`} style={{ background: FreezeClock.tint(swatch) }} aria-label={`Use ${swatch}`} disabled={busy} onClick={() => pick(swatch)} />)}</div> : null}
   </div>;
 }
 

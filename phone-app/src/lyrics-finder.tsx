@@ -3,7 +3,7 @@ import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, 
 import { ChevronLeft, ChevronRight, Search } from 'lucide-react-native';
 import type { SystemMediaState } from './connection';
 import { guessFields, searchEntries, type EntryFields, type EntryList, type LyricsEntry } from './lyrics';
-import { colors } from './theme';
+import { useStyles, useTheme, type Colors } from './theme';
 
 // The Find lyrics screen, shown in the lyrics details modal: search LRCLIB for a song, see every matching
 // entry with its length and timing, preview one, and use it for this song. The entry Freeze would pick is
@@ -33,6 +33,8 @@ function lengthTag(entry: LyricsEntry): { text: string; good: boolean } | null {
 }
 
 export function LyricsFinder({ media, pickedId, shown, onUse, onAutomatic }: FinderProps) {
+  const { colors } = useTheme();
+  const styles = useStyles(makeStyles);
   const guess = useMemo(() => guessFields({ title: media.title, artist: media.artist }), [media.title, media.artist]);
   const [fields, setFields] = useState<EntryFields>({ song: guess.song, artist: guess.artist });
   const [status, setStatus] = useState<'form' | 'loading' | 'results' | 'error'>('form');
@@ -84,7 +86,7 @@ export function LyricsFinder({ media, pickedId, shown, onUse, onAutomatic }: Fin
         <TextInput value={fields.artist} onChangeText={(artist) => setFields({ ...fields, artist })} onSubmitEditing={() => void search(fields)} returnKeyType="search" autoCorrect={false} spellCheck={false} maxLength={MAX_FIELD} placeholder="Artist" placeholderTextColor={colors.faint} accessibilityLabel="Artist" style={styles.input} />
         <Suggestions values={guess.artists} onPick={(artist) => setFields({ ...fields, artist })} />
         <Pressable onPress={() => void search(fields)} disabled={!fields.song.trim()} accessibilityRole="button" accessibilityLabel="Search LRCLIB" style={({ pressed }) => [styles.primary, pressed && styles.pressed, !fields.song.trim() && styles.disabled]}>
-          <Search size={15} color="#18181b" /><Text style={styles.primaryText}>Search LRCLIB</Text>
+          <Search size={15} color={colors.onAccent} /><Text style={styles.primaryText}>Search LRCLIB</Text>
         </Pressable>
         <Text style={styles.hint}>Searches for the song and artist, then widens if too little is found.</Text>
         {status === 'error' ? <Text accessibilityRole="alert" style={styles.error}>Can’t reach LRCLIB. Check your internet connection, then try again.</Text> : null}
@@ -127,6 +129,7 @@ export function LyricsFinder({ media, pickedId, shown, onUse, onAutomatic }: Fin
 }
 
 function Suggestions({ values, onPick }: { values: string[]; onPick: (value: string) => void }) {
+  const styles = useStyles(makeStyles);
   if (values.length === 0) return null;
   return <View style={styles.chips}>
     {values.map((value) => <Pressable key={value} onPress={() => onPick(value)} accessibilityRole="button" accessibilityLabel={`Use ${value}`} style={({ pressed }) => [styles.chip, pressed && styles.pressed]}><Text style={styles.chipText} numberOfLines={1}>{value}</Text></Pressable>)}
@@ -136,6 +139,7 @@ function Suggestions({ values, onPick }: { values: string[]; onPick: (value: str
 // Everything known about an entry, as tags: what it is, how it fits the song, and what it shares.
 // `plain` leaves out the length and shared-timing tags, for a row whose reason line already says them.
 function Tags({ entry, recommended, closest, inUse, plain }: { entry: LyricsEntry; recommended?: boolean; closest?: boolean; inUse?: boolean; plain?: boolean }) {
+  const styles = useStyles(makeStyles);
   const fit = plain ? null : lengthTag(entry);
   return <View style={styles.tags}>
     {recommended ? <Text style={[styles.tag, styles.tagRecommended]}>Recommended</Text> : null}
@@ -150,6 +154,8 @@ function Tags({ entry, recommended, closest, inUse, plain }: { entry: LyricsEntr
 }
 
 function EntryRow({ entry, recommended, closest, reason, inUse, onPress }: { entry: LyricsEntry; recommended: boolean; closest: boolean; reason?: string; inUse: boolean; onPress: () => void }) {
+  const { colors } = useTheme();
+  const styles = useStyles(makeStyles);
   const subtitle = [entry.artist, entry.album].filter(Boolean).join(' · ');
   return <Pressable onPress={onPress} accessibilityRole="button" accessibilityLabel={`${entry.title}, ${subtitle}${recommended ? ', recommended' : ''}${inUse ? ', in use' : ''}`} style={({ pressed }) => [styles.row, recommended && styles.rowRecommended, pressed && styles.pressed]}>
     <View style={styles.rowTitle}>
@@ -164,6 +170,8 @@ function EntryRow({ entry, recommended, closest, reason, inUse, onPress }: { ent
 
 // The entry's first lines and where it starts and ends, before it is used.
 function Preview({ entry, media, inUse, onBack, onUse }: { entry: LyricsEntry; media: SystemMediaState; inUse: boolean; onBack: () => void; onUse: () => void }) {
+  const { colors } = useTheme();
+  const styles = useStyles(makeStyles);
   const gap = entry.lengthGapS === undefined ? null : Math.round(Math.abs(entry.lengthGapS));
   const fit = !media.durationMs ? null
     : entry.overruns ? 'These lyrics run past the end of your song, so their timing belongs to a longer cut.'
@@ -195,7 +203,7 @@ function Preview({ entry, media, inUse, onBack, onUse }: { entry: LyricsEntry; m
   </>;
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: Colors) => StyleSheet.create({
   scroll: { flex: 1, minHeight: 0 },
   content: { padding: 16, gap: 10 },
   playing: { color: colors.faint, fontSize: 12, lineHeight: 16 },
@@ -212,9 +220,9 @@ const styles = StyleSheet.create({
   chips: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
   chip: { maxWidth: '100%', paddingHorizontal: 9, paddingVertical: 5, borderRadius: 8, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panelRaised },
   chipText: { color: colors.text, fontSize: 12, fontWeight: '500' },
-  primary: { height: 41, borderRadius: 5, backgroundColor: '#e4e4e7', flexDirection: 'row', gap: 7, alignItems: 'center', justifyContent: 'center', marginTop: 2 },
-  primaryText: { color: '#18181b', fontSize: 14, fontWeight: '600' },
-  secondary: { height: 38, borderRadius: 5, borderWidth: 1, borderColor: '#3f3f46', backgroundColor: colors.panelRaised, alignItems: 'center', justifyContent: 'center' },
+  primary: { height: 41, borderRadius: 5, backgroundColor: colors.accent, flexDirection: 'row', gap: 7, alignItems: 'center', justifyContent: 'center', marginTop: 2 },
+  primaryText: { color: colors.onAccent, fontSize: 14, fontWeight: '600' },
+  secondary: { height: 38, borderRadius: 5, borderWidth: 1, borderColor: colors.borderStrong, backgroundColor: colors.panelRaised, alignItems: 'center', justifyContent: 'center' },
   secondaryText: { color: colors.text, fontSize: 13, fontWeight: '500' },
   textButton: { minHeight: 36, alignItems: 'center', justifyContent: 'center' },
   textButtonText: { color: colors.muted, fontSize: 13, fontWeight: '500' },
@@ -225,17 +233,17 @@ const styles = StyleSheet.create({
   queryCopy: { flex: 1, minWidth: 0, gap: 3 },
   queryTitle: { color: colors.text, fontSize: 14, fontWeight: '600' },
   row: { padding: 12, gap: 6, borderWidth: 1, borderColor: colors.border, borderRadius: 7, backgroundColor: colors.panel },
-  rowRecommended: { backgroundColor: '#111a14', borderColor: '#28392d' },
+  rowRecommended: { backgroundColor: colors.goodBg, borderColor: colors.goodBorder },
   rowTitle: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   rowName: { flex: 1, color: colors.text, fontSize: 14, fontWeight: '600' },
   rowSub: { color: colors.muted, fontSize: 12 },
   reason: { color: colors.mint, fontSize: 12, lineHeight: 15 },
   tags: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
   tag: { overflow: 'hidden', paddingHorizontal: 7, paddingVertical: 3, borderRadius: 5, borderWidth: 1, borderColor: colors.border, color: colors.muted, fontSize: 11, fontWeight: '500' },
-  tagRecommended: { backgroundColor: colors.mint, borderColor: colors.mint, color: '#052e16', fontWeight: '700' },
-  tagInUse: { backgroundColor: colors.accent, borderColor: colors.accent, color: '#18181b', fontWeight: '700' },
-  tagGood: { borderColor: '#28392d', color: colors.mint },
-  tagWarn: { borderColor: '#4a3f10', color: '#eab308' },
+  tagRecommended: { backgroundColor: colors.mint, borderColor: colors.mint, color: colors.onMint, fontWeight: '700' },
+  tagInUse: { backgroundColor: colors.accent, borderColor: colors.accent, color: colors.onAccent, fontWeight: '700' },
+  tagGood: { borderColor: colors.goodBorder, color: colors.mint },
+  tagWarn: { borderColor: colors.warnBorder, color: colors.warn },
   back: { flexDirection: 'row', alignItems: 'center', gap: 2, alignSelf: 'flex-start', minHeight: 32 },
   backText: { color: colors.muted, fontSize: 13, fontWeight: '500' },
   lyricRow: { flexDirection: 'row', gap: 10, alignItems: 'baseline' },

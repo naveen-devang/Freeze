@@ -58,6 +58,8 @@ const STORAGE_KEY = 'freeze.pc-connection';
 const PAIRED_KEY = 'freeze.pc-connections';
 const LEGACY_STORAGE_KEY = 'decklink.pc-connection';
 const MAX_RECONNECT_ATTEMPTS = 3;
+// Some phones (iPhones especially) let a connection to an address nobody answers hang for over a minute.
+const CONNECT_TIMEOUT_MS = 8000;
 const DECK_CACHE_KEY = 'freeze.deck-snapshot';
 const DEVICE_SELECTION_KEY = 'freeze.device-navigation';
 const LEGACY_SOURCE_KEY = 'freeze.legacy-import-source';
@@ -203,6 +205,12 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
   const widgetSurfaceRef = useRef<WidgetSurface | null>(null);
   const pendingRequestsRef = useRef(new Set<string>());
   const openConnectionRef = useRef<((next: PcConnection, retrying: boolean) => void) | null>(null);
+  // Resolves once the saved pairings are loaded. A pairing link can open the app before that, and `connect` must not run first.
+  const [restored] = useState(() => {
+    let done = () => {};
+    const promise = new Promise<void>((resolve) => { done = resolve; });
+    return { promise, done: () => done() };
+  });
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptRef = useRef(0);
   const shouldReconnectRef = useRef(false);
@@ -298,6 +306,16 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
     try {
       const socket = new WebSocket(websocketUrl(next));
       socketRef.current = socket;
+      let opened = false;
+      const giveUp = setTimeout(() => {
+        if (opened || socketRef.current !== socket) return;
+        socketRef.current = null;
+        try { socket.close(); } catch { /* it never opened */ }
+        setPcStatsSender(null);
+        pendingRequestsRef.current.clear();
+        if (shouldReconnectRef.current) retry();
+        else if (!terminalErrorRef.current) setStatus('disconnected');
+      }, CONNECT_TIMEOUT_MS);
       void Storage.getItem(`${DECK_CACHE_KEY}.${connectionId(next)}`).then((saved) => {
         if (socketRef.current !== socket || !saved) return;
         try {
@@ -308,6 +326,8 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
         }
       });
       socket.onopen = () => {
+        opened = true;
+        clearTimeout(giveUp);
         void Promise.all([legacyDeckForPairing(next), Storage.getItem(`${DEVICE_SELECTION_KEY}.${connectionId(next)}`)]).then(([legacyDeck, savedSelection]) => {
           let selection: { profileId: string; pageId: string } | null = null;
           try {
@@ -445,6 +465,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
         if (socketRef.current === socket) setStatus('error');
       };
       socket.onclose = () => {
+        clearTimeout(giveUp);
         if (socketRef.current !== socket) return;
         socketRef.current = null;
         setPcStatsSender(null);
@@ -501,7 +522,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
         void SecureStore.deleteItemAsync(LEGACY_STORAGE_KEY);
       }
     };
-    void restore();
+    void restore().finally(() => restored.done());
     return () => {
       active = false;
       shouldReconnectRef.current = false;
@@ -510,9 +531,10 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
       socketRef.current?.close();
       socketRef.current = null;
     };
-  }, [openConnection, persistPairedDevices]);
+  }, [openConnection, persistPairedDevices, restored]);
 
   const connect = useCallback(async (next: PcConnection) => {
+    await restored.promise;
     const device = { ...next, deviceName: next.deviceName?.trim() || next.host };
     openConnection(device);
     const updated = [device, ...pairedDevicesRef.current.filter((item) => connectionId(item) !== connectionId(device))];
@@ -520,7 +542,7 @@ export function ConnectionProvider({ children }: PropsWithChildren) {
       persistPairedDevices(updated),
       SecureStore.setItemAsync(STORAGE_KEY, JSON.stringify(device)),
     ]);
-  }, [openConnection, persistPairedDevices]);
+  }, [openConnection, persistPairedDevices, restored]);
 
   const disconnect = useCallback(async () => {
     pendingRequestsRef.current.clear();

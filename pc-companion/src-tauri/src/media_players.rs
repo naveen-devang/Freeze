@@ -144,6 +144,14 @@ pub(super) fn single_player(source_app_id: Option<&str>, state: PlaybackState, t
     }
 }
 
+/// Chromium browsers add a per-user hash to their app id ("Helium.EXT476RSTCBNKLTWZBCGD673S4", "Vivaldi.EXT476…"),
+/// and Opera adds a number. That tail is not a name.
+fn looks_like_hash(part: &str) -> bool {
+    part.len() >= 8
+        && (part.chars().all(|c| c.is_ascii_digit())
+            || (part.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) && part.chars().any(|c| c.is_ascii_digit())))
+}
+
 /// A readable name for an app id: "Spotify.exe" and "SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify" are Spotify,
 /// "com.google.Chrome" is Chrome. Unknown apps get their file or package name with a capital letter.
 pub(super) fn friendly_name(app_id: &str) -> String {
@@ -151,6 +159,7 @@ pub(super) fn friendly_name(app_id: &str) -> String {
         ("spotify", "Spotify"),
         ("msedge", "Microsoft Edge"),
         ("microsoftedge", "Microsoft Edge"),
+        ("chromecanary", "Chrome Canary"),
         ("chrome", "Chrome"),
         ("firefox", "Firefox"),
         ("brave", "Brave"),
@@ -184,7 +193,11 @@ pub(super) fn friendly_name(app_id: &str) -> String {
     name = name.rsplit(['\\', '/']).next().unwrap_or(name);
     let name = name.strip_suffix(".exe").or_else(|| name.strip_suffix(".EXE")).unwrap_or(name);
     let name = name.split('_').next().unwrap_or(name);
-    let name = name.rsplit('.').next().unwrap_or(name).trim();
+    let mut parts: Vec<&str> = name.split('.').collect();
+    while parts.len() > 1 && parts.last().is_some_and(|part| looks_like_hash(part)) {
+        parts.pop();
+    }
+    let name = parts.last().copied().unwrap_or(name).trim();
     let mut characters = name.chars();
     match characters.next() {
         Some(first) => first.to_uppercase().chain(characters).take(24).collect(),
@@ -212,6 +225,13 @@ mod tests {
         assert_eq!(friendly_name("Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic"), "Media Player");
         assert_eq!(friendly_name("com.apple.Music"), "Music");
         assert_eq!(friendly_name("com.google.Chrome"), "Chrome");
+        // Chromium browsers tag their id with a per-user hash, which must not become the name.
+        assert_eq!(friendly_name("Helium.EXT476RSTCBNKLTWZBCGD673S4"), "Helium");
+        assert_eq!(friendly_name("ChromeCanary.EXT476RSTCBNKLTWZBCGD673S4"), "Chrome Canary");
+        assert_eq!(friendly_name("Vivaldi.EXT476RSTCBNKLTWZBCGD673S4"), "Vivaldi");
+        assert_eq!(friendly_name("OperaSoftware.OperaWebBrowser.1781555376"), "Opera");
+        assert_eq!(friendly_name("TheBrowserCompany.Arc_ttt1ap7aakyb4!Arc"), "Arc");
+        assert_eq!(friendly_name("Some.Vendor.AwesomePlayer.ABCD1234EFGH"), "AwesomePlayer");
         assert_eq!(friendly_name("C:\\Tools\\fooplayer.exe"), "Fooplayer");
         assert_eq!(friendly_name("Some.Vendor.AwesomePlayer_abc123!App"), "App");
         assert_eq!(friendly_name("Some.Vendor.AwesomePlayer"), "AwesomePlayer");

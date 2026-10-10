@@ -3,7 +3,7 @@ import { AppState, Pressable, StyleSheet, Text, View } from 'react-native';
 import Storage from 'expo-sqlite/kv-store';
 import * as Brightness from 'expo-brightness';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
-import { colors } from './theme';
+import { setThemeMode, useStyles, useThemeMode, type Colors, type ThemeMode } from './theme';
 
 // The screen is a deck's biggest power draw. These settings decide whether the deck keeps it on and
 // whether it dims when nobody is touching it. (Expo Go keeps the screen on while developing anyway.)
@@ -86,6 +86,7 @@ export function useDeckScreenPower() {
 }
 
 function Choice<T extends string | number | boolean>({ options, value, onChange }: { options: [T, string][]; value: T; onChange: (value: T) => void }) {
+  const styles = useStyles(makeStyles);
   return <View style={styles.segments}>
     {options.map(([option, label]) => <Pressable key={String(option)} style={[styles.segment, option === value && styles.segmentActive]} onPress={() => onChange(option)} accessibilityRole="button" accessibilityState={{ selected: option === value }}>
       <Text style={[styles.segmentText, option === value && styles.segmentTextActive]}>{label}</Text>
@@ -93,8 +94,21 @@ function Choice<T extends string | number | boolean>({ options, value, onChange 
   </View>;
 }
 
+/** The Appearance section of the settings tab: light, dark, or this phone's own setting. */
+export function AppearanceSection() {
+  const styles = useStyles(makeStyles);
+  const mode = useThemeMode();
+  const options: [ThemeMode, string][] = [['light', 'Light'], ['dark', 'Dark'], ['system', 'System']];
+  return <View style={styles.card}>
+    <Text style={styles.title}>Appearance</Text>
+    <Choice options={options} value={mode} onChange={setThemeMode} />
+    <Text style={styles.hint}>{"System follows this phone's setting. Your PC has its own."}</Text>
+  </View>;
+}
+
 /** The Screen section of the settings tab. */
 export function ScreenSettingsSection() {
+  const styles = useStyles(makeStyles);
   const { keepAwake, dimAfterMin } = useScreenSettings();
   return <View style={styles.card}>
     <Text style={styles.title}>Screen</Text>
@@ -106,7 +120,7 @@ export function ScreenSettingsSection() {
   </View>;
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: Colors) => StyleSheet.create({
   card: { marginTop: 14, padding: 12, borderWidth: 1, borderColor: colors.border, borderRadius: 7, backgroundColor: colors.panel },
   title: { color: colors.text, fontSize: 13, fontWeight: '500' },
   label: { color: colors.muted, fontSize: 12, marginTop: 11 },

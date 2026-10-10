@@ -65,7 +65,9 @@ export function lyricsLayout(width: number, height: number) {
 }
 
 // Apple Music-style falloff: the active line is solid, neighbours fade with distance.
-export const lyricLineOpacity = (distance: number) => [1, 0.35, 0.27, 0.21][distance] ?? 0.15;
+// Near lines stay readable and far ones fade. Dark ink on a light screen fades to a pale grey long before light ink on a
+// dark screen fades to a dim one, so the light look keeps its lines stronger.
+export const lyricLineOpacity = (distance: number, light = false) => (light ? [1, 0.55, 0.45, 0.36][distance] ?? 0.28 : [1, 0.35, 0.27, 0.21][distance] ?? 0.15);
 
 // Unicode clean-up: one form for accents and full-width characters, no invisible characters, single spaces.
 export function normalizeText(text: string): string {

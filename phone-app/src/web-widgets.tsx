@@ -6,7 +6,8 @@ import { CLOCK_FACES_SOURCE } from './clock-faces-source';
 import { PC_STATS_SOURCE } from './pc-stats-source';
 import { pcStatsHistory, setLayerNeeds, subscribePcStats, validNeeds } from './pc-stats-feed';
 import { countWakes, WAKE_COUNTER_JS } from './perf-overlay';
-import { colors } from './theme';
+import { useTheme } from './theme';
+import { darkColors } from './theme-colors';
 import { WEB_FONT_LOADS, WEB_FONTS_CSS } from './web-fonts-source';
 import { initialState, step, type Event, type State, type TimerKind } from './web-widget-lifecycle';
 import { widgetPageHtml } from './web-widgets-page';
@@ -18,7 +19,7 @@ export type WebWidget = { id: string; x: number; y: number; width: number; heigh
 );
 
 // The page is built once; a stable source object keeps the WebView from reloading on re-render.
-const SOURCE = { html: widgetPageHtml({ wakeCounterJs: WAKE_COUNTER_JS, background: colors.panel, clockFaces: CLOCK_FACES_SOURCE, pcStats: PC_STATS_SOURCE, fontsCss: WEB_FONTS_CSS, fontLoads: WEB_FONT_LOADS }) };
+const SOURCE = { html: widgetPageHtml({ wakeCounterJs: WAKE_COUNTER_JS, background: darkColors.panel, clockFaces: CLOCK_FACES_SOURCE, pcStats: PC_STATS_SOURCE, fontsCss: WEB_FONTS_CSS, fontLoads: WEB_FONT_LOADS }) };
 
 let nextLayer = 0;
 
@@ -41,6 +42,12 @@ export function WebWidgetLayer({ widgets, focused = true }: { widgets: WebWidget
   const list = JSON.stringify(widgets);
   const hasWidgets = widgets.length > 0;
   const hasStats = widgets.some((widget) => widget.kind === 'stats');
+  const { colors, scheme } = useTheme();
+  // The page is told the look before its first widgets, and again when it changes (`freezeTheme` in web-widgets-page.ts).
+  const themeCall = `window.freezeTheme(${JSON.stringify(scheme)}, ${JSON.stringify(colors.panel)});`;
+  const themeCallRef = useRef(themeCall);
+  // Declared before the effects that send, so a send always carries the latest look.
+  useEffect(() => { themeCallRef.current = themeCall; }, [themeCall]);
 
   const dispatchRef = useRef<(event: Event) => void>(() => {});
   const dispatch = useCallback((event: Event) => {
@@ -49,7 +56,7 @@ export function WebWidgetLayer({ widgets, focused = true }: { widgets: WebWidget
     for (const command of commands) {
       switch (command.type) {
         case 'send':
-          webView.current?.injectJavaScript(`window.freezeWidgets(${command.list}, ${command.hour12}, ${command.force}, ${command.seq});true;`);
+          webView.current?.injectJavaScript(`${themeCallRef.current}window.freezeWidgets(${command.list}, ${command.hour12}, ${command.force}, ${command.seq});true;`);
           break;
         case 'pause':
           webView.current?.injectJavaScript(`FreezeClock.setPaused(${command.paused});true;`);
@@ -79,6 +86,7 @@ export function WebWidgetLayer({ widgets, focused = true }: { widgets: WebWidget
     const subscription = AppState.addEventListener('change', (next) => dispatch({ type: 'app', active: next === 'active' }));
     return () => subscription.remove();
   }, [dispatch]);
+  useEffect(() => { if (view.mounted && view.ready) webView.current?.injectJavaScript(`${themeCall}true;`); }, [themeCall, view.mounted, view.ready]);
   // Leaving the screen frees the WebView and withdraws this layer's stats needs.
   useEffect(() => () => dispatch({ type: 'unmount' }), [dispatch]);
 

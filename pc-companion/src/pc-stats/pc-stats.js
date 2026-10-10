@@ -88,7 +88,7 @@ function reason(k) {
 }
 const num = (k, v = val(k)) => (!has(v) ? '–' : M[k].rate ? rateText(v) : M[k].dec ? v.toFixed(M[k].dec) : String(Math.round(v)));
 const frac = (k, v = val(k)) => (has(v) ? clamp(v / maxOf(k), 0, 1) : 0);
-const tone = (k, v = val(k)) => (M[k].temp && has(v) ? (v >= 85 ? '#e5484d' : v >= 70 ? '#f5a524' : '#46a758') : 'var(--accent)');
+const tone = (k, v = val(k)) => (M[k].temp && has(v) ? (v >= 85 ? 'var(--hot)' : v >= 70 ? 'var(--warm)' : 'var(--ok)') : 'var(--accent)');
 // The current reading as HTML; a given `v` is a past value (graph min/avg/max) and gets no reason text.
 const html = (k, v) => {
   const current = v === undefined;
@@ -600,7 +600,7 @@ function resolve(id, columns, rows) {
   return style;
 }
 
-const CSS = `.ps-root{--fg:#ececef;--muted:#a1a1aa;--faint:#63636d;--line:#24252b;--track:#202127;position:relative;overflow:hidden;color:var(--fg);font-family:"IBM Plex Sans","Segoe UI",system-ui,sans-serif;font-variant-numeric:tabular-nums;contain:strict}
+const CSS = `.ps-root{--fg:#ececef;--muted:#a1a1aa;--faint:#63636d;--line:#24252b;--track:#202127;--ok:#46a758;--warm:#f5a524;--hot:#e5484d;position:relative;overflow:hidden;color:var(--fg);font-family:"IBM Plex Sans","Segoe UI",system-ui,sans-serif;font-variant-numeric:tabular-nums;contain:strict}
 .ps-root *{box-sizing:border-box}
 .ps-root .abs{position:absolute;inset:0;display:block;overflow:visible}
 .ps-root .lbl{font-family:"IBM Plex Mono",ui-monospace,Consolas,monospace;font-weight:500;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);line-height:1.34;white-space:nowrap}
@@ -633,6 +633,59 @@ const CSS = `.ps-root{--fg:#ececef;--muted:#a1a1aa;--faint:#63636d;--line:#24252
 .ps-root .cbar i{position:absolute;inset:0;border-radius:4px;background:var(--accent);transform:translateY(100%);transition:transform .8s cubic-bezier(.2,.8,.2,1)}
 .ps-root.ps-still *{transition:none!important}
 @media (prefers-reduced-motion:reduce){.ps-root *{transition:none!important}}`;
+// --- Themes. Dark is the original look. The widget's own variables are set on its root, so a theme change is a
+// handful of style updates, not a redraw.
+const THEMES = {
+  dark: { fg: '#ececef', muted: '#a1a1aa', faint: '#63636d', line: '#24252b', track: '#202127', ok: '#46a758', warm: '#f5a524', hot: '#e5484d' },
+  light: { fg: '#18181b', muted: '#52525b', faint: '#6b6b76', line: '#e0e0e6', track: '#e4e4ea', ok: '#22c55e', warm: '#f59e0b', hot: '#ef4444' },
+};
+let theme = 'dark';
+const shown = new Set();
+const lum = (hex) => {
+  const n = parseInt(hex.slice(1), 16), f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; };
+  return 0.2126 * f(n >> 16 & 255) + 0.7152 * f(n >> 8 & 255) + 0.0722 * f(n & 255);
+};
+function hslOf(hex) {
+  const n = parseInt(hex.slice(1), 16), r = (n >> 16 & 255) / 255, g = (n >> 8 & 255) / 255, b = (n & 255) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2;
+  if (max === min) return [0, 0, l * 100];
+  const d = max - min, s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  const h = max === r ? (g - b) / d + (g < b ? 6 : 0) : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return [h * 60, s * 100, l * 100];
+}
+function hexOf(h, s, l) {
+  s /= 100; l /= 100;
+  const k = (n) => (n + h / 30) % 12, a = s * Math.min(l, 1 - l), ch = (n) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  return '#' + [ch(0), ch(8), ch(4)].map((v) => Math.round(v * 255).toString(16).padStart(2, '0')).join('');
+}
+// How bright a color may stay on a light plate depends on its hue: a yellow is bright at the luminance where a blue
+// already looks dark. These are the luminances good light UIs give each hue (blue about 0.24, pink 0.22, orange 0.30,
+// green 0.40, yellow 0.46), blended between the anchors, so every color the user picks comes out vivid, not muddy.
+const CAPS = [[0, 0.2], [20, 0.24], [35, 0.3], [50, 0.4], [60, 0.46], [85, 0.46], [110, 0.42], [150, 0.4], [180, 0.36], [200, 0.3], [225, 0.24], [255, 0.19], [285, 0.19], [320, 0.22], [345, 0.22], [360, 0.2]];
+function capFor(h) {
+  h = ((h % 360) + 360) % 360;
+  for (let i = 1; i < CAPS.length; i++) if (h <= CAPS[i][0]) { const [h0, c0] = CAPS[i - 1], [h1, c1] = CAPS[i]; return c0 + (c1 - c0) * (h - h0) / (h1 - h0); }
+  return CAPS[CAPS.length - 1][1];
+}
+// The picked color on a light tile without turning to mud: its own hue, a little more saturation (never neon), and
+// the yellow-green band leaning toward gold as it darkens.
+function readable(hex) {
+  if (theme !== 'light') return hex;
+  let [h, sat, l] = hslOf(hex);
+  const cap = capFor(h);
+  if (h >= 46 && h <= 72) h -= 10;
+  if (sat > 15) sat = Math.min(92, sat + 8);
+  else if (l > 50) l = 100 - l; // white and pale greys become dark ink
+  while (l > 6 && lum(hexOf(h, sat, l)) > cap) l -= 1;
+  return hexOf(h, sat, l);
+}
+function styleRoot(entry) {
+  const { root, color, background } = entry;
+  for (const [key, value] of Object.entries(THEMES[theme])) root.style.setProperty(`--${key}`, value);
+  root.style.setProperty('--accent', readable(color || '#93c5fd'));
+  root.style.background = background || '';
+}
+
 function injectCss() {
   if (typeof document === 'undefined' || document.getElementById('freeze-pc-stats-css')) return;
   const style = document.createElement('style'); style.id = 'freeze-pc-stats-css'; style.textContent = CSS; document.head.append(style);
@@ -647,13 +700,16 @@ function mount(host, { style, metric, color, gpu, background, still = false, wid
   injectCss();
   const root = document.createElement('div');
   root.className = still ? 'ps-root ps-still' : 'ps-root';
-  root.style.cssText = `width:${width}px;height:${height}px;--accent:${color || '#93c5fd'}${background ? `;background:${background}` : ''}`;
+  root.style.cssText = `width:${width}px;height:${height}px`;
+  const entry = { root, color, background };
+  styleRoot(entry);
+  shown.add(entry);
   host.replaceChildren(root);
   const draw = resolve(style, columns, rows).build(root, width, height, M[metric] ? metric : 'cpu');
   const update = () => { CTX.gpu = gpu || 'auto'; draw(); };
   update();
   mounted.add(update);
-  return { destroy() { mounted.delete(update); root.remove(); } };
+  return { destroy() { mounted.delete(update); shown.delete(entry); root.remove(); } };
 }
 const redraw = () => mounted.forEach((update) => update());
 
@@ -665,6 +721,11 @@ globalThis.FreezeStats = {
   setHistory(samples) { history = Array.isArray(samples) ? samples.slice(-N) : []; redraw(); },
   push(sample) { history.push(sample); if (history.length > N) history.shift(); redraw(); },
   latest: () => history[history.length - 1] || null,
+  // 'light' or 'dark'. `background` is the tile color behind widgets that were mounted with one (the phone's).
+  setTheme(value, background) {
+    theme = value === 'light' ? 'light' : 'dark';
+    for (const entry of shown) { if (entry.background && background) entry.background = background; styleRoot(entry); }
+  },
   mount,
 };
 })();

@@ -7,12 +7,12 @@ use std::sync::{
     Arc, RwLock,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        ConnectInfo, State,
     },
     response::IntoResponse,
     routing::get,
@@ -34,6 +34,7 @@ mod icon_png;
 mod media_players;
 mod pc_stats;
 mod system_media;
+mod usb_pair;
 #[cfg(windows)]
 mod win_apps;
 #[cfg(windows)]
@@ -69,6 +70,10 @@ struct AppState {
     active_devices: AtomicUsize,
     server_online: AtomicBool,
     android_usb_enabled: AtomicBool,
+    /// Phones connected through the USB cable (they reach this PC from its own loopback address).
+    usb_clients: AtomicUsize,
+    usb_panel: RwLock<UsbPanel>,
+    usb_retry: AtomicBool,
     session_epoch: AtomicUsize,
     widget_surface: RwLock<Option<WidgetSurface>>,
 }
@@ -119,6 +124,15 @@ enum PlaybackState {
     Unavailable,
 }
 
+/// What the USB tab shows: `status` is one of off, no_adb, no_phone, unauthorized, error, pairing, connected, idle, failed.
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UsbPanel {
+    status: String,
+    phone: String,
+    detail: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ConnectionInfo {
@@ -130,6 +144,7 @@ struct ConnectionInfo {
     server_online: bool,
     is_macos: bool,
     android_usb_enabled: bool,
+    android_usb: UsbPanel,
     widget_surface: Option<WidgetSurface>,
 }
 
@@ -1911,6 +1926,7 @@ fn connection_info(state: tauri::State<'_, Arc<AppState>>) -> ConnectionInfo {
         server_online: state.server_online.load(Ordering::Relaxed),
         is_macos: IS_MACOS,
         android_usb_enabled: state.android_usb_enabled.load(Ordering::Relaxed),
+        android_usb: state.usb_panel.read().map(|panel| panel.clone()).unwrap_or_default(),
         widget_surface: state.widget_surface.read().ok().and_then(|surface| *surface),
     }
 }
@@ -2777,10 +2793,10 @@ fn rotate_pairing_key(state: tauri::State<'_, Arc<AppState>>) -> Result<(), Stri
     Ok(())
 }
 
-fn ensure_android_usb_reverse() -> Result<(), String> {
+fn ensure_android_usb_reverse() -> Result<usb_pair::Phone, String> {
     let adb = adb::find().ok_or_else(|| adb::MISSING.to_owned())?;
     let timeout = Duration::from_secs(15);
-    let devices = adb::run(&adb, &["devices"], timeout).map_err(|error| {
+    let devices = adb::run(&adb, &["devices", "-l"], timeout).map_err(|error| {
         // A vanished or stuck adb is looked up again next time.
         adb::forget();
         error
@@ -2788,35 +2804,13 @@ fn ensure_android_usb_reverse() -> Result<(), String> {
     if !devices.status.success() {
         return Err("Android Debug Bridge could not list connected devices".into());
     }
-    let output = String::from_utf8_lossy(&devices.stdout);
-    let states: Vec<&str> = output
-        .lines()
-        .skip(1)
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| line.split_whitespace().nth(1))
-        .collect();
-    if states.iter().any(|state| *state == "unauthorized") {
-        return Err("Unlock your Android phone and allow USB debugging for this PC".into());
-    }
-    if states.iter().any(|state| *state == "no") {
-        return Err("This PC is not allowed to use the phone over USB. On Linux, add a udev rule for the phone".into());
-    }
-    if states.iter().any(|state| *state == "offline") {
-        return Err("The phone is not responding. Unplug it, plug it in again and unlock it".into());
-    }
-    if states.len() > 1 {
-        return Err("Connect only one Android phone by USB at a time".into());
-    }
-    let authorized = states.iter().filter(|state| **state == "device").count();
-    if authorized == 0 {
-        return Err("Connect one Android phone by USB and turn on USB debugging".into());
-    }
+    let phone = usb_pair::parse_devices(&String::from_utf8_lossy(&devices.stdout))?;
     let forwards = adb::run(&adb, &["reverse", "--list"], timeout)
         .map_err(|_| "Android Debug Bridge could not check USB forwarding".to_owned())?;
     if forwards.status.success()
         && String::from_utf8_lossy(&forwards.stdout).contains("tcp:39421 tcp:39421")
     {
-        return Ok(());
+        return Ok(phone);
     }
     let reverse = adb::run(&adb, &["reverse", "tcp:39421", "tcp:39421"], timeout)
         .map_err(|_| "Android Debug Bridge could not configure USB forwarding".to_owned())?;
@@ -2828,7 +2822,70 @@ fn ensure_android_usb_reverse() -> Result<(), String> {
             detail.trim().to_owned()
         });
     }
-    Ok(())
+    Ok(phone)
+}
+
+/// Keeps the USB cable working: forwards the port, and hands the pairing to a trusted phone that is not connected.
+fn run_usb_monitor(state: Arc<AppState>) {
+    let mut pairing = usb_pair::Pairing::default();
+    let mut last_error = String::new();
+    let show = |status: &str, phone: &str, detail: &str| {
+        if let Ok(mut panel) = state.usb_panel.write() {
+            *panel = UsbPanel { status: status.to_owned(), phone: phone.to_owned(), detail: detail.to_owned() };
+        }
+    };
+    loop {
+        thread::sleep(Duration::from_secs(3));
+        if !state.android_usb_enabled.load(Ordering::Relaxed) {
+            show("off", "", "");
+            continue;
+        }
+        let phone = match ensure_android_usb_reverse() {
+            Ok(phone) => phone,
+            Err(error) => {
+                pairing.lost();
+                last_error.clear();
+                let status = if error == adb::MISSING {
+                    "no_adb"
+                } else if error.contains("allow USB debugging") {
+                    "unauthorized"
+                } else if error.starts_with("Connect one") {
+                    "no_phone"
+                } else {
+                    "error"
+                };
+                show(status, "", if status == "error" { &error } else { "" });
+                if error == adb::MISSING {
+                    // No adb on this PC: searching for it spawns processes, so look again in 30 s, not 3.
+                    thread::sleep(Duration::from_secs(27));
+                }
+                continue;
+            }
+        };
+        let now = Instant::now();
+        if state.usb_retry.swap(false, Ordering::Relaxed) {
+            pairing.retry(now);
+            last_error.clear();
+        }
+        let connected = state.usb_clients.load(Ordering::Relaxed) > 0;
+        if pairing.should_send(&phone.serial, connected, now) {
+            let token = state.token.read().map(|token| token.clone()).unwrap_or_default();
+            let link = usb_pair::pair_link(&state.host, PORT, &token, &state.device_name);
+            last_error = match adb::find().ok_or_else(|| adb::MISSING.to_owned()).and_then(|adb| usb_pair::send_link(&adb, &phone.serial, &link)) {
+                Ok(()) => String::new(),
+                Err(error) => error,
+            };
+        }
+        if connected {
+            last_error.clear();
+        }
+        show(pairing.status(connected, now), &phone.model, &last_error);
+    }
+}
+
+#[tauri::command]
+fn retry_android_usb(state: tauri::State<'_, Arc<AppState>>) {
+    state.usb_retry.store(true, Ordering::Relaxed);
 }
 
 #[tauri::command]
@@ -2897,14 +2954,17 @@ fn load_or_create_pairing_key(path: &Path) -> Result<String, String> {
 
 async fn upgrade_socket(
     ws: WebSocketUpgrade,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
+    // A phone on the USB cable arrives through adb's port forward, so it looks like it is on this PC.
+    let over_usb = peer.ip().is_loopback();
     ws.max_message_size(MAX_DECK_CONFIG_BYTES + 65_536)
         .max_frame_size(MAX_DECK_CONFIG_BYTES + 65_536)
-        .on_upgrade(move |socket| handle_socket(socket, state))
+        .on_upgrade(move |socket| handle_socket(socket, state, over_usb))
 }
 
-async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
+async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, over_usb: bool) {
     let mut authenticated = false;
     // 1: phones that know buttons and widget areas only. 2: phones that draw widgets on the page grid and open folders.
     let mut protocol: u32 = 1;
@@ -3186,6 +3246,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                 authenticated = true;
                 session_epoch = state.session_epoch.load(Ordering::Relaxed);
                 state.active_devices.fetch_add(1, Ordering::Relaxed);
+                if over_usb {
+                    state.usb_clients.fetch_add(1, Ordering::Relaxed);
+                }
                 if legacy_deck_available {
                     if let Some(source_id) =
                         requested_source_id.filter(|id| valid_id(id) && id.len() <= 56)
@@ -3669,6 +3732,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     }
     if authenticated {
         state.active_devices.fetch_sub(1, Ordering::Relaxed);
+        if over_usb {
+            state.usb_clients.fetch_sub(1, Ordering::Relaxed);
+        }
     }
     // This phone no longer needs any readings.
     state.pc_stats_demand.remove(connection_id);
@@ -4341,24 +4407,67 @@ async fn serve(state: Arc<AppState>) {
         }
     };
     state.server_online.store(true, Ordering::Relaxed);
-    if let Err(error) = axum::serve(listener, app).await {
+    if let Err(error) = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await {
         eprintln!("Freeze connection server stopped: {error}");
         state.server_online.store(false, Ordering::Relaxed);
     }
 }
 
-/// Pins the native window to the dark appearance. `"theme": "Dark"` only sets the app-wide
-/// appearance, and macOS kept drawing the title bar and sidebar material light on some Macs;
-/// the window's own appearance overrides both the app and the system setting.
+/// Pins the native window to the chosen appearance. `window.set_theme` only sets the app-wide appearance, and
+/// macOS kept drawing the title bar and sidebar material in the other one on some Macs; the window's own
+/// appearance overrides both the app and the system setting. System leaves the window to follow the Mac.
 #[cfg(target_os = "macos")]
-fn force_dark_window(window: &tauri::WebviewWindow) {
-    use objc2_app_kit::{NSAppearance, NSAppearanceCustomization, NSAppearanceNameDarkAqua, NSWindow};
+fn force_window_appearance(window: &tauri::WebviewWindow, mode: &str) {
+    use objc2_app_kit::{NSAppearance, NSAppearanceCustomization, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSWindow};
     let Ok(pointer) = window.ns_window() else { return };
-    // SAFETY: Tauri returns the live NSWindow, and setup runs on the main thread.
+    // SAFETY: Tauri returns the live NSWindow, and this runs on the main thread (setup, or a command that is not async).
     unsafe {
         let ns_window = &*(pointer as *const NSWindow);
-        ns_window.setAppearance(NSAppearance::appearanceNamed(NSAppearanceNameDarkAqua).as_deref());
+        let appearance = match mode {
+            "light" => NSAppearance::appearanceNamed(NSAppearanceNameAqua),
+            "dark" => NSAppearance::appearanceNamed(NSAppearanceNameDarkAqua),
+            _ => None,
+        };
+        ns_window.setAppearance(appearance.as_deref());
     }
+}
+
+/// "light", "dark", or "system" for anything else: the same three words the app's Appearance setting uses.
+fn clean_appearance(mode: &str) -> &'static str {
+    match mode.trim() {
+        "light" => "light",
+        "dark" => "dark",
+        _ => "system",
+    }
+}
+
+/// Gives the native window (title bar, and on a Mac the sidebar material) the chosen look.
+fn apply_appearance(window: &tauri::WebviewWindow, mode: &str) {
+    let theme = match mode {
+        "light" => Some(tauri::Theme::Light),
+        "dark" => Some(tauri::Theme::Dark),
+        _ => None,
+    };
+    let _ = window.set_theme(theme);
+    #[cfg(target_os = "macos")]
+    force_window_appearance(window, mode);
+}
+
+/// Saves the appearance and applies it to the window. Not async on purpose: macOS wants the main thread.
+#[tauri::command]
+fn set_appearance(app: tauri::AppHandle, state: tauri::State<'_, Arc<AppState>>, mode: String) -> Result<(), String> {
+    let mode = clean_appearance(&mode);
+    let config_dir = state
+        .config_dir
+        .read()
+        .map_err(|_| "Freeze settings are unavailable".to_owned())?
+        .clone()
+        .ok_or_else(|| "Freeze settings are unavailable".to_owned())?;
+    fs::write(config_dir.join("appearance"), mode).map_err(|_| "Could not save the appearance setting".to_owned())?;
+    if let Some(window) = app.get_webview_window("main") {
+        apply_appearance(&window, mode);
+    }
+    Ok(())
 }
 
 /// Brings the window back from the tray, the taskbar or a second launch.
@@ -4411,6 +4520,9 @@ pub fn run() {
         active_devices: AtomicUsize::new(0),
         server_online: AtomicBool::new(false),
         android_usb_enabled: AtomicBool::new(false),
+        usb_clients: AtomicUsize::new(0),
+        usb_panel: RwLock::new(UsbPanel::default()),
+        usb_retry: AtomicBool::new(false),
         session_epoch: AtomicUsize::new(0),
         widget_surface: RwLock::new(None),
     });
@@ -4442,6 +4554,8 @@ pub fn run() {
             request_legacy_deck_import,
             import_legacy_deck,
             enable_android_usb,
+            retry_android_usb,
+            set_appearance,
             adb_status,
             install_adb,
             rotate_pairing_key,
@@ -4494,15 +4608,7 @@ pub fn run() {
                 .android_usb_enabled
                 .store(usb_enabled, Ordering::Relaxed);
             let monitor_state = state.clone();
-            thread::spawn(move || loop {
-                thread::sleep(Duration::from_secs(3));
-                if monitor_state.android_usb_enabled.load(Ordering::Relaxed)
-                    && ensure_android_usb_reverse().is_err_and(|error| error == adb::MISSING)
-                {
-                    // No adb on this PC: searching for it spawns processes, so look again in 30 s, not 3.
-                    thread::sleep(Duration::from_secs(27));
-                }
-            });
+            thread::spawn(move || run_usb_monitor(monitor_state));
 
             let profile_monitor = state.clone();
             thread::spawn(move || loop {
@@ -4520,9 +4626,9 @@ pub fn run() {
 
             pc_stats::spawn_pc_stats_monitor(state.pc_stats.clone(), state.pc_stats_demand.clone());
 
-            #[cfg(target_os = "macos")]
             if let Some(window) = app.get_webview_window("main") {
-                force_dark_window(&window);
+                let saved = fs::read_to_string(config_dir.join("appearance")).unwrap_or_default();
+                apply_appearance(&window, clean_appearance(&saved));
             }
 
             tauri::async_runtime::spawn(serve(state));
@@ -4847,3 +4953,14 @@ mod installed_apps_tests {
     }
 }
 
+#[cfg(test)]
+mod appearance_tests {
+    use super::clean_appearance;
+
+    #[test]
+    fn appearance_is_one_of_three_words() {
+        let cleaned = ["light", " dark
+", "system", "", "Dark; rm"].map(clean_appearance);
+        assert_eq!(cleaned, ["light", "dark", "system", "system", "system"]);
+    }
+}

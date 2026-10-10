@@ -14,7 +14,8 @@ import { WebWidgetLayer, type WebWidget } from '../../web-widgets';
 import { countRender, PerfOverlay } from '../../perf-overlay';
 import { useDeckScreenPower } from '../../screen-power';
 import { buttonPlacement, surfaceOccupancy, type SurfaceItem } from '../../deck-layout';
-import { colors } from '../../theme';
+import { useStyles, useTheme, type Colors } from '../../theme';
+import { inkIcon } from '../../theme-colors';
 import { TabBarHiddenContext } from '../../navigation/tab-bar-context';
 import { useTabBarClearance } from '../../tab-inset';
 import { MediaToastView, PlayerSheet, SourceChip, useMediaSource } from '../../media-source';
@@ -56,6 +57,8 @@ function controlIcon(button: DeckButton, playback: PlaybackState) {
 }
 
 function PluginTextWidget({ widget, immersive = false }: { widget: Extract<DeckWidget, { type: 'plugin' }>; immersive?: boolean }) {
+  const { colors } = useTheme();
+  const styles = useStyles(makeStyles);
   const [size, setSize] = useState({ width: 0, height: 0 });
   const title = widget.values.title?.trim() ?? '';
   const body = widget.values.body?.trim() ?? '';
@@ -103,6 +106,7 @@ type ScrubBarProps = {
 // A bar you press and drag along; values are 0–1. Once it has the touch it refuses to hand it
 // over, so the widget page swipe and the portrait scroll view can't cancel a scrub halfway.
 function ScrubBar({ value, disabled, height, trackHeight, knobSize, alwaysShowKnob = false, hitSlop, accessibilityLabel, accessibilityValue, accessibilityStep, onScrub, onCommit }: ScrubBarProps) {
+  const styles = useStyles(makeStyles);
   const [width, setWidth] = useState(1);
   const [dragValue, setDragValue] = useState<number | null>(null);
   const [dragging, setDragging] = useState(false);
@@ -168,11 +172,13 @@ function ScrubBar({ value, disabled, height, trackHeight, knobSize, alwaysShowKn
 }
 
 function SystemVolumeSlider({ value, disabled, height, controlSize, labelSize, onChange, onInteract, onClose }: { value?: number; disabled: boolean; height: number; controlSize: number; labelSize: number; onChange: (value: number) => boolean; onInteract: () => void; onClose: () => void }) {
+  const { colors } = useTheme();
+  const styles = useStyles(makeStyles);
   const [scrubValue, setScrubValue] = useState<number | null>(null);
   const lastSent = useRef(0);
   return <View style={[styles.nowPlayingVolume, { height, gap: controlSize * 0.3 }, disabled && styles.nowPlayingVolumeDisabled]}>
     <Pressable onPress={onClose} accessibilityRole="button" accessibilityLabel="Hide volume" style={[styles.nowPlayingControl, styles.nowPlayingVolumeClose, { width: controlSize, height: controlSize }]}>
-      <Volume2 size={controlSize * 0.5} color="#93c5fd" strokeWidth={1.8} />
+      <Volume2 size={controlSize * 0.5} color={colors.blue} strokeWidth={1.8} />
     </Pressable>
     <View style={styles.nowPlayingVolumeTrack}><ScrubBar value={(value ?? 0) / 100} disabled={disabled} height={height} trackHeight={5} knobSize={Math.max(12, height * 0.36)} alwaysShowKnob accessibilityLabel="System volume" accessibilityValue={{ min: 0, max: 100, now: Math.round((scrubValue ?? (value ?? 0) / 100) * 100) }} accessibilityStep={0.05} onScrub={(next) => {
       setScrubValue(next);
@@ -208,6 +214,8 @@ function useLivePosition(media: SystemMediaState) {
 }
 
 function NowPlayingWidget({ media, connected, sendCommand, sendVolume, seekMedia, source }: { media: SystemMediaState; connected: boolean; sendCommand: (command: DeckMediaCommand) => boolean; sendVolume: (volumePercent: number) => boolean; seekMedia: (positionMs: number) => boolean; source?: { players: PlayersState | null; multiple: boolean; interactive: boolean; onPress: () => void } }) {
+  const { colors } = useTheme();
+  const styles = useStyles(makeStyles);
   const [size, setSize] = useState({ width: 0, height: 0 });
   const [scrubPosition, setScrubPosition] = useState<number | null>(null);
   const [volumeOpen, setVolumeOpen] = useState(false);
@@ -257,7 +265,7 @@ function NowPlayingWidget({ media, connected, sendCommand, sendVolume, seekMedia
     </> : null}
     {sourceInfo && size.width >= 150 && size.height >= 90 ? <View pointerEvents="box-none" style={styles.sourceChipWrap}><SourceChip name={sourceInfo.name} color={sourceInfo.color} multiple={source?.multiple ?? false} interactive={source?.interactive ?? false} onPress={source!.onPress} /></View> : null}
     <View style={[styles.nowPlayingContent, { flexDirection: stacked ? 'column' : 'row', padding: layout.padding, gap: layout.gap }]}>
-      {media.artworkDataUrl ? <Image source={{ uri: media.artworkDataUrl }} style={[styles.nowPlayingArtwork, { width: layout.artSize, height: layout.artSize, borderRadius: artRadius }]} resizeMode="cover" /> : <View style={[styles.nowPlayingFallback, { width: layout.artSize, height: layout.artSize, borderRadius: artRadius }]}><Music size={Math.max(12, layout.artSize * 0.43)} color="#93c5fd" strokeWidth={1.7} /></View>}
+      {media.artworkDataUrl ? <Image source={{ uri: media.artworkDataUrl }} style={[styles.nowPlayingArtwork, { width: layout.artSize, height: layout.artSize, borderRadius: artRadius }]} resizeMode="cover" /> : <View style={[styles.nowPlayingFallback, { width: layout.artSize, height: layout.artSize, borderRadius: artRadius }]}><Music size={Math.max(12, layout.artSize * 0.43)} color={colors.blue} strokeWidth={1.7} /></View>}
       <View style={[styles.nowPlayingColumn, stacked ? styles.nowPlayingColumnStacked : styles.nowPlayingColumnRow, { gap: layout.gap }]}>
         <Text allowFontScaling={false} numberOfLines={1} style={[styles.nowPlayingTitle, { fontSize: layout.titleSize, lineHeight: layout.titleSize * 1.25, textAlign }]}>{hasTrack ? media.title || media.artist || media.album : 'No media'}</Text>
         {on('detail') ? <Text allowFontScaling={false} numberOfLines={1} style={[styles.nowPlayingDetail, { fontSize: layout.detailSize, lineHeight: layout.detailSize * 1.3, textAlign }]}>{supportingText}</Text> : null}
@@ -303,6 +311,7 @@ function LiveLyrics(props: Omit<Parameters<typeof LyricsWidget>[0], 'media'>) {
 
 // A row of pill buttons, scrolled so the selected one is in view (profiles and pages can be many).
 function ChipRow({ label, items, selectedId, onSelect }: { label: string; items: { id: string; name: string }[]; selectedId?: string; onSelect: (id: string) => void }) {
+  const styles = useStyles(makeStyles);
   const scroller = useRef<ScrollView>(null);
   const positions = useRef(new Map<string, number>());
   useEffect(() => {
@@ -317,6 +326,8 @@ function ChipRow({ label, items, selectedId, onSelect }: { label: string; items:
 }
 
 export default function DeckScreen() {
+  const { colors, scheme } = useTheme();
+  const styles = useStyles(makeStyles);
   countRender('deck');
   const power = useDeckScreenPower();
   const router = useRouter();
@@ -542,7 +553,7 @@ export default function DeckScreen() {
       const Icon = controlIcon(button, playbackState);
       return <Pressable key={button.id} style={({ pressed }) => [big ? styles.immersiveKey : styles.key, frame(placement), pressed && styles.keyPressed, !connected && !isFolder && styles.keyDisabled]} onPress={() => press(button, label)} onLongPress={isMediaKey && connected && mediaSource.canSwitch ? mediaSource.openSheet : undefined} delayLongPress={450} disabled={!connected && !isFolder} accessibilityRole="button" accessibilityLabel={isFolder ? `${label}, folder` : label} accessibilityHint={isMediaKey && mediaSource.multiple ? 'Long press to choose a media player' : undefined}>
         {isMediaKey && mediaSource.multiple ? <View pointerEvents="none" style={styles.mediaKeyDot} /> : null}
-        {button.appIconData ? <Image source={{ uri: button.appIconData }} style={big ? { width: iconSize, height: iconSize } : styles.appIcon} resizeMode="contain" /> : button.iconSvg && button.icon !== 'auto' ? <SvgXml xml={button.iconSvg} width={iconSize} height={iconSize} /> : <Icon size={iconSize} color={colors.text} strokeWidth={1.7} />}
+        {button.appIconData ? <Image source={{ uri: button.appIconData }} style={big ? { width: iconSize, height: iconSize } : styles.appIcon} resizeMode="contain" /> : button.iconSvg && button.icon !== 'auto' ? <SvgXml xml={inkIcon(button.iconSvg, scheme)} width={iconSize} height={iconSize} /> : <Icon size={iconSize} color={colors.text} strokeWidth={1.7} />}
         {big ? null : <Text style={styles.keyLabel} numberOfLines={2}>{label}</Text>}
       </Pressable>;
     });
@@ -550,7 +561,7 @@ export default function DeckScreen() {
 
   if (immersive) {
     return <>
-      <StatusBar hidden style="light" />
+      <StatusBar hidden style="auto" />
       <SafeAreaView {...power.touchProps} style={styles.immersiveSafe} edges={['top', 'right', 'bottom', 'left']} onLayout={(event) => {
         const { width, height } = event.nativeEvent.layout;
         setImmersiveSize((current) => current.width === width && current.height === height ? current : { width, height });
@@ -581,7 +592,7 @@ export default function DeckScreen() {
 
   return (
     <SafeAreaView {...power.touchProps} style={styles.safe} edges={['top']}>
-      <StatusBar style="light" />
+      <StatusBar style="auto" />
       <ScrollView contentContainerStyle={[styles.content, { paddingBottom: bottomClearance }]} showsVerticalScrollIndicator={false}>
         <View style={styles.header}>
           <View style={styles.brand}><Snowflake size={19} color={colors.text} strokeWidth={1.8} /><Text style={styles.brandName}>Freeze</Text></View>
@@ -635,7 +646,7 @@ export default function DeckScreen() {
   );
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: Colors) => StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.bg },
   immersiveSafe: { flex: 1, backgroundColor: colors.bg },
   immersiveBackdrop: { ...StyleSheet.absoluteFill },
@@ -649,12 +660,12 @@ const styles = StyleSheet.create({
   pluginWidgetBody: { width: '100%', flexShrink: 1, color: colors.muted, textAlign: 'center', includeFontPadding: false },
   pluginWidgetUnavailable: { color: colors.muted, fontSize: 10, textAlign: 'center' },
   sourceChipWrap: { position: 'absolute', top: 6, right: 6, zIndex: 5 },
-  mediaKeyDot: { position: 'absolute', top: 7, right: 7, width: 7, height: 7, borderRadius: 4, backgroundColor: '#facc15' },
+  mediaKeyDot: { position: 'absolute', top: 7, right: 7, width: 7, height: 7, borderRadius: 4, backgroundColor: colors.star },
   nowPlayingWidget: { flex: 1, width: '100%', minWidth: 0, minHeight: 0, overflow: 'hidden', borderRadius: 6 },
   nowPlayingContent: { flex: 1, minWidth: 0, minHeight: 0, alignItems: 'center', justifyContent: 'center' },
   nowPlayingBackdropFrame: { ...StyleSheet.absoluteFill, overflow: 'hidden' },
-  nowPlayingBackdrop: { ...StyleSheet.absoluteFill, opacity: 0.3 },
-  nowPlayingBackdropTint: { ...StyleSheet.absoluteFill, backgroundColor: 'rgba(9, 9, 11, 0.78)' },
+  nowPlayingBackdrop: { ...StyleSheet.absoluteFill, opacity: colors.artOpacity },
+  nowPlayingBackdropTint: { ...StyleSheet.absoluteFill, backgroundColor: colors.tint },
   nowPlayingArtwork: { flexShrink: 0, backgroundColor: colors.panelRaised },
   nowPlayingFallback: { flexShrink: 0, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.panelRaised, borderWidth: 1, borderColor: colors.border },
   nowPlayingColumn: { minWidth: 0, justifyContent: 'center' },
@@ -665,7 +676,7 @@ const styles = StyleSheet.create({
   nowPlayingAlbum: { width: '100%', color: colors.faint, includeFontPadding: false },
   nowPlayingProgressRow: { width: '100%', justifyContent: 'center' },
   nowPlayingProgressTrack: { width: '100%', overflow: 'hidden', borderRadius: 3, backgroundColor: colors.border },
-  nowPlayingProgress: { height: '100%', borderRadius: 3, backgroundColor: '#93c5fd' },
+  nowPlayingProgress: { height: '100%', borderRadius: 3, backgroundColor: colors.blue },
   nowPlayingTimeLabels: { width: '100%', flexDirection: 'row', justifyContent: 'space-between' },
   nowPlayingTimeLabel: { color: colors.faint, fontVariant: ['tabular-nums'], includeFontPadding: false },
   nowPlayingControls: { width: '100%', flexDirection: 'row', alignItems: 'center', justifyContent: 'center' },
@@ -679,12 +690,12 @@ const styles = StyleSheet.create({
   scrubBar: { alignSelf: 'stretch', justifyContent: 'center' },
   nowPlayingVolumeTrack: { flex: 1 },
   scrubRail: { width: '100%', overflow: 'hidden', backgroundColor: colors.border },
-  scrubFill: { height: '100%', backgroundColor: '#93c5fd' },
-  scrubKnob: { position: 'absolute', borderWidth: 2, borderColor: colors.text, backgroundColor: '#93c5fd' },
+  scrubFill: { height: '100%', backgroundColor: colors.blue },
+  scrubKnob: { position: 'absolute', borderWidth: 2, borderColor: colors.text, backgroundColor: colors.blue },
   nowPlayingVolumeLabel: { color: colors.muted, fontVariant: ['tabular-nums'], textAlign: 'right', includeFontPadding: false },
   immersiveEmptyKey: { borderRadius: 10, backgroundColor: 'transparent' },
   immersiveEmptyDeck: { ...StyleSheet.absoluteFill, alignItems: 'center', justifyContent: 'center' },
-  immersiveTools: { position: 'absolute', top: 8, left: 20, right: 20, minHeight: 42, flexDirection: 'row', alignItems: 'center', gap: 8, padding: 5, borderRadius: 8, borderWidth: 1, borderColor: colors.border, backgroundColor: 'rgba(24, 24, 27, 0.94)' },
+  immersiveTools: { position: 'absolute', top: 8, left: 20, right: 20, minHeight: 42, flexDirection: 'row', alignItems: 'center', gap: 8, padding: 5, borderRadius: 8, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.float },
   immersivePageTools: { flexGrow: 1, flexDirection: 'row', alignItems: 'center', gap: 5 },
   immersivePageButton: { height: 30, justifyContent: 'center', paddingHorizontal: 10, borderRadius: 5 },
   immersiveExit: { width: 34, height: 34, borderRadius: 6, alignItems: 'center', justifyContent: 'center', backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border },
@@ -708,7 +719,7 @@ const styles = StyleSheet.create({
   pageTabsScroll: { flexGrow: 0, flexShrink: 0 },
   pageTabs: { flexDirection: 'row', gap: 6, paddingBottom: 16 },
   pageTab: { minHeight: 29, maxWidth: 180, justifyContent: 'center', paddingHorizontal: 10, borderRadius: 5, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panel },
-  pageTabActive: { backgroundColor: colors.pressed, borderColor: '#52525b' },
+  pageTabActive: { backgroundColor: colors.pressed, borderColor: colors.borderActive },
   pageTabText: { color: colors.muted, fontSize: 13, fontWeight: '500' },
   pageTabTextActive: { color: colors.text },
   connectBanner: { minHeight: 57, borderRadius: 7, paddingHorizontal: 12, marginBottom: 20, backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border, flexDirection: 'row', alignItems: 'center', gap: 11 },
@@ -724,7 +735,7 @@ const styles = StyleSheet.create({
   emptyKey: { borderStyle: 'dashed', backgroundColor: 'transparent', opacity: 0.45 },
   appIcon: { width: 23, height: 23 },
   keyDisabled: { opacity: 0.52 },
-  keyPressed: { backgroundColor: colors.pressed, borderColor: '#52525b' },
+  keyPressed: { backgroundColor: colors.pressed, borderColor: colors.borderActive },
   keyLabel: { color: colors.text, fontSize: 13, fontWeight: '500', lineHeight: 14 },
   shortcutHint: { color: colors.faint, fontSize: 11, marginTop: -4 },
   addKey: { alignItems: 'flex-start', justifyContent: 'space-between', borderStyle: 'dashed', backgroundColor: 'transparent' },

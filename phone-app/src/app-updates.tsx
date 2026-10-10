@@ -3,7 +3,7 @@ import { AppState, Linking, Platform, Pressable, StyleSheet, Text, View } from '
 import Constants from 'expo-constants';
 import { File, Paths } from 'expo-file-system';
 import { startActivityAsync } from 'expo-intent-launcher';
-import { colors } from './theme';
+import { useStyles, type Colors } from './theme';
 
 // Android only: Freeze reads the latest GitHub release and hands its APK to Android's installer,
 // which refuses any APK not signed with Freeze's release key. iOS updates come from Apple.
@@ -116,6 +116,7 @@ export function useUpdateBadge() {
 const megabytes = (bytes: number) => `${Math.round(bytes / 1_000_000)} MB`;
 
 export function AppUpdatesSection() {
+  const styles = useStyles(makeStyles);
   const current = useUpdateState();
   if (Platform.OS !== 'android') return null;
 
@@ -151,12 +152,13 @@ export function AppUpdatesSection() {
 }
 
 function Button({ label, primary, disabled, onPress }: { label: string; primary?: boolean; disabled?: boolean; onPress: () => void }) {
+  const styles = useStyles(makeStyles);
   return <Pressable style={({ pressed }) => [styles.button, primary && styles.primary, (pressed || disabled) && styles.pressed]} disabled={disabled} onPress={onPress} accessibilityRole="button">
     <Text style={[styles.buttonText, primary && styles.primaryText]}>{label}</Text>
   </Pressable>;
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: Colors) => StyleSheet.create({
   card: { marginTop: 14, padding: 12, borderWidth: 1, borderColor: colors.border, borderRadius: 7, backgroundColor: colors.panel },
   title: { color: colors.text, fontSize: 13, fontWeight: '500' },
   detail: { color: colors.muted, fontSize: 12, marginTop: 5, lineHeight: 16 },

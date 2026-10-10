@@ -6,7 +6,7 @@ import type { SystemMediaState } from './connection';
 import { activeLineAt, fetchLyrics, fetchLyricsById, isGapLine, lyricLineOpacity, lyricsLayout, lyricsTrace, lyricsTrackKey, nearestVersion, sungSpan, withIntroGap, type LyricLine, type Lyrics, type LyricsEntry, type TimingVersion } from './lyrics';
 import { ChevronLeft, Minus, Plus, RefreshCw, Search, X } from 'lucide-react-native';
 import { LyricsFinder } from './lyrics-finder';
-import { colors } from './theme';
+import { useStyles, useTheme, type Colors } from './theme';
 import { IDLE_MS } from './web-widget-lifecycle';
 
 // ponytail: one fixed lead for every setup; make it a setting if lines feel early or late on some PCs.
@@ -162,6 +162,7 @@ const holdScale = (step: number) => step < 10 ? 1 : step < 20 ? 4 : 20;
 // A tap steps once; holding keeps stepping, faster and faster, until release. Only one repeat timer ever
 // runs: a new hold clears any earlier one, so fast taps can't leave a timer stepping on its own.
 function RepeatButton({ onStep, label, size, children }: { onStep: (scale: number) => void; label: string; size: number; children: React.ReactNode }) {
+  const styles = useStyles(makeStyles);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   const stop = useCallback(() => {
     if (timer.current) clearInterval(timer.current);
@@ -215,6 +216,8 @@ function useBreath(enabled: boolean) {
 }
 
 function Dots({ size, opacities, scale }: { size: number; opacities: (Animated.AnimatedInterpolation<number> | number)[]; scale: Animated.AnimatedInterpolation<number> | Animated.AnimatedMultiplication<number> | number }) {
+  const { colors } = useTheme();
+  const styles = useStyles(makeStyles);
   return <Animated.View style={[styles.dots, { height: size * 2.6, gap: size * 0.7, transform: [{ scale }] }]}>
     {opacities.map((opacity, index) => <Animated.View key={index} style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: colors.text, opacity }} />)}
   </Animated.View>;
@@ -245,6 +248,8 @@ function GapDots({ size, active, rate, startMs, endMs, now, clock, reduceMotion 
 }
 
 function SyncedLyrics({ lines, media, active, width, height, canSeek, seekMedia, onLongPress, offsetMs, onNudge, onResetOffset }: { lines: LyricLine[]; media: SystemMediaState; active: boolean; width: number; height: number; canSeek: boolean; seekMedia: (positionMs: number) => boolean; onLongPress: () => void; offsetMs: number; onNudge: (deltaMs: number) => void; onResetOffset: () => void }) {
+  const { colors, scheme } = useTheme();
+  const styles = useStyles(makeStyles);
   const reduceMotion = useReduceMotion();
   const { compact, fontSize, padding, lineGap, anchorY } = lyricsLayout(width, height);
 
@@ -433,7 +438,7 @@ function SyncedLyrics({ lines, media, active, width, height, canSeek, seekMedia,
     const waveStart = previous === null ? shown : Math.min(previous, shown);
     animated.forEach((line, index) => {
       const distance = shown < 0 ? index + 1 : Math.abs(index - shown);
-      const opacity = compact && index < shown ? 0 : lyricLineOpacity(distance);
+      const opacity = compact && index < shown ? 0 : lyricLineOpacity(distance, scheme === 'light');
       const scale = reduceMotion || index === shown ? 1 : 0.96;
       if (instant) {
         line.y.stopAnimation();
@@ -449,7 +454,7 @@ function SyncedLyrics({ lines, media, active, width, height, canSeek, seekMedia,
     placedOffset.current = offsets.current[anchorIndex];
     snap.current = false;
     glide.current = false;
-  }, [animated, shown, layoutVersion, anchorY, compact, reduceMotion, lines.length, browsing]);
+  }, [animated, shown, layoutVersion, anchorY, compact, reduceMotion, lines.length, browsing, scheme]);
 
   const seekTo = useCallback((line: LyricLine) => {
     if (!seekMedia(line.timeMs)) return;
@@ -507,10 +512,12 @@ function SyncedLyrics({ lines, media, active, width, height, canSeek, seekMedia,
 }
 
 function Message({ title, size }: { title: string; size: number }) {
+  const styles = useStyles(makeStyles);
   return <View style={styles.center}><Text allowFontScaling={false} numberOfLines={2} style={[styles.message, { fontSize: size }]}>{title}</Text></View>;
 }
 
 function BreathingDots({ size, label, labelSize }: { size: number; label?: string; labelSize: number }) {
+  const styles = useStyles(makeStyles);
   const reduceMotion = useReduceMotion();
   const breath = useBreath(!reduceMotion);
   return <View style={styles.center}>
@@ -520,6 +527,7 @@ function BreathingDots({ size, label, labelSize }: { size: number; label?: strin
 }
 
 export function LyricsWidget({ media, connected, focused, seekMedia }: { media: SystemMediaState; connected: boolean; focused: boolean; seekMedia: (positionMs: number) => boolean }) {
+  const styles = useStyles(makeStyles);
   const [size, setSize] = useState({ width: 0, height: 0 });
   const key = lyricsTrackKey(media);
   const [result, setResult] = useState<{ key: string; lyrics: Lyrics } | null>(null);
@@ -635,6 +643,8 @@ type SyncPanel = { versions: TimingVersion[]; shown?: TimingVersion; auto?: Timi
 // The sync fixes, then what the PC reported for the track and each lookup step, refreshed while a lookup
 // is still running. Tapping a timing version uses it for this track from now on.
 function LyricsDebug({ media, status, onClose, pickedId, shown, onUseEntry, onAutomatic, sync, onPickVersion, onResetOffset, typedTitle, onSearchTitle }: { media: SystemMediaState; status: string; onClose: () => void; pickedId?: number; shown?: { firstMs: number; lastMs: number }; onUseEntry: (entry: LyricsEntry) => void; onAutomatic: () => void; sync: SyncPanel; onPickVersion: (version: TimingVersion | undefined) => void; onResetOffset: () => void; typedTitle?: string; onSearchTitle: (title: string | undefined) => void }) {
+  const { colors } = useTheme();
+  const styles = useStyles(makeStyles);
   const [finding, setFinding] = useState(false);
   const [, setRefresh] = useState(0);
   useEffect(() => {
@@ -689,7 +699,7 @@ function LyricsDebug({ media, status, onClose, pickedId, shown, onUseEntry, onAu
               <Text allowFontScaling={false} style={styles.debugHeading}>Lyrics</Text>
               <Text allowFontScaling={false} style={styles.debugText}>{pickedId !== undefined ? `using the entry you picked (LRCLIB #${pickedId})` : 'Wrong or missing lyrics? Search LRCLIB and pick the right entry.'}</Text>
               <Pressable onPress={() => setFinding(true)} accessibilityRole="button" accessibilityLabel="Find lyrics on LRCLIB" style={({ pressed }) => [styles.debugPrimary, pressed && { opacity: 0.76 }]}>
-                <Search size={15} color="#18181b" /><Text allowFontScaling={false} style={styles.debugPrimaryText}>Find lyrics</Text>
+                <Search size={15} color={colors.onAccent} /><Text allowFontScaling={false} style={styles.debugPrimaryText}>Find lyrics</Text>
               </Pressable>
               {pickedId !== undefined ? <Pressable onPress={onAutomatic} hitSlop={6} accessibilityRole="button" accessibilityLabel="Go back to automatic lyrics" style={styles.debugChip}><Text allowFontScaling={false} style={styles.debugChipText}>Back to automatic</Text></Pressable> : null}
               {typedTitle ? <View style={styles.debugRow}>
@@ -706,7 +716,7 @@ function LyricsDebug({ media, status, onClose, pickedId, shown, onUseEntry, onAu
   </Modal>;
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: Colors) => StyleSheet.create({
   widget: { flex: 1, width: '100%', minWidth: 0, minHeight: 0, overflow: 'hidden', borderRadius: 6 },
   fill: { flex: 1, overflow: 'hidden' },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 8, padding: 8 },
@@ -716,9 +726,9 @@ const styles = StyleSheet.create({
   dots: { flexDirection: 'row', alignItems: 'center' },
   syncControls: { position: 'absolute', alignItems: 'flex-end', gap: 2 },
   syncRow: { flexDirection: 'row', gap: 4 },
-  syncButton: { alignItems: 'center', justifyContent: 'center', borderRadius: 999, backgroundColor: 'rgba(24, 24, 27, 0.7)' },
-  offsetLabel: { color: colors.muted, fontWeight: '600', paddingHorizontal: 4, borderRadius: 6, backgroundColor: 'rgba(24, 24, 27, 0.7)', overflow: 'hidden' },
-  debugOverlay: { flex: 1, backgroundColor: 'rgba(0, 0, 0, 0.65)' },
+  syncButton: { alignItems: 'center', justifyContent: 'center', borderRadius: 999, backgroundColor: colors.floatSoft },
+  offsetLabel: { color: colors.muted, fontWeight: '600', paddingHorizontal: 4, borderRadius: 6, backgroundColor: colors.floatSoft, overflow: 'hidden' },
+  debugOverlay: { flex: 1, backgroundColor: colors.scrim },
   debugKeyboard: { flex: 1 },
   debugSafeArea: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 16 },
   debug: { flex: 1, width: '100%', maxWidth: 560, maxHeight: '90%', minHeight: 0, borderRadius: 16, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.bg, overflow: 'hidden' },
@@ -726,8 +736,8 @@ const styles = StyleSheet.create({
   debugTitle: { flex: 1, color: colors.text, fontSize: 16, fontWeight: '600' },
   debugClose: { width: 40, height: 40, alignItems: 'center', justifyContent: 'center', borderRadius: 8 },
   debugBack: { width: 40, height: 40, marginLeft: -12, alignItems: 'center', justifyContent: 'center', borderRadius: 8 },
-  debugPrimary: { height: 41, borderRadius: 5, backgroundColor: '#e4e4e7', flexDirection: 'row', gap: 7, alignItems: 'center', justifyContent: 'center' },
-  debugPrimaryText: { color: '#18181b', fontSize: 14, fontWeight: '600' },
+  debugPrimary: { height: 41, borderRadius: 5, backgroundColor: colors.accent, flexDirection: 'row', gap: 7, alignItems: 'center', justifyContent: 'center' },
+  debugPrimaryText: { color: colors.onAccent, fontSize: 14, fontWeight: '600' },
   debugScroll: { flex: 1, minHeight: 0 },
   debugContent: { padding: 16, gap: 8 },
   debugText: { color: colors.text, fontSize: 11, lineHeight: 15, fontFamily: Platform.select({ ios: 'Menlo', default: 'monospace' }) },

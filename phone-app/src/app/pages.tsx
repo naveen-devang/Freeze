@@ -2,9 +2,11 @@ import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { ArrowLeft, Layers2 } from 'lucide-react-native';
 import { useRouter } from 'expo-router';
-import { colors } from '../theme';
+import { useStyles, useTheme, type Colors } from '../theme';
 
 export default function PagesScreen() {
+  const { colors } = useTheme();
+  const styles = useStyles(makeStyles);
   const router = useRouter();
   return <SafeAreaView style={styles.safe} edges={['top']}>
     <View style={styles.content}>
@@ -16,7 +18,7 @@ export default function PagesScreen() {
   </SafeAreaView>;
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: Colors) => StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.bg },
   content: { flex: 1, padding: 20, gap: 14, justifyContent: 'center' },
   back: { position: 'absolute', top: 12, left: 18, width: 36, height: 36, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: colors.border, borderRadius: 6 },

@@ -7,7 +7,8 @@
 //   { ack, needs, shown, errors }                 the widgets of request number `ack` are drawn: the
 //                                                 readings they need, how many are on screen, and any
 //                                                 widget that failed to draw (the others still draw)
-// The app calls window.freezeWidgets(list, hour12, force, seq) and FreezeClock.setPaused(paused).
+// The app calls window.freezeTheme(scheme, tile) when the page is ready and on every theme change, then
+// window.freezeWidgets(list, hour12, force, seq) and FreezeClock.setPaused(paused).
 
 /** Version of the messages above; the page announces it in { ready }. */
 export const PAGE_PROTOCOL = 1;
@@ -28,15 +29,15 @@ export type PageSources = {
 export function widgetPageHtml({ wakeCounterJs, background, clockFaces, pcStats, fontsCss, fontLoads }: PageSources): string {
   return `<!doctype html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<meta name="color-scheme" content="dark">
-<style>html,body{margin:0;height:100%;overflow:hidden;background:transparent;color-scheme:dark}</style>
+<meta name="color-scheme" content="light dark">
+<style>html,body{margin:0;height:100%;overflow:hidden;background:transparent}html{color-scheme:dark}</style>
 <style>${fontsCss}</style>
 </head><body><script>
 ${wakeCounterJs}
 ${clockFaces.replace(/<\/script/gi, '<\\/script')}
 ${pcStats.replace(/<\/script/gi, '<\\/script')}
 FreezeClock.setFrameRate(30);
-var shown = {}, pending = null, fontsReady = false;
+var shown = {}, pending = null, fontsReady = false, panel = ${JSON.stringify(background)};
 function post(message) {
   try { window.ReactNativeWebView.postMessage(JSON.stringify(message)); return true; } catch (error) { return false; }
 }
@@ -47,7 +48,7 @@ function mountOne(w, hour12) {
   try {
     var handle = w.kind === 'clock'
       ? FreezeClock.mount(host, { face: w.face || 'digital', color: w.color || null, width: w.width, height: w.height, hour12: hour12 })
-      : FreezeStats.mount(host, { style: w.face || 'ring', metric: w.metric || 'cpu', color: w.color || null, gpu: w.gpu || 'auto', background: ${JSON.stringify(background)}, still: true, width: w.width, height: w.height, columns: w.columns, rows: w.rows });
+      : FreezeStats.mount(host, { style: w.face || 'ring', metric: w.metric || 'cpu', color: w.color || null, gpu: w.gpu || 'auto', background: panel, still: true, width: w.width, height: w.height, columns: w.columns, rows: w.rows });
     return { host: host, handle: handle };
   } catch (error) {
     host.remove();
@@ -79,6 +80,13 @@ function show(request) {
   Object.keys(shown).forEach(function (id) { if (!keep[id]) { destroy(shown[id]); delete shown[id]; } });
   post({ ack: request.seq, needs: Object.keys(needs).sort(), shown: Object.keys(shown).length, errors: errors });
 }
+// The app's look, sent before the first widgets and again whenever it changes. Widgets on screen are updated in place.
+window.freezeTheme = function (scheme, tile) {
+  panel = tile;
+  document.documentElement.style.colorScheme = scheme;
+  FreezeClock.setTheme(scheme);
+  FreezeStats.setTheme(scheme, tile);
+};
 window.freezeWidgets = function (list, hour12, force, seq) {
   var request = { list: list, hour12: hour12, force: !!force, seq: seq };
   // Until the fonts are in, only the newest request is kept: stats widgets size their text by measuring it.

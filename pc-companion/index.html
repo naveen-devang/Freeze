@@ -3,7 +3,25 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#101116" />
+    <meta name="theme-color" content="#09090b" />
+    <meta name="color-scheme" content="light dark" />
+    <script>
+      // Picks the theme before the first paint, so a light or dark start never flashes the other. theme.tsx keeps it after.
+      (function () {
+        var light = false;
+        try {
+          var saved = localStorage.getItem("freeze.appearance");
+          light = saved === "light" || (saved !== "dark" && window.matchMedia("(prefers-color-scheme: light)").matches);
+        } catch (e) {
+          try { light = window.matchMedia("(prefers-color-scheme: light)").matches; } catch (e2) { /* dark */ }
+        }
+        document.documentElement.setAttribute("data-theme", light ? "light" : "dark");
+      })();
+    </script>
+    <style>
+      html[data-theme="light"] { background: #ffffff; color-scheme: light; }
+      html[data-theme="dark"] { background: #09090b; color-scheme: dark; }
+    </style>
     <title>Freeze</title>
   </head>
 

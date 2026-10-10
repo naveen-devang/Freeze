@@ -1,6 +1,7 @@
 import { useEffect, useSyncExternalStore } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import './pc-stats.js';
+import { currentTheme, onThemeChange } from '../theme';
 
 export type PcStatsSize = '1x1' | '2x1' | '2x2' | 'dash';
 export type PcStatsStyle = { id: string; size: PcStatsSize; span: [number, number]; name: string; blurb: string; dashboard: boolean };
@@ -18,10 +19,14 @@ type FreezeStatsApi = {
   setHistory(samples: unknown[]): void;
   push(sample: unknown): void;
   latest(): PcStatsSample | null;
+  setTheme(theme: 'light' | 'dark', background?: string): void;
   mount(host: HTMLElement, options: { style: string; metric?: string; color?: string; gpu?: string; width: number; height: number; columns: number; rows: number }): { destroy(): void };
 };
 
 export const FreezeStats = (globalThis as unknown as { FreezeStats: FreezeStatsApi }).FreezeStats;
+// Widgets follow the app's light or dark look, and change with it.
+FreezeStats.setTheme(currentTheme());
+onThemeChange(() => FreezeStats.setTheme(currentTheme()));
 export const PC_STATS_SIZES: [PcStatsSize, string][] = [['1x1', '1 × 1'], ['2x1', '2 × 1'], ['2x2', '2 × 2'], ['dash', 'Dashboards']];
 export const DEFAULT_PC_STATS_STYLE = 'ring';
 

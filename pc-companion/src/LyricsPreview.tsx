@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { activeLineAt, fetchLyrics, isGapLine, lyricLineOpacity, lyricsLayout, lyricsTrackKey, withIntroGap, type Lyrics } from './lyrics';
 import { widgetBlockSize, type WidgetSurface } from './now-playing-layout';
 import { useElementSize } from './useElementSize';
+import { useTheme } from './theme';
 
 type PreviewMedia = { title?: string | null; artist?: string | null; album?: string | null; playbackState: string; positionMs?: number | null; durationMs?: number | null; playbackRate?: number | null };
 
@@ -13,6 +14,7 @@ const MISSING_DURATION_WAIT_MS = 1500;
 // The phone's Lyrics widget drawn with CSS at the phone's block size, then scaled into the editor cell.
 export function LyricsPreview({ media, surface, columns, rows, columnSpan, rowSpan }: { media: PreviewMedia; surface: WidgetSurface; columns: number; rows: number; columnSpan: number; rowSpan: number }) {
   const [frameRef, box] = useElementSize<HTMLDivElement>();
+  const light = useTheme() === 'light';
   const { width, height } = widgetBlockSize(surface, columns, rows, columnSpan, rowSpan);
   const layout = lyricsLayout(width, height);
   const scale = box.width && box.height ? Math.min(box.width / width, box.height / height) : 0;
@@ -72,7 +74,7 @@ export function LyricsPreview({ media, surface, columns, rows, columnSpan, rowSp
             const distance = active < 0 ? index + 1 : Math.abs(index - active);
             return <p key={`${index}:${line.timeMs}`} ref={(element) => { lineRefs.current[index] = element; }} style={{
               marginBottom: layout.lineGap,
-              opacity: layout.compact && index < active ? 0 : lyricLineOpacity(distance),
+              opacity: layout.compact && index < active ? 0 : lyricLineOpacity(distance, light),
               transform: `translateY(${target}px) scale(${index === active ? 1 : 0.96})`,
               transitionDelay: `${Math.max(0, Math.min(12, index - active + 1)) * 40}ms, 0ms`,
             }}>{isGapLine(line) ? <span className={`lyrics-preview-dots${index === active ? ' breathing' : ''}`} style={{ fontSize: layout.fontSize * 0.42 }}><i /><i /><i /></span> : line.text}</p>;

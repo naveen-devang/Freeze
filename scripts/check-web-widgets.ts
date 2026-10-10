@@ -313,6 +313,23 @@ window.ReactNativeWebView = { postMessage: function (message) { window.__message
   window.freezeWidgets([], true, false, 6);
   check(messages[0].ack === 6 && messages[0].shown === 0 && hosts().length === 0, 'an empty list clears the page');
 
+  // The page follows the app's look: widgets on screen change in place, and a scene face (a Nixie tube) stays dark.
+  var rootOf = function (host) { return host.querySelector('.fc-root, .ps-root'); };
+  var token = function (host, name) { return getComputedStyle(rootOf(host)).getPropertyValue(name).trim(); };
+  messages.length = 0;
+  window.freezeWidgets([W('t1', 'clock', { face: 'analog' }), W('t2', 'clock', { face: 'nixie', x: 110 }), W('t3', 'stats', { face: 'ring', metric: 'cpu', columns: 1, rows: 1, x: 220 })], true, true, 8);
+  check(messages[0].shown === 3 && messages[0].errors.length === 0, 'the theme widgets are drawn: ' + JSON.stringify(messages[0]));
+  check(token(hosts()[0], '--fg') === '#ececef' && token(hosts()[2], '--fg') === '#ececef', 'widgets are drawn dark until told otherwise');
+  window.freezeTheme('light', '#fafafa');
+  check(token(hosts()[0], '--fg') === '#18181b', 'a clock face is redrawn in the light palette: ' + token(hosts()[0], '--fg'));
+  check(token(hosts()[1], '--fg') === '#ececef', 'a scene face stays dark');
+  check(token(hosts()[2], '--fg') === '#18181b' && /250/.test(rootOf(hosts()[2]).style.background), 'a stats widget takes the light palette and the new tile color');
+  check(document.documentElement.style.colorScheme === 'light', 'the page color scheme follows the theme');
+  window.freezeWidgets([W('t4', 'clock', { face: 'analog' })], true, false, 9);
+  check(token(hosts()[0], '--fg') === '#18181b', 'a widget drawn later uses the current theme');
+  window.freezeTheme('dark', '#111113');
+  check(token(hosts()[0], '--fg') === '#ececef', 'and back to dark');
+
   // One widget that cannot be drawn is reported, and the others are still drawn.
   var mount = FreezeClock.mount;
   FreezeClock.mount = function (host, options) { if (options.face === 'boom') throw new Error('boom'); return mount.call(FreezeClock, host, options); };

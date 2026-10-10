@@ -27,7 +27,56 @@ function hexToHsl(hex) {
   return [h * 60, s * 100, l * 100];
 }
 const hsl = (h, s, l) => `hsl(${((h % 360) + 360) % 360} ${clamp(s, 0, 100)}% ${clamp(l, 0, 100)}%)`;
-const shades = (hex) => { const [h, s, l] = hexToHsl(hex); return { base: hex, light: hsl(h, s, Math.min(88, l + 14)), shift: hsl(h + 38, s, l), deep: hsl(h - 24, s, Math.max(30, l - 10)) }; };
+
+// --- Themes
+// Most faces are typographic and follow the app's light or dark look (PALETTES). The scene faces (SCENE) are the
+// point of being dark, like a Nixie tube, a CRT or an aurora, so they keep their dark plate in both themes.
+// Dark is the original look, value for value.
+const PALETTES = {
+  dark: { light: false, plate: '#111215', plate2: '#0d0e12', fg: '#ececef', muted: '#a1a1aa', faint: '#5c5c66', line: '#2a2b31', line2: '#24252c', track: '#1f2026', dim: '#2c2d34', dim2: '#3a3b44', dial: '#16171b', dial2: '#16171c', stripDim: '#3f3f46', onAccent: '#0b0b0e', tile: '#f3f1ea', onWater: 'rgba(8,9,12,0.9)', fade: 'rgba(10,10,13,0.32)', cover: '#0a0a0d', thread: 'rgba(255,255,255,0.05)' },
+  light: { light: true, plate: '#fafafa', plate2: '#f4f4f6', fg: '#18181b', muted: '#52525b', faint: '#8a8a94', line: '#d4d4da', line2: '#d4d4da', track: '#e6e6eb', dim: '#d9d9df', dim2: '#b4b4bd', dial: '#ffffff', dial2: '#ffffff', stripDim: '#b4b4bd', onAccent: '#ffffff', tile: '#ffffff', onWater: 'rgba(255,255,255,0.95)', fade: 'rgba(244,244,246,0.32)', cover: '#f4f4f6', thread: 'rgba(24,24,27,0.09)' },
+};
+const SCENE = new Set(['flip', 'orbit', 'led', 'nixie', 'sky', 'tape', 'radar', 'swarm', 'lava', 'aurora', 'slots', 'crt', 'ferro', 'pong', 'sand']);
+let theme = 'dark';
+// The palette of the face being built: a face reads it once at the top of build, so faces drawn in different
+// themes (a scene face and a light one side by side) never share it.
+let BUILD_PAL = PALETTES.dark;
+const lum = (hex) => {
+  const n = parseInt(hex.slice(1), 16), f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; };
+  return 0.2126 * f(n >> 16 & 255) + 0.7152 * f(n >> 8 & 255) + 0.0722 * f(n & 255);
+};
+function hslToHex(h, s, l) {
+  h = ((h % 360) + 360) % 360; s = clamp(s, 0, 100) / 100; l = clamp(l, 0, 100) / 100;
+  const k = (n) => (n + h / 30) % 12, a = s * Math.min(l, 1 - l), ch = (n) => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  return '#' + [ch(0), ch(8), ch(4)].map((v) => Math.round(v * 255).toString(16).padStart(2, '0')).join('');
+}
+// How bright a color may stay on a light plate depends on its hue: a yellow is bright at the luminance where a blue
+// already looks dark. These are the luminances good light UIs give each hue (blue about 0.24, pink 0.22, orange 0.30,
+// green 0.40, yellow 0.46), blended between the anchors, so every color the user picks comes out vivid, not muddy.
+const CAPS = [[0, 0.2], [20, 0.24], [35, 0.3], [50, 0.4], [60, 0.46], [85, 0.46], [110, 0.42], [150, 0.4], [180, 0.36], [200, 0.3], [225, 0.24], [255, 0.19], [285, 0.19], [320, 0.22], [345, 0.22], [360, 0.2]];
+function capFor(h) {
+  h = ((h % 360) + 360) % 360;
+  for (let i = 1; i < CAPS.length; i++) if (h <= CAPS[i][0]) { const [h0, c0] = CAPS[i - 1], [h1, c1] = CAPS[i]; return c0 + (c1 - c0) * (h - h0) / (h1 - h0); }
+  return CAPS[CAPS.length - 1][1];
+}
+// The user's color made to sit on a light plate without turning to mud: its own hue, a little more saturation (never
+// neon), and the yellow-green band leaning toward gold as it darkens. `k` scales the hue's allowance (derived shades).
+function forLight(hex, k = 1) {
+  let [h, s, l] = hexToHsl(hex);
+  const cap = capFor(h) * k;
+  if (h >= 46 && h <= 72) h -= 10;
+  if (s > 15) s = Math.min(92, s + 8);
+  else if (l > 50) l = 100 - l; // white and pale greys become dark ink: a white clock on a light screen would vanish
+  while (l > 6 && lum(hslToHex(h, s, l)) > cap) l -= 1;
+  return hslToHex(h, s, l);
+}
+// Dark or white, whichever reads better on a fill of this color.
+const onColor = (hex) => (lum(hex) > 0.2 ? '#18181b' : '#ffffff');
+const shades = (hex, onLight = false) => {
+  const [h, s, l] = hexToHsl(hex);
+  if (onLight) return { base: hex, light: forLight(hslToHex(h, s, Math.min(60, l + 8)), 1.15), shift: forLight(hslToHex(h + 38, s, l), 1.05), deep: forLight(hslToHex(h - 24, s, Math.max(18, l - 12)), 0.7) };
+  return { base: hex, light: hsl(h, s, Math.min(88, l + 14)), shift: hsl(h + 38, s, l), deep: hsl(h - 24, s, Math.max(30, l - 10)) };
+};
 
 const el = (tag, cls, html) => { const e = document.createElement(tag); if (cls) e.className = cls; if (html != null) e.innerHTML = html; return e; };
 const restart = (node, cls) => { node.classList.remove(cls); void node.offsetWidth; node.classList.add(cls); };
@@ -82,20 +131,21 @@ const FIRST_FACES = [
     blurb: 'A minimal dial with a sweeping second hand. Your color marks the hours and the second hand.',
     motion: '<b>Motion:</b> the second hand sweeps smoothly instead of ticking.',
     build(root, w, h, color) {
+      const PAL = BUILD_PAL;
       const f = el('div', 'f-analog'); root.append(f);
       const pad = Math.min(12, h * 0.1), wide = w / h >= 2;
       const dial = Math.max(20, wide ? h - 2 * pad : Math.min(w, h) - 2 * pad);
-      const c = shades(color);
+      const c = shades(color, PAL.light);
       const tickCount = dial < 70 ? 12 : 60;
       const ticks = Array.from({ length: tickCount }, (_, i) => {
         const major = tickCount === 12 || i % 5 === 0, a = i * (360 / tickCount);
-        return `<line x1="50" y1="${major ? 6 : 5}" x2="50" y2="${major ? 13 : 8}" stroke="${major ? c.base : '#3a3b44'}" stroke-width="${major ? 2.4 : 1}" stroke-linecap="round" transform="rotate(${a} 50 50)"/>`;
+        return `<line x1="50" y1="${major ? 6 : 5}" x2="50" y2="${major ? 13 : 8}" stroke="${major ? c.base : PAL.dim2}" stroke-width="${major ? 2.4 : 1}" stroke-linecap="round" transform="rotate(${a} 50 50)"/>`;
       }).join('');
-      f.insertAdjacentHTML('beforeend', `<svg width="${dial}" height="${dial}" viewBox="0 0 100 100"><circle cx="50" cy="50" r="48" fill="#16171b" stroke="#2a2b31"/>${ticks}
-        <line class="hh" x1="50" y1="54" x2="50" y2="27" stroke="#ececef" stroke-width="4.4" stroke-linecap="round"/>
-        <line class="mh" x1="50" y1="55" x2="50" y2="15" stroke="#ececef" stroke-width="3" stroke-linecap="round"/>
+      f.insertAdjacentHTML('beforeend', `<svg width="${dial}" height="${dial}" viewBox="0 0 100 100"><circle cx="50" cy="50" r="48" fill="${PAL.dial}" stroke="${PAL.line}"/>${ticks}
+        <line class="hh" x1="50" y1="54" x2="50" y2="27" stroke="${PAL.fg}" stroke-width="4.4" stroke-linecap="round"/>
+        <line class="mh" x1="50" y1="55" x2="50" y2="15" stroke="${PAL.fg}" stroke-width="3" stroke-linecap="round"/>
         <line class="sh" x1="50" y1="60" x2="50" y2="11" stroke="${c.base}" stroke-width="1.4" stroke-linecap="round"/>
-        <circle cx="50" cy="50" r="3.2" fill="${c.base}"/><circle cx="50" cy="50" r="1.3" fill="#16171b"/></svg>`);
+        <circle cx="50" cy="50" r="3.2" fill="${c.base}"/><circle cx="50" cy="50" r="1.3" fill="${PAL.dial}"/></svg>`);
       const svg = f.querySelector('svg'), hh = svg.querySelector('.hh'), mh = svg.querySelector('.mh'), sh = svg.querySelector('.sh');
       let t = null, s = null;
       if (wide) {
@@ -169,14 +219,15 @@ const FIRST_FACES = [
     blurb: 'Three rings fill through the hour, minute and second. Shades come from your color.',
     motion: '<b>Motion:</b> the seconds ring sweeps continuously; the others creep forward.',
     build(root, w, h, color) {
+      const PAL = BUILD_PAL;
       const f = el('div', 'f-rings'); root.append(f);
       const pad = Math.min(12, h * 0.1), wide = w / h >= 1.8;
       const size = Math.max(22, wide ? h - 2 * pad : Math.min(w, h) - 2 * pad);
-      const c = shades(color);
+      const c = shades(color, PAL.light);
       const R = [44, 33, 22], C = R.map((r) => 2 * Math.PI * r), stroke = size < 60 ? 9 : 7.5;
-      const ring = (i, col) => `<circle cx="50" cy="50" r="${R[i]}" fill="none" stroke="#1f2026" stroke-width="${stroke}"/><circle class="r${i}" cx="50" cy="50" r="${R[i]}" fill="none" stroke="${col}" stroke-width="${stroke}" stroke-linecap="round" stroke-dasharray="${C[i]}" transform="rotate(-90 50 50)"/>`;
+      const ring = (i, col) => `<circle cx="50" cy="50" r="${R[i]}" fill="none" stroke="${PAL.track}" stroke-width="${stroke}"/><circle class="r${i}" cx="50" cy="50" r="${R[i]}" fill="none" stroke="${col}" stroke-width="${stroke}" stroke-linecap="round" stroke-dasharray="${C[i]}" transform="rotate(-90 50 50)"/>`;
       const center = !wide && size >= 110;
-      f.insertAdjacentHTML('beforeend', `<svg width="${size}" height="${size}" viewBox="0 0 100 100">${ring(0, c.base)}${ring(1, c.light)}${ring(2, c.shift)}${center ? '<text class="ct" x="50" y="54" text-anchor="middle" font-size="12" font-weight="600" fill="#ececef" font-family="IBM Plex Sans, system-ui">0:00</text>' : ''}</svg>`);
+      f.insertAdjacentHTML('beforeend', `<svg width="${size}" height="${size}" viewBox="0 0 100 100">${ring(0, c.base)}${ring(1, c.light)}${ring(2, c.shift)}${center ? '<text class="ct" x="50" y="54" text-anchor="middle" font-size="12" font-weight="600" fill="' + PAL.fg + '" font-family="IBM Plex Sans, system-ui">0:00</text>' : ''}</svg>`);
       const arcs = [0, 1, 2].map((i) => f.querySelector(`.r${i}`)), ct = f.querySelector('.ct');
       let t = null, s = null;
       if (wide) {
@@ -248,8 +299,9 @@ const FIRST_FACES = [
     blurb: 'Heavy numerals filled with a slow-moving gradient built from your color.',
     motion: '<b>Motion:</b> the gradient drifts through the digits and a soft aura breathes behind them.',
     build(root, w, h, color) {
+      const PAL = BUILD_PAL;
       const f = el('div', 'f-glow'); root.append(f);
-      const c = shades(color), pad = Math.min(12, h * 0.1);
+      const c = shades(color, PAL.light), pad = Math.min(12, h * 0.1);
       const grad = `linear-gradient(100deg, ${c.base}, ${c.shift}, ${c.light}, ${c.deep}, ${c.base})`;
       const aura = el('div', 'aura'); aura.style.background = `radial-gradient(closest-side, ${c.base}, transparent)`; aura.style.filter = `blur(${Math.max(8, h * 0.12)}px)`;
       const showDate = h >= 80;
@@ -314,7 +366,8 @@ const NEW_FACES = [
     blurb: 'Water rises through the hour and drains at the top of the next. The digits invert where the water covers them.',
     motion: '<b>Motion:</b> two wave layers roll across the surface and bubbles drift up.',
     build(root, w, h, color) {
-      const ctx = canvasFace(root, w, h), c = shades(color), pad = Math.min(12, h * 0.1), strip = h < 80;
+      const PAL = BUILD_PAL;
+      const ctx = canvasFace(root, w, h), c = shades(color, PAL.light), pad = Math.min(12, h * 0.1), strip = h < 80;
       const bubbles = Array.from({ length: Math.max(3, Math.round(w / 60)) }, () => ({ x: Math.random() * w, y: h + Math.random() * h, r: 1 + Math.random() * 2.2, v: 8 + Math.random() * 14 }));
       let lastT = seconds();
       const surface = (level, t, phase, amp) => {
@@ -330,18 +383,18 @@ const NEW_FACES = [
         const size = fitFont(ctx, time, '600', w - 2 * pad, (h - 2 * pad) * (showDate ? 0.5 : 0.78));
         const cy = showDate ? h * 0.46 : h / 2;
         ctx.clearRect(0, 0, w, h);
-        ctx.fillStyle = '#0d0e12'; ctx.fillRect(0, 0, w, h);
+        ctx.fillStyle = PAL.plate2; ctx.fillRect(0, 0, w, h);
         const drawText = (style) => {
           ctx.fillStyle = style; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
           setFont(ctx, 600, size); ctx.fillText(time, w / 2, cy);
           if (showDate) { setFont(ctx, 500, Math.max(10, size * 0.2)); ctx.fillText(dateText, w / 2, cy + size * 0.62); }
         };
-        drawText('#ececef');
+        drawText(PAL.fg);
         surface(level - amp, t, 2.1, amp * 0.8); ctx.fillStyle = rgba(c.base, 0.28); ctx.fill();
         surface(level, t, 0, amp);
         const g = ctx.createLinearGradient(0, level, 0, h); g.addColorStop(0, c.light); g.addColorStop(1, c.deep);
         ctx.fillStyle = g; ctx.fill();
-        ctx.save(); surface(level, t, 0, amp); ctx.clip(); drawText('rgba(8,9,12,0.9)');
+        ctx.save(); surface(level, t, 0, amp); ctx.clip(); drawText(PAL.light ? onColor(color) : PAL.onWater);
         for (const b of bubbles) {
           b.y -= b.v * dt; b.x += Math.sin(t * 2 + b.r) * 0.2;
           if (b.y < level) { b.y = h + Math.random() * 20; b.x = Math.random() * w; }
@@ -572,8 +625,9 @@ const NEW_FACES = [
     blurb: 'Editorial type: a huge outlined hour runs off the edges and the minutes sit on top in solid colour.',
     motion: '<b>Motion:</b> the hour drifts slowly; new minutes slide up into place.',
     build(root, w, h, color) {
+      const PAL = BUILD_PAL;
       const f = el('div', 'f-poster'); root.append(f);
-      const strip = h < 80, c = shades(color);
+      const strip = h < 80, c = shades(color, PAL.light);
       const hourSize = h * (strip ? 1.5 : 1.25);
       const hourEl = el('div', 'ph'); hourEl.style.cssText = `font-size:${hourSize}px;-webkit-text-stroke:${Math.max(1, hourSize * 0.012)}px ${c.base};left:${-hourSize * 0.04}px;top:${(h - hourSize) / 2 - hourSize * 0.06}px`;
       const minSize = Math.min(h * (strip ? 0.82 : 0.5), w * 0.34);
@@ -866,7 +920,8 @@ const MOTION_FACES = [
     blurb: 'A row of pendulums with slightly different lengths. They drift in and out of step, making snakes, waves and chaos, and line up again every 30 seconds.',
     motion: '<b>Motion:</b> hypnotic, always-moving wave patterns with soft trails.',
     build(root, w, h, color) {
-      const ctx = canvasFace(root, w, h), c = shades(color), pad = Math.min(12, h * 0.1), strip = h < 90;
+      const PAL = BUILD_PAL;
+      const ctx = canvasFace(root, w, h), c = shades(color, PAL.light), pad = Math.min(12, h * 0.1), strip = h < 90;
       const [hue, sat, lig] = hexToHsl(color);
       const textSize = strip ? fitFont(ctx, '12:59', '600', w * 0.3, (h - 2 * pad) * 0.62) : fitFont(ctx, '12:59', '600', w - 2 * pad, h * 0.26);
       const fieldX = pad, fieldW = strip ? w - textSize * 3 - 3 * pad : w - 2 * pad;
@@ -875,23 +930,23 @@ const MOTION_FACES = [
       const T = 30;
       return (d) => {
         const p = parts(d), t = (d.getTime() / 1000) % 3600;
-        ctx.fillStyle = 'rgba(10,10,13,0.32)'; ctx.fillRect(0, 0, w, h);
+        ctx.fillStyle = PAL.fade; ctx.fillRect(0, 0, w, h);
         const cy = fieldTop + fieldH / 2, amp = fieldH * 0.42, r = Math.max(2, Math.min(fieldW / N * 0.32, fieldH * 0.08));
         for (let i = 0; i < N; i++) {
           const x = fieldX + (i + 0.5) * (fieldW / N);
           const y = cy + Math.sin((2 * Math.PI * (18 + i) / T) * t) * amp;
           const col = hsl(hue + (i / N) * 50 - 25, sat, lig);
-          ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x, fieldTop); ctx.lineTo(x, y); ctx.stroke();
+          ctx.strokeStyle = PAL.thread; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(x, fieldTop); ctx.lineTo(x, y); ctx.stroke();
           ctx.save(); ctx.shadowColor = col; ctx.shadowBlur = r * 3; ctx.fillStyle = col;
           ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill(); ctx.restore();
         }
-        ctx.fillStyle = '#0a0a0d';
+        ctx.fillStyle = PAL.cover;
         if (strip) ctx.fillRect(w - textSize * 3 - pad, 0, textSize * 3 + pad, h); else ctx.fillRect(0, 0, w, fieldTop - 2);
-        ctx.fillStyle = '#ececef'; ctx.textBaseline = 'middle'; setFont(ctx, 600, textSize);
+        ctx.fillStyle = PAL.fg; ctx.textBaseline = 'middle'; setFont(ctx, 600, textSize);
         if (strip) { ctx.textAlign = 'right'; ctx.fillText(hhmm(p), w - pad, h / 2); }
         else {
           ctx.textAlign = 'left'; ctx.fillText(hhmm(p), pad, pad + textSize * 0.6);
-          ctx.textAlign = 'right'; ctx.fillStyle = c.light; setFont(ctx, 500, Math.max(9, textSize * 0.32)); ctx.fillText(`${p.day}, ${p.date}`, w - pad, pad + textSize * 0.6);
+          ctx.textAlign = 'right'; ctx.fillStyle = PAL.light ? PAL.muted : c.light; setFont(ctx, 500, Math.max(9, textSize * 0.32)); ctx.fillText(`${p.day}, ${p.date}`, w - pad, pad + textSize * 0.6);
         }
       };
     },
@@ -930,7 +985,8 @@ const INSPIRED_FACES = [
     blurb: 'Twenty-four tiny analog dials whose hands line up to draw the digits. Inspired by ClockClock 24 by Humans Since 1982.',
     motion: '<b>Motion:</b> every minute (and every 20 s here) the hands spin in a wave across the dials, sweep into diagonal patterns, then lock back into the time.',
     build(root, w, h, color) {
-      const ctx = canvasFace(root, w, h), c = shades(color), pad = Math.min(10, h * 0.08);
+      const PAL = BUILD_PAL;
+      const ctx = canvasFace(root, w, h), c = shades(color, PAL.light), pad = Math.min(10, h * 0.08);
       const gapX = Math.max(2, w * 0.012);
       const dial = Math.min((w - 2 * pad - gapX * 1.5) / 8, (h - 2 * pad) / 3);
       const ox = (w - dial * 8 - gapX * 1.5) / 2, oy = (h - dial * 3) / 2;
@@ -970,12 +1026,12 @@ const INSPIRED_FACES = [
           plan(t + 2.4, targetsFor(str), 1, 0.07, 1.9);
           lastStr = str;
         }
-        ctx.clearRect(0, 0, w, h); ctx.fillStyle = '#0c0d10'; ctx.fillRect(0, 0, w, h);
+        ctx.clearRect(0, 0, w, h); ctx.fillStyle = PAL.plate2; ctx.fillRect(0, 0, w, h);
         const r = dial * 0.46;
         for (let row = 0; row < 3; row++) for (let col = 0; col < 8; col++) {
           const x = dialPos(col), y = oy + row * dial + dial / 2;
-          ctx.fillStyle = '#16171c'; ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
-          ctx.strokeStyle = '#24252c'; ctx.lineWidth = 1; ctx.stroke();
+          ctx.fillStyle = PAL.dial2; ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+          ctx.strokeStyle = PAL.line2; ctx.lineWidth = 1; ctx.stroke();
           for (let k = 0; k < 2; k++) {
             const hand = hands[handIndex(col, row, k)];
             while (hand.moves.length && t >= hand.moves[0].start + hand.moves[0].dur) { hand.angle = hand.moves[0].to; hand.moves.shift(); }
@@ -983,7 +1039,7 @@ const INSPIRED_FACES = [
             const mv = hand.moves[0];
             if (mv && t >= mv.start) a = mv.from + (mv.to - mv.from) * easeInOut((t - mv.start) / mv.dur);
             const rad = (a - 90) * Math.PI / 180;
-            ctx.strokeStyle = k ? c.light : '#ececef'; ctx.lineCap = 'round'; ctx.lineWidth = Math.max(1.2, dial * 0.075);
+            ctx.strokeStyle = k ? c.light : PAL.fg; ctx.lineCap = 'round'; ctx.lineWidth = Math.max(1.2, dial * 0.075);
             ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + Math.cos(rad) * r * 0.86, y + Math.sin(rad) * r * 0.86); ctx.stroke();
           }
           ctx.fillStyle = c.base; ctx.beginPath(); ctx.arc(x, y, Math.max(1, dial * 0.05), 0, Math.PI * 2); ctx.fill();
@@ -1150,6 +1206,7 @@ const INSPIRED_FACES = [
     blurb: 'Squares of 1, 1, 2, 3 and 5. Red adds to the hour, green to the minutes (×5), blue to both. A puzzle for your desk.',
     motion: '<b>Motion:</b> tiles flip to their new colours one after another every five minutes, picking a fresh combination each time.',
     build(root, w, h) {
+      const PAL = BUILD_PAL;
       const f = el('div', 'f-fib'); root.append(f);
       const pad = Math.min(10, h * 0.08), side = w / h >= 2.4;
       const textW = side ? Math.min(w * 0.36, (h - 2 * pad) * 2.2) : 0;
@@ -1163,7 +1220,7 @@ const INSPIRED_FACES = [
         legend = el('div', 'flegend', '<span><i style="background:#e5484d"></i>hours</span><span><i style="background:#30a46c"></i>minutes</span><span><i style="background:#3e63dd"></i>both</span>');
         legend.style.fontSize = `${Math.max(9, h * 0.045)}px`; f.style.flexDirection = 'column'; f.style.gap = `${h * 0.03}px`; f.append(legend);
       }
-      const COLORS = ['#f3f1ea', '#e5484d', '#30a46c', '#3e63dd'];
+      const COLORS = [PAL.tile, '#e5484d', '#30a46c', '#3e63dd'];
       let last = '';
       return (d) => {
         const p = parts(d), m5 = Math.floor(p.m / 5), key = `${p.hd}:${m5}`;
@@ -1184,8 +1241,9 @@ const INSPIRED_FACES = [
     blurb: 'Columns of digits glide up and down so the current time lines up on a highlighted row of dots.',
     motion: '<b>Motion:</b> the strips slide with an easing glide; on big blocks a seconds pair keeps everything moving.',
     build(root, w, h, color) {
+      const PAL = BUILD_PAL;
       const f = el('div', 'f-strips'); root.append(f);
-      const c = shades(color), pad = Math.min(10, h * 0.08);
+      const c = shades(color, PAL.light), pad = Math.min(10, h * 0.08);
       const showSec = h >= 150 && w >= 300;
       const ranges = showSec ? [HOUR12 ? 2 : 3, 10, 6, 10, 6, 10] : [HOUR12 ? 2 : 3, 10, 6, 10];
       const cols = ranges.length, gapExtra = Math.max(4, w * 0.02);
@@ -1228,7 +1286,7 @@ const FACES = [...INSPIRED_FACES, ...MOTION_FACES, ...NEW_FACES, ...FIRST_FACES]
 
 const CATEGORY = {"digital": "classic", "analog": "classic", "flip": "classic", "glow": "classic", "word": "classic", "poster": "classic", "nixie": "retro", "led": "retro", "crt": "retro", "pong": "retro", "slots": "retro", "tape": "retro", "tide": "ambient", "sky": "ambient", "aurora": "ambient", "lava": "ambient", "sand": "ambient", "pendulum": "ambient", "orbit": "ambient", "clockclock": "kinetic", "ferro": "kinetic", "swarm": "kinetic", "rings": "kinetic", "radar": "kinetic", "fibonacci": "kinetic", "strips": "kinetic"};
 const DEFAULT_COLOR = '#93c5fd';
-const CSS = ".fc-root{--fg:#ececef;--muted:#a1a1aa;--faint:#5c5c66;--line:#2a2b31;--display:\"Bricolage Grotesque\",\"Segoe UI\",system-ui,sans-serif;--body:\"IBM Plex Sans\",\"Segoe UI\",system-ui,sans-serif;--mono:\"IBM Plex Mono\",ui-monospace,Consolas,monospace;--flip:\"Barlow Condensed\",\"Arial Narrow\",system-ui,sans-serif;position:relative;overflow:hidden;background:#111215;font-family:var(--body);}\n.fc-root .f-digital{position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--fg);}\n.fc-root .f-digital .time{font-family: var(--body); font-weight: 500; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; display: flex; align-items: baseline; line-height: 1;}\n.fc-root .f-digital .d{display: inline-block; width: .6em; text-align: center;}\n.fc-root .f-digital .d.roll{animation: roll .45s cubic-bezier(.2, .8, .2, 1);}\n.fc-root .f-digital .c{display: inline-block; width: .3em; text-align: center; transition: opacity .2s;}\n.fc-root .f-digital .c.dim{opacity: .25;}\n.fc-root .f-digital .ap{font-size: .32em; color: var(--muted); margin-left: .25em; letter-spacing: .04em;}\n.fc-root .f-digital .date{color: var(--muted); line-height: 1.2;}\n@keyframes roll{ from { transform: translateY(45%); opacity: 0; filter: blur(2px); } to { transform: none; opacity: 1; filter: none; } }\n@keyframes pulse{ 0% { opacity: 1; } 50% { opacity: .25; } }\n.fc-root .f-analog, .fc-root .f-rings{position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;}\n.fc-root .f-analog svg, .fc-root .f-rings svg{display: block; flex: 0 0 auto; overflow: visible;}\n.fc-root .side{display: flex; flex-direction: column; justify-content: center; min-width: 0;}\n.fc-root .side .t{font-family: var(--body); font-weight: 500; font-variant-numeric: tabular-nums; color: var(--fg); line-height: 1.05; white-space: nowrap;}\n.fc-root .side .s{color: var(--muted); line-height: 1.25; white-space: nowrap;}\n.fc-root .f-flip{position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;}\n.fc-root .f-flip .row{display: flex; align-items: center;}\n.fc-root .card{position: relative; perspective: 400px; font-family: var(--flip); font-weight: 600; color: #f4f4f5;}\n.fc-root .half{position: absolute; left: 0; right: 0; height: 50%; overflow: hidden; background: #1f2026; backface-visibility: hidden;}\n.fc-root .half span{position: absolute; left: 0; right: 0; text-align: center;}\n.fc-root .half.top{top: 0; border-radius: inherit; border-bottom-left-radius: 0; border-bottom-right-radius: 0; background: #23242b;}\n.fc-root .half.bot{bottom: 0; border-radius: inherit; border-top-left-radius: 0; border-top-right-radius: 0;}\n.fc-root .half.bot span{bottom: 0;}\n.fc-root .half.top span{top: 0;}\n.fc-root .half.ftop{top: 0; transform-origin: bottom; background: #23242b; border-radius: inherit; border-bottom-left-radius: 0; border-bottom-right-radius: 0; z-index: 2;}\n.fc-root .half.ftop span{top: 0;}\n.fc-root .half.fbot{bottom: 0; transform-origin: top; border-radius: inherit; border-top-left-radius: 0; border-top-right-radius: 0; z-index: 2; transform: rotateX(90deg);}\n.fc-root .half.fbot span{bottom: 0;}\n.fc-root .half.ftop, .fc-root .half.fbot{visibility: hidden;}\n.fc-root .card.go .half.ftop, .fc-root .card.go .half.fbot{visibility: visible;}\n.fc-root .card .hinge{position: absolute; left: 0; right: 0; top: 50%; height: 1px; background: #0b0b0d; z-index: 3;}\n.fc-root .card.go .ftop{animation: flipTop .26s ease-in forwards;}\n.fc-root .card.go .fbot{animation: flipBot .26s .26s ease-out forwards;}\n@keyframes flipTop{ to { transform: rotateX(-90deg); } }\n@keyframes flipBot{ from { transform: rotateX(90deg); } to { transform: rotateX(0); } }\n.fc-root .f-flip .dots{display: flex; flex-direction: column; justify-content: center;}\n.fc-root .f-flip .dots i{display: block; border-radius: 50%; background: #3a3b44;}\n.fc-root .f-flip .date{color: var(--muted); font-family: var(--body); line-height: 1.2;}\n.fc-root .f-word{position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;}\n.fc-root .f-word .grid{display: grid; position: relative; font-family: var(--mono); font-weight: 500;}\n.fc-root .f-word .grid span{display: grid; place-items: center; color: #2c2d34; transition: color .7s ease, text-shadow .7s ease;}\n.fc-root .f-word .grid span.on{color: var(--wc); text-shadow: 0 0 .6em color-mix(in srgb, var(--wc) 55%, transparent);}\n.fc-root .f-word .mdot{position: absolute; border-radius: 50%; background: #2c2d34; transition: background .7s ease;}\n.fc-root .f-word .mdot.on{background: var(--wc);}\n.fc-root .f-word .phrase{font-family: var(--display); font-weight: 600; line-height: 1.08; text-align: center; color: var(--fg);}\n.fc-root .f-word .phrase em{font-style: normal; color: var(--wc);}\n.fc-root .f-word .phrase.swap{animation: fadeUp .7s ease;}\n@keyframes fadeUp{ from { opacity: 0; transform: translateY(12%); } to { opacity: 1; transform: none; } }\n.fc-root .f-glow{position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;}\n.fc-root .f-glow .aura{position: absolute; inset: 15% 20%; border-radius: 50%; opacity: .32; animation: breathe 6s ease-in-out infinite;}\n.fc-root .f-glow .t{position: relative; font-family: var(--display); font-weight: 800; letter-spacing: -0.04em; line-height: 1; font-variant-numeric: tabular-nums; background-size: 300% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: drift 9s linear infinite; white-space: nowrap;}\n.fc-root .f-glow .s{position: relative; color: var(--muted); line-height: 1.2;}\n@keyframes drift{ to { background-position: 300% 0; } }\n@keyframes breathe{ 50% { transform: scale(1.12); opacity: .45; } }\n.fc-root .f-nixie{position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: radial-gradient(ellipse at 50% 120%, #1a0e06, #0b0908 70%);}\n.fc-root .tube{position: relative; overflow: hidden; background: linear-gradient(90deg, rgba(255,255,255,.07), rgba(255,255,255,.16) 18%, rgba(255,255,255,.03) 45%, rgba(255,255,255,.02) 75%, rgba(255,255,255,.1)), #140d09; box-shadow: inset 0 0 0 1px rgba(255,255,255,.08), inset 0 -6px 14px rgba(0,0,0,.6); font-family: \"IBM Plex Sans\", system-ui, sans-serif; font-weight: 300;}\n.fc-root .tube .mesh{position: absolute; inset: 8% 10%; background: repeating-linear-gradient(60deg, rgba(255,255,255,.035) 0 1px, transparent 1px 5px), repeating-linear-gradient(-60deg, rgba(255,255,255,.035) 0 1px, transparent 1px 5px);}\n.fc-root .tube span{position: absolute; inset: 0; display: grid; place-items: center; color: rgba(255, 150, 70, .06); line-height: 1; transition: color .25s ease, text-shadow .25s ease;}\n.fc-root .tube span.lit{color: #ffc27d; text-shadow: 0 0 .05em #fff1d6, 0 0 .14em #ff9a3c, 0 0 .4em #ff6a10, 0 0 .9em rgba(255, 80, 0, .6);}\n.fc-root .tube span.flick{animation: flick .5s steps(1);}\n@keyframes flick{ 0% { opacity: .2; } 15% { opacity: 1; } 25% { opacity: .35; } 40% { opacity: 1; } 55% { opacity: .7; } 70% { opacity: 1; } }\n.fc-root .ncolon{display: flex; flex-direction: column; align-items: center; justify-content: center;}\n.fc-root .ncolon i{display: block; border-radius: 50%; background: #ffb067; box-shadow: 0 0 6px #ff7a1a, 0 0 14px rgba(255, 90, 0, .6); transition: opacity .3s;}\n.fc-root .ncolon.dim i{opacity: .35;}\n.fc-root .f-poster{position: absolute; inset: 0; overflow: hidden; background: #0d0e12;}\n.fc-root .f-poster .ph{position: absolute; font-family: var(--display); font-weight: 800; line-height: 1; color: transparent; letter-spacing: -0.06em; white-space: nowrap; animation: posterDrift 24s ease-in-out infinite alternate;}\n.fc-root .f-poster .pm{position: absolute; font-family: var(--display); font-weight: 800; line-height: .9; letter-spacing: -0.04em; font-variant-numeric: tabular-nums;}\n.fc-root .f-poster .pm.slide{animation: slideUp .6s cubic-bezier(.2, .8, .2, 1);}\n.fc-root .f-poster .ptag{position: absolute; top: 8%; right: 5%; font-family: var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--muted);}\n@keyframes posterDrift{ to { transform: translateX(4%); } }\n@keyframes slideUp{ from { transform: translateY(60%); opacity: 0; clip-path: inset(0 0 100% 0); } to { transform: none; opacity: 1; clip-path: inset(0); } }\n.fc-root .f-slots{position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: radial-gradient(ellipse at 50% 0%, #1a1b22, #0b0b0e 70%);}\n.fc-root .reel{position: relative; overflow: hidden; background: #f4f1ea;}\n.fc-root .reel .strip{position: absolute; left: 0; right: 0; top: 0; font-family: var(--display); font-weight: 800; color: #111216; text-align: center; will-change: transform;}\n.fc-root .reel .strip span{display: block;}\n.fc-root .reel .strip.spin{animation: reelBlur .95s ease-out both;}\n.fc-root .reel .gloss{position: absolute; inset: 0; pointer-events: none; background: linear-gradient(180deg, rgba(0,0,0,.55), rgba(0,0,0,0) 28%, rgba(255,255,255,.18) 48%, rgba(0,0,0,0) 62%, rgba(0,0,0,.55));}\n@keyframes reelBlur{ 0% { filter: blur(0); } 20% { filter: blur(3px); } 70% { filter: blur(1.5px); } 100% { filter: blur(0); } }\n.fc-root .scolon{display: flex; flex-direction: column; align-items: center; justify-content: center;}\n.fc-root .scolon i{display: block; border-radius: 50%;}\n.fc-root .f-fib{position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: #0e0e11;}\n.fc-root .fboard{position: relative; flex: 0 0 auto;}\n.fc-root .ftile{position: absolute; box-sizing: border-box; border: 2px solid #0e0e11; background: #f3f1ea; transition: background .5s ease;}\n.fc-root .ftile.flip{animation: tileFlip .6s ease;}\n@keyframes tileFlip{ 0% { transform: perspective(300px) rotateY(0); } 50% { transform: perspective(300px) rotateY(90deg); } 100% { transform: perspective(300px) rotateY(0); } }\n.fc-root .fread{font-family: var(--body); font-weight: 600; color: var(--fg); font-variant-numeric: tabular-nums;}\n.fc-root .flegend{display: flex; gap: 1.2em; color: var(--muted);}\n.fc-root .flegend span{display: inline-flex; align-items: center; gap: .4em;}\n.fc-root .flegend i{width: .8em; height: .8em; border-radius: 2px; display: inline-block;}\n.fc-root .f-strips{position: absolute; inset: 0; overflow: hidden; background: #0c0d10;}\n.fc-root .sband{position: absolute; left: 0; right: 0; border-block: 1px solid;}\n.fc-root .srow{position: absolute; inset: 0; display: flex; justify-content: center;}\n.fc-root .scol{position: relative; overflow: hidden; -webkit-mask-image: linear-gradient(180deg, transparent, #000 30%, #000 70%, transparent); mask-image: linear-gradient(180deg, transparent, #000 30%, #000 70%, transparent);}\n.fc-root .slist{position: absolute; left: 0; right: 0; top: 0;}\n.fc-root .slist span{position: relative; display: grid; place-items: center; font-family: var(--body); font-weight: 600; color: #3f3f46; font-variant-numeric: tabular-nums; transition: color .5s ease;}\n.fc-root .slist span::before{content: \"\"; position: absolute; width: var(--dot, 0); height: var(--dot, 0); border-radius: 50%; background: var(--dc, transparent); transition: background .5s ease; z-index: -1;}\n.fc-root .slist span.on{color: #0b0b0e;}\n.fc-root .slist{isolation: isolate;}\n@media (prefers-reduced-motion: reduce){.fc-root .f-digital .d.roll, .fc-root .f-digital .c, .fc-root .card.go .ftop, .fc-root .card.go .fbot, .fc-root .f-word .phrase.swap, .fc-root .f-glow .t, .fc-root .f-glow .aura, .fc-root .tube span.flick, .fc-root .f-poster .ph, .fc-root .f-poster .pm.slide, .fc-root .reel .strip.spin, .fc-root .ftile.flip{animation: none !important;}\n.fc-root .card.go .ftop{transform: rotateX(-90deg);}\n.fc-root .card.go .fbot{transform: none;}}";
+const CSS = ".fc-root{--fg:#ececef;--muted:#a1a1aa;--faint:#5c5c66;--line:#2a2b31;--display:\"Bricolage Grotesque\",\"Segoe UI\",system-ui,sans-serif;--body:\"IBM Plex Sans\",\"Segoe UI\",system-ui,sans-serif;--mono:\"IBM Plex Mono\",ui-monospace,Consolas,monospace;--flip:\"Barlow Condensed\",\"Arial Narrow\",system-ui,sans-serif;position:relative;overflow:hidden;background:var(--plate,#111215);font-family:var(--body);}\n.fc-root .f-digital{position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--fg);}\n.fc-root .f-digital .time{font-family: var(--body); font-weight: 500; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; display: flex; align-items: baseline; line-height: 1;}\n.fc-root .f-digital .d{display: inline-block; width: .6em; text-align: center;}\n.fc-root .f-digital .d.roll{animation: roll .45s cubic-bezier(.2, .8, .2, 1);}\n.fc-root .f-digital .c{display: inline-block; width: .3em; text-align: center; transition: opacity .2s;}\n.fc-root .f-digital .c.dim{opacity: .25;}\n.fc-root .f-digital .ap{font-size: .32em; color: var(--muted); margin-left: .25em; letter-spacing: .04em;}\n.fc-root .f-digital .date{color: var(--muted); line-height: 1.2;}\n@keyframes roll{ from { transform: translateY(45%); opacity: 0; filter: blur(2px); } to { transform: none; opacity: 1; filter: none; } }\n@keyframes pulse{ 0% { opacity: 1; } 50% { opacity: .25; } }\n.fc-root .f-analog, .fc-root .f-rings{position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;}\n.fc-root .f-analog svg, .fc-root .f-rings svg{display: block; flex: 0 0 auto; overflow: visible;}\n.fc-root .side{display: flex; flex-direction: column; justify-content: center; min-width: 0;}\n.fc-root .side .t{font-family: var(--body); font-weight: 500; font-variant-numeric: tabular-nums; color: var(--fg); line-height: 1.05; white-space: nowrap;}\n.fc-root .side .s{color: var(--muted); line-height: 1.25; white-space: nowrap;}\n.fc-root .f-flip{position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;}\n.fc-root .f-flip .row{display: flex; align-items: center;}\n.fc-root .card{position: relative; perspective: 400px; font-family: var(--flip); font-weight: 600; color: #f4f4f5;}\n.fc-root .half{position: absolute; left: 0; right: 0; height: 50%; overflow: hidden; background: #1f2026; backface-visibility: hidden;}\n.fc-root .half span{position: absolute; left: 0; right: 0; text-align: center;}\n.fc-root .half.top{top: 0; border-radius: inherit; border-bottom-left-radius: 0; border-bottom-right-radius: 0; background: #23242b;}\n.fc-root .half.bot{bottom: 0; border-radius: inherit; border-top-left-radius: 0; border-top-right-radius: 0;}\n.fc-root .half.bot span{bottom: 0;}\n.fc-root .half.top span{top: 0;}\n.fc-root .half.ftop{top: 0; transform-origin: bottom; background: #23242b; border-radius: inherit; border-bottom-left-radius: 0; border-bottom-right-radius: 0; z-index: 2;}\n.fc-root .half.ftop span{top: 0;}\n.fc-root .half.fbot{bottom: 0; transform-origin: top; border-radius: inherit; border-top-left-radius: 0; border-top-right-radius: 0; z-index: 2; transform: rotateX(90deg);}\n.fc-root .half.fbot span{bottom: 0;}\n.fc-root .half.ftop, .fc-root .half.fbot{visibility: hidden;}\n.fc-root .card.go .half.ftop, .fc-root .card.go .half.fbot{visibility: visible;}\n.fc-root .card .hinge{position: absolute; left: 0; right: 0; top: 50%; height: 1px; background: #0b0b0d; z-index: 3;}\n.fc-root .card.go .ftop{animation: flipTop .26s ease-in forwards;}\n.fc-root .card.go .fbot{animation: flipBot .26s .26s ease-out forwards;}\n@keyframes flipTop{ to { transform: rotateX(-90deg); } }\n@keyframes flipBot{ from { transform: rotateX(90deg); } to { transform: rotateX(0); } }\n.fc-root .f-flip .dots{display: flex; flex-direction: column; justify-content: center;}\n.fc-root .f-flip .dots i{display: block; border-radius: 50%; background: #3a3b44;}\n.fc-root .f-flip .date{color: var(--muted); font-family: var(--body); line-height: 1.2;}\n.fc-root .f-word{position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;}\n.fc-root .f-word .grid{display: grid; position: relative; font-family: var(--mono); font-weight: 500;}\n.fc-root .f-word .grid span{display: grid; place-items: center; color: var(--dim, #2c2d34); transition: color .7s ease, text-shadow .7s ease;}\n.fc-root .f-word .grid span.on{color: var(--wc); text-shadow: 0 0 .6em color-mix(in srgb, var(--wc) 55%, transparent);}\n.fc-root .f-word .mdot{position: absolute; border-radius: 50%; background: var(--dim, #2c2d34); transition: background .7s ease;}\n.fc-root .f-word .mdot.on{background: var(--wc);}\n.fc-root .f-word .phrase{font-family: var(--display); font-weight: 600; line-height: 1.08; text-align: center; color: var(--fg);}\n.fc-root .f-word .phrase em{font-style: normal; color: var(--wc);}\n.fc-root .f-word .phrase.swap{animation: fadeUp .7s ease;}\n@keyframes fadeUp{ from { opacity: 0; transform: translateY(12%); } to { opacity: 1; transform: none; } }\n.fc-root .f-glow{position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;}\n.fc-root .f-glow .aura{position: absolute; inset: 15% 20%; border-radius: 50%; opacity: .32; animation: breathe 6s ease-in-out infinite;}\n.fc-root .f-glow .t{position: relative; font-family: var(--display); font-weight: 800; letter-spacing: -0.04em; line-height: 1; font-variant-numeric: tabular-nums; background-size: 300% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: drift 9s linear infinite; white-space: nowrap;}\n.fc-root .f-glow .s{position: relative; color: var(--muted); line-height: 1.2;}\n@keyframes drift{ to { background-position: 300% 0; } }\n@keyframes breathe{ 50% { transform: scale(1.12); opacity: .45; } }\n.fc-root .f-nixie{position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: radial-gradient(ellipse at 50% 120%, #1a0e06, #0b0908 70%);}\n.fc-root .tube{position: relative; overflow: hidden; background: linear-gradient(90deg, rgba(255,255,255,.07), rgba(255,255,255,.16) 18%, rgba(255,255,255,.03) 45%, rgba(255,255,255,.02) 75%, rgba(255,255,255,.1)), #140d09; box-shadow: inset 0 0 0 1px rgba(255,255,255,.08), inset 0 -6px 14px rgba(0,0,0,.6); font-family: \"IBM Plex Sans\", system-ui, sans-serif; font-weight: 300;}\n.fc-root .tube .mesh{position: absolute; inset: 8% 10%; background: repeating-linear-gradient(60deg, rgba(255,255,255,.035) 0 1px, transparent 1px 5px), repeating-linear-gradient(-60deg, rgba(255,255,255,.035) 0 1px, transparent 1px 5px);}\n.fc-root .tube span{position: absolute; inset: 0; display: grid; place-items: center; color: rgba(255, 150, 70, .06); line-height: 1; transition: color .25s ease, text-shadow .25s ease;}\n.fc-root .tube span.lit{color: #ffc27d; text-shadow: 0 0 .05em #fff1d6, 0 0 .14em #ff9a3c, 0 0 .4em #ff6a10, 0 0 .9em rgba(255, 80, 0, .6);}\n.fc-root .tube span.flick{animation: flick .5s steps(1);}\n@keyframes flick{ 0% { opacity: .2; } 15% { opacity: 1; } 25% { opacity: .35; } 40% { opacity: 1; } 55% { opacity: .7; } 70% { opacity: 1; } }\n.fc-root .ncolon{display: flex; flex-direction: column; align-items: center; justify-content: center;}\n.fc-root .ncolon i{display: block; border-radius: 50%; background: #ffb067; box-shadow: 0 0 6px #ff7a1a, 0 0 14px rgba(255, 90, 0, .6); transition: opacity .3s;}\n.fc-root .ncolon.dim i{opacity: .35;}\n.fc-root .f-poster{position: absolute; inset: 0; overflow: hidden; background: var(--plate2, #0d0e12);}\n.fc-root .f-poster .ph{position: absolute; font-family: var(--display); font-weight: 800; line-height: 1; color: transparent; letter-spacing: -0.06em; white-space: nowrap; animation: posterDrift 24s ease-in-out infinite alternate;}\n.fc-root .f-poster .pm{position: absolute; font-family: var(--display); font-weight: 800; line-height: .9; letter-spacing: -0.04em; font-variant-numeric: tabular-nums;}\n.fc-root .f-poster .pm.slide{animation: slideUp .6s cubic-bezier(.2, .8, .2, 1);}\n.fc-root .f-poster .ptag{position: absolute; top: 8%; right: 5%; font-family: var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--muted);}\n@keyframes posterDrift{ to { transform: translateX(4%); } }\n@keyframes slideUp{ from { transform: translateY(60%); opacity: 0; clip-path: inset(0 0 100% 0); } to { transform: none; opacity: 1; clip-path: inset(0); } }\n.fc-root .f-slots{position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: radial-gradient(ellipse at 50% 0%, #1a1b22, #0b0b0e 70%);}\n.fc-root .reel{position: relative; overflow: hidden; background: #f4f1ea;}\n.fc-root .reel .strip{position: absolute; left: 0; right: 0; top: 0; font-family: var(--display); font-weight: 800; color: #111216; text-align: center; will-change: transform;}\n.fc-root .reel .strip span{display: block;}\n.fc-root .reel .strip.spin{animation: reelBlur .95s ease-out both;}\n.fc-root .reel .gloss{position: absolute; inset: 0; pointer-events: none; background: linear-gradient(180deg, rgba(0,0,0,.55), rgba(0,0,0,0) 28%, rgba(255,255,255,.18) 48%, rgba(0,0,0,0) 62%, rgba(0,0,0,.55));}\n@keyframes reelBlur{ 0% { filter: blur(0); } 20% { filter: blur(3px); } 70% { filter: blur(1.5px); } 100% { filter: blur(0); } }\n.fc-root .scolon{display: flex; flex-direction: column; align-items: center; justify-content: center;}\n.fc-root .scolon i{display: block; border-radius: 50%;}\n.fc-root .f-fib{position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: var(--plate2, #0e0e11);}\n.fc-root .fboard{position: relative; flex: 0 0 auto;}\n.fc-root .ftile{position: absolute; box-sizing: border-box; border: 2px solid var(--plate2, #0e0e11); background: var(--tile, #f3f1ea); transition: background .5s ease;}\n.fc-root .ftile.flip{animation: tileFlip .6s ease;}\n@keyframes tileFlip{ 0% { transform: perspective(300px) rotateY(0); } 50% { transform: perspective(300px) rotateY(90deg); } 100% { transform: perspective(300px) rotateY(0); } }\n.fc-root .fread{font-family: var(--body); font-weight: 600; color: var(--fg); font-variant-numeric: tabular-nums;}\n.fc-root .flegend{display: flex; gap: 1.2em; color: var(--muted);}\n.fc-root .flegend span{display: inline-flex; align-items: center; gap: .4em;}\n.fc-root .flegend i{width: .8em; height: .8em; border-radius: 2px; display: inline-block;}\n.fc-root .f-strips{position: absolute; inset: 0; overflow: hidden; background: var(--plate2, #0c0d10);}\n.fc-root .sband{position: absolute; left: 0; right: 0; border-block: 1px solid;}\n.fc-root .srow{position: absolute; inset: 0; display: flex; justify-content: center;}\n.fc-root .scol{position: relative; overflow: hidden; -webkit-mask-image: linear-gradient(180deg, transparent, #000 30%, #000 70%, transparent); mask-image: linear-gradient(180deg, transparent, #000 30%, #000 70%, transparent);}\n.fc-root .slist{position: absolute; left: 0; right: 0; top: 0;}\n.fc-root .slist span{position: relative; display: grid; place-items: center; font-family: var(--body); font-weight: 600; color: var(--stripDim, #3f3f46); font-variant-numeric: tabular-nums; transition: color .5s ease;}\n.fc-root .slist span::before{content: \"\"; position: absolute; width: var(--dot, 0); height: var(--dot, 0); border-radius: 50%; background: var(--dc, transparent); transition: background .5s ease; z-index: -1;}\n.fc-root .slist span.on{color: var(--onAccent, #0b0b0e);}\n.fc-root .slist{isolation: isolate;}\n@media (prefers-reduced-motion: reduce){.fc-root .f-digital .d.roll, .fc-root .f-digital .c, .fc-root .card.go .ftop, .fc-root .card.go .fbot, .fc-root .f-word .phrase.swap, .fc-root .f-glow .t, .fc-root .f-glow .aura, .fc-root .tube span.flick, .fc-root .f-poster .ph, .fc-root .f-poster .pm.slide, .fc-root .reel .strip.spin, .fc-root .ftile.flip{animation: none !important;}\n.fc-root .card.go .ftop{transform: rotateX(-90deg);}\n.fc-root .card.go .fbot{transform: none;}}";
 // CSS animations (Nixie flicker, Glow drift, ...) stop while a face is paused.
 const PAUSED_CSS = '.fc-root.fc-paused *{animation-play-state:paused!important}';
 const styled = new WeakSet();
@@ -1290,22 +1348,34 @@ function mount(host, { face, color, width, height, hour12 = true, live = true, p
   if (!styled.has(doc)) { const style = doc.createElement('style'); style.textContent = CSS + PAUSED_CSS; doc.head.append(style); styled.add(doc); }
   const def = FACES.find((item) => item.id === face) || FACES.find((item) => item.id === 'digital');
   const w = Math.max(20, width), h = Math.max(20, height);
-  host.textContent = '';
-  const root = doc.createElement('div');
-  root.className = 'fc-root';
-  root.style.width = `${w}px`; root.style.height = `${h}px`;
-  host.append(root);
-  HOUR12 = hour12;
-  MAX_PIXEL_RATIO = ratio;
-  const tick = def.build(root, w, h, def.color && /^#[0-9a-f]{6}$/i.test(color || '') ? color.toLowerCase() : DEFAULT_COLOR);
-  const mounted = { tick: (date) => { HOUR12 = hour12; tick(date); }, live, background, visible: true, every: EVERY[def.id] || 0 };
-  mounted.syncCss = () => root.classList.toggle('fc-paused', !mounted.live || !mounted.visible || (mounted.background && backgroundPaused));
-  mounted.syncCss();
+  const picked = def.color && /^#[0-9a-f]{6}$/i.test(color || '') ? color.toLowerCase() : DEFAULT_COLOR;
+  const mounted = { live, background, visible: true, every: EVERY[def.id] || 0, def, root: null, tick: () => {} };
+  mounted.syncCss = () => { if (mounted.root) mounted.root.classList.toggle('fc-paused', !mounted.live || !mounted.visible || (mounted.background && backgroundPaused)); };
+  // Draws the face with the palette of the current theme (a scene face always uses the dark one).
+  mounted.build = () => {
+    const pal = SCENE.has(def.id) ? PALETTES.dark : PALETTES[theme];
+    host.textContent = '';
+    const root = doc.createElement('div');
+    root.className = 'fc-root';
+    root.style.width = `${w}px`; root.style.height = `${h}px`;
+    for (const [key, value] of Object.entries(pal)) if (typeof value === 'string') root.style.setProperty(`--${key}`, value);
+    host.append(root);
+    HOUR12 = hour12;
+    MAX_PIXEL_RATIO = ratio;
+    BUILD_PAL = pal;
+    const shown = pal.light ? forLight(picked) : picked;
+    if (pal.light) root.style.setProperty('--onAccent', onColor(shown));
+    const tick = def.build(root, w, h, shown);
+    mounted.root = root;
+    mounted.tick = (date) => { HOUR12 = hour12; tick(date); };
+    mounted.syncCss();
+  };
+  mounted.build();
   mounted.tick(new Date());
   active.add(mounted);
   wake();
   return {
-    destroy() { active.delete(mounted); root.remove(); wake(); },
+    destroy() { active.delete(mounted); if (mounted.root) mounted.root.remove(); wake(); },
     setLive(value) { mounted.live = Boolean(value); mounted.syncCss(); if (mounted.live) mounted.tick(new Date()); wake(); },
     setVisible(value) { mounted.visible = Boolean(value); mounted.syncCss(); if (mounted.visible) mounted.tick(new Date()); wake(); },
   };
@@ -1317,5 +1387,15 @@ globalThis.FreezeClock = {
   setPaused(value) { paused = Boolean(value); wake(); },
   setBackgroundPaused(value) { backgroundPaused = Boolean(value); for (const mounted of active) mounted.syncCss(); wake(); },
   setFrameRate(fps) { frameMs = fps > 0 ? 1000 / fps : 0; },
+  // The color as it will be drawn in the current theme (the color pickers show swatches this way).
+  tint(hex) { return /^#[0-9a-f]{6}$/i.test(hex) && theme === 'light' ? forLight(hex) : hex; },
+  // 'light' or 'dark'. Faces already on screen are drawn again in the new look; scene faces stay dark.
+  setTheme(value) {
+    const next = value === 'light' ? 'light' : 'dark';
+    if (next === theme) return;
+    theme = next;
+    for (const mounted of active) if (!SCENE.has(mounted.def.id)) { mounted.build(); mounted.tick(new Date()); }
+    wake();
+  },
 };
 })();

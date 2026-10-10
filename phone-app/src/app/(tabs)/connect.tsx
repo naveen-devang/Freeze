@@ -5,8 +5,8 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { useTabBarClearance } from '../../tab-inset';
 import { Camera, Check, ChevronDown, ChevronRight, Monitor, QrCode, RefreshCw, ShieldCheck, Trash2 } from 'lucide-react-native';
 import { connectionId, PcConnection, usePcConnection } from '../../connection';
-import { colors } from '../../theme';
-import { ScreenSettingsSection } from '../../screen-power';
+import { useStyles, useTheme, type Colors } from '../../theme';
+import { AppearanceSection, ScreenSettingsSection } from '../../screen-power';
 import { AppUpdatesSection } from '../../app-updates';
 
 type PairingCode = PcConnection & { type: 'freeze-pair'; version: 1 };
@@ -34,6 +34,8 @@ function decodePairingCode(data: string): PcConnection | null {
 }
 
 export default function ConnectScreen() {
+  const { colors } = useTheme();
+  const styles = useStyles(makeStyles);
   const { connection, pairedDevices, status, protocolError, connect, disconnect, removePairedDevice } = usePcConnection();
   const bottomClearance = useTabBarClearance();
   const [permission, requestPermission] = useCameraPermissions();
@@ -113,9 +115,11 @@ export default function ConnectScreen() {
             <Monitor size={17} color={connected ? colors.mint : colors.muted} />
             <View style={styles.statusCopy}>
               <Text style={styles.statusTitle}>{connected ? 'Connected to your PC' : connecting ? 'Connecting…' : status === 'error' ? 'Could not connect' : 'No PC connected'}</Text>
-              <Text style={styles.statusSub}>{connected ? connection?.transport === 'usb' ? 'Connected by Android USB' : `${connection?.host}:${connection?.port}` : protocolError ?? (connecting && connection?.transport === 'usb' ? 'Reconnecting over USB…' : status === 'error' ? 'Check the connection and confirm the PC app is running.' : connection ? 'Tap Retry under Paired devices when the PC is available.' : 'Scan the code on the PC to connect.')}</Text>
+              <Text style={styles.statusSub}>{connected ? connection?.transport === 'usb' ? 'Connected by Android USB' : `${connection?.host}:${connection?.port}` : protocolError ?? (connecting && connection?.transport === 'usb' ? 'Reconnecting over USB…' : status === 'error' ? 'Check the connection and confirm the PC app is running.' : connection ? connection.transport === 'usb' ? 'Check the USB cable and that USB debugging is on, then tap Retry.' : 'Tap Retry when the PC is available.' : 'Scan the code on the PC to connect.')}</Text>
             </View>
             {connected && <Check size={16} color={colors.mint} />}
+            {connection && !connected && !connecting ? <Pressable style={styles.retryButton} onPress={() => void connect(connection)} accessibilityRole="button" accessibilityLabel="Retry connecting"><RefreshCw size={12} color={colors.text} /><Text style={styles.deviceButtonText}>Retry</Text></Pressable> : null}
+            {connection && connecting ? <Pressable style={styles.retryButton} onPress={() => void disconnect()} accessibilityRole="button" accessibilityLabel="Cancel connecting"><Text style={styles.deviceButtonText}>Cancel</Text></Pressable> : null}
           </View>
 
           {Platform.OS === 'android' && connection ? <View style={styles.transportRow}>
@@ -134,9 +138,9 @@ export default function ConnectScreen() {
               <Pressable style={styles.cancelScan} onPress={() => setScanning(false)} accessibilityRole="button"><Text style={styles.cancelScanText}>Cancel scan</Text></Pressable>
             </View>
           ) : (
-            <Pressable style={({ pressed }) => [styles.scanButton, pressed && styles.pressed, connecting && styles.disabled]} onPress={() => void startScan()} disabled={connecting} accessibilityRole="button">
+            <Pressable style={({ pressed }) => [styles.scanButton, pressed && styles.pressed]} onPress={() => void startScan()} accessibilityRole="button">
               <QrCode size={19} color={colors.text} strokeWidth={1.8} />
-              <View style={styles.scanCopy}><Text style={styles.scanTitle}>{connecting ? 'Connecting…' : 'Scan QR code'}</Text><Text style={styles.scanSubtitle}>Connect without entering details</Text></View>
+              <View style={styles.scanCopy}><Text style={styles.scanTitle}>Scan QR code</Text><Text style={styles.scanSubtitle}>Connect without entering details</Text></View>
               <ChevronRight size={16} color={colors.faint} />
             </Pressable>
           )}
@@ -158,7 +162,7 @@ export default function ConnectScreen() {
             </View>
             <Text style={styles.label}>Pairing key</Text>
             <TextInput value={form.token} onChangeText={(token) => setDraft({ ...form, token })} placeholder="Paste the pairing key" placeholderTextColor={colors.faint} autoCapitalize="none" autoCorrect={false} secureTextEntry style={styles.input} accessibilityLabel="Pairing key" />
-            <Pressable style={({ pressed }) => [styles.primaryButton, pressed && styles.pressed, connecting && styles.disabled]} onPress={() => void submit()} disabled={connecting} accessibilityRole="button"><Text style={styles.primaryText}>{connecting ? 'Connecting…' : 'Connect manually'}</Text></Pressable>
+            <Pressable style={({ pressed }) => [styles.primaryButton, pressed && styles.pressed]} onPress={() => void submit()} accessibilityRole="button"><Text style={styles.primaryText}>Connect manually</Text></Pressable>
           </View>}
 
           <View style={styles.pairedSection}>
@@ -175,7 +179,7 @@ export default function ConnectScreen() {
                 <View style={styles.deviceActions}>
                   <View style={styles.deviceStatus}><View style={[styles.statusDot, deviceStatus === 'Connected' && styles.statusDotConnected, deviceStatus === 'Connecting' && styles.statusDotConnecting]} /><Text style={[styles.deviceStatusText, deviceStatus === 'Connected' && styles.deviceStatusConnected]}>{deviceStatus}</Text></View>
                   <View style={styles.deviceButtons}>
-                    <Pressable style={styles.deviceButton} onPress={() => void (actionLabel === 'Disconnect' ? disconnect() : connect(device))} accessibilityRole="button" accessibilityLabel={`${actionLabel} ${actionLabel === 'Disconnect' ? 'from' : 'to'} ${device.deviceName || device.host}`} disabled={active && status === 'connecting'}>
+                    <Pressable style={styles.deviceButton} onPress={() => void (actionLabel === 'Disconnect' ? disconnect() : connect(device))} accessibilityRole="button" accessibilityLabel={`${actionLabel} ${actionLabel === 'Disconnect' ? 'from' : 'to'} ${device.deviceName || device.host}`}>
                       {actionLabel === 'Retry' && <RefreshCw size={12} color={colors.text} />}
                       <Text style={[styles.deviceButtonText, actionLabel === 'Disconnect' && styles.deviceDisconnectText]}>{actionLabel}</Text>
                     </Pressable>
@@ -186,6 +190,7 @@ export default function ConnectScreen() {
             })}
           </View>
 
+          <AppearanceSection />
           <ScreenSettingsSection />
           <AppUpdatesSection />
 
@@ -197,14 +202,14 @@ export default function ConnectScreen() {
   );
 }
 
-const styles = StyleSheet.create({
+const makeStyles = (colors: Colors) => StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.bg },
   flex: { flex: 1 },
   content: { padding: 18, paddingBottom: 28 },
   title: { color: colors.text, fontSize: 23, fontWeight: '600', letterSpacing: -0.3, marginTop: 17 },
   description: { color: colors.muted, fontSize: 14, lineHeight: 17, marginTop: 5 },
   statusCard: { borderRadius: 7, borderWidth: 1, padding: 13, marginTop: 19, flexDirection: 'row', alignItems: 'center', gap: 10 },
-  statusGood: { backgroundColor: '#111a14', borderColor: '#28392d' },
+  statusGood: { backgroundColor: colors.goodBg, borderColor: colors.goodBorder },
   statusPending: { backgroundColor: colors.panel, borderColor: colors.border },
   statusIdle: { backgroundColor: colors.panel, borderColor: colors.border },
   statusCopy: { flex: 1 },
@@ -218,7 +223,8 @@ const styles = StyleSheet.create({
   transportText: { color: colors.muted, fontSize: 13 },
   transportTextActive: { color: colors.text, fontWeight: '500' },
   transportHint: { color: colors.faint, fontSize: 12, marginTop: 8 },
-  scanButton: { minHeight: 61, borderWidth: 1, borderColor: '#3f3f46', borderRadius: 7, backgroundColor: colors.panelRaised, marginTop: 13, paddingHorizontal: 13, flexDirection: 'row', alignItems: 'center', gap: 11 },
+  retryButton: { minHeight: 32, borderWidth: 1, borderColor: colors.borderStrong, borderRadius: 6, paddingHorizontal: 10, flexDirection: 'row', alignItems: 'center', gap: 6 },
+  scanButton: { minHeight: 61, borderWidth: 1, borderColor: colors.borderStrong, borderRadius: 7, backgroundColor: colors.panelRaised, marginTop: 13, paddingHorizontal: 13, flexDirection: 'row', alignItems: 'center', gap: 11 },
   scanCopy: { flex: 1 },
   scanTitle: { color: colors.text, fontSize: 14, fontWeight: '600' },
   scanSubtitle: { color: colors.muted, fontSize: 12, marginTop: 4 },
@@ -236,8 +242,8 @@ const styles = StyleSheet.create({
   portRow: { flexDirection: 'row', gap: 12, alignItems: 'flex-end' },
   portField: { width: 95 },
   portHint: { flex: 1, paddingBottom: 25, color: colors.faint, fontSize: 12, lineHeight: 14 },
-  primaryButton: { height: 41, borderRadius: 5, backgroundColor: '#e4e4e7', alignItems: 'center', justifyContent: 'center', marginTop: 2 },
-  primaryText: { color: '#18181b', fontSize: 14, fontWeight: '600' },
+  primaryButton: { height: 41, borderRadius: 5, backgroundColor: colors.accent, alignItems: 'center', justifyContent: 'center', marginTop: 2 },
+  primaryText: { color: colors.onAccent, fontSize: 14, fontWeight: '600' },
   pairedSection: { marginTop: 15, paddingHorizontal: 12, borderWidth: 1, borderColor: colors.border, borderRadius: 7, backgroundColor: colors.panel },
   pairedHeader: { minHeight: 43, marginBottom: 2, flexDirection: 'row', alignItems: 'center', gap: 8 },
   pairedTitle: { color: colors.text, fontSize: 14, fontWeight: '600' },
@@ -251,7 +257,7 @@ const styles = StyleSheet.create({
   deviceStatus: { flexDirection: 'row', alignItems: 'center', gap: 5 },
   statusDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: colors.faint },
   statusDotConnected: { backgroundColor: colors.mint },
-  statusDotConnecting: { backgroundColor: '#eab308' },
+  statusDotConnecting: { backgroundColor: colors.warnFill },
   deviceStatusText: { color: colors.faint, fontSize: 12 },
   deviceStatusConnected: { color: colors.mint },
   deviceButtons: { flexDirection: 'row', alignItems: 'center', gap: 4 },

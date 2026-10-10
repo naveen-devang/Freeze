@@ -1,4 +1,5 @@
 import './clock-faces.js';
+import { currentTheme, onThemeChange } from '../theme';
 
 export type ClockCategory = 'classic' | 'retro' | 'ambient' | 'kinetic';
 export type ClockFaceInfo = { id: string; name: string; category: ClockCategory; color: boolean; blurb: string };
@@ -8,12 +9,17 @@ type FreezeClockApi = {
   setPaused(paused: boolean): void;
   setBackgroundPaused(paused: boolean): void;
   setFrameRate(fps: number): void;
+  setTheme(theme: 'light' | 'dark'): void;
+  tint(hex: string): string;
 };
 
 export const FreezeClock = (globalThis as unknown as { FreezeClock: FreezeClockApi }).FreezeClock;
 // Editor previews are thumbnails: 15 fps keeps motion readable at a quarter of the work of 60 fps.
 // The phone draws the real widget at 30.
 FreezeClock.setFrameRate(15);
+// Faces follow the app's light or dark look; the ones on screen are drawn again when it changes.
+FreezeClock.setTheme(currentTheme());
+onThemeChange(() => FreezeClock.setTheme(currentTheme()));
 // Nothing animates while the Freeze window is hidden or minimised.
 document.addEventListener('visibilitychange', () => FreezeClock.setPaused(document.hidden));
 export const CLOCK_CATEGORIES: [ClockCategory, string][] = [['classic', 'Classic'], ['retro', 'Retro'], ['ambient', 'Ambient'], ['kinetic', 'Kinetic']];

@@ -63,3 +63,5 @@ jobs:
       - run: node scripts/check-deck-move.ts
       - run: node scripts/check-media-players.ts
       - run: node scripts/check-quiet-processes.ts
+      - run: node scripts/check-pairing-link.ts
+      - run: node scripts/check-theme.ts
