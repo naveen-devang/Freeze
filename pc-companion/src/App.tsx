@@ -21,6 +21,8 @@ import {
   Monitor,
   Music,
   PanelsTopLeft,
+  PanelRight,
+  X,
   Pause,
   Play,
   QrCode,
@@ -372,19 +374,19 @@ function App() {
 
         <div className="nav-heading">Workspace</div>
         <nav aria-label="Workspace">
-          <button className={`nav-item ${screen === 'overview' ? 'selected' : ''}`} aria-current={screen === 'overview' ? 'page' : undefined} onClick={() => setScreen('overview')}>
+          <button className={`nav-item ${screen === 'overview' ? 'selected' : ''}`} title="Overview" aria-label="Overview" aria-current={screen === 'overview' ? 'page' : undefined} onClick={() => setScreen('overview')}>
             <LayoutDashboard size={16} strokeWidth={1.8} /><span>Overview</span>
           </button>
-          <button className={`nav-item ${screen === 'deck' ? 'selected' : ''}`} aria-current={screen === 'deck' ? 'page' : undefined} onClick={() => setScreen('deck')}>
+          <button className={`nav-item ${screen === 'deck' ? 'selected' : ''}`} title="Deck" aria-label="Deck" aria-current={screen === 'deck' ? 'page' : undefined} onClick={() => setScreen('deck')}>
             <Layers size={16} strokeWidth={1.8} /><span>Deck</span>
           </button>
-          <button className={`nav-item ${screen === 'settings' ? 'selected' : ''}`} aria-current={screen === 'settings' ? 'page' : undefined} onClick={() => setScreen('settings')}>
+          <button className={`nav-item ${screen === 'settings' ? 'selected' : ''}`} title="Settings" aria-label="Settings" aria-current={screen === 'settings' ? 'page' : undefined} onClick={() => setScreen('settings')}>
             <Settings size={16} strokeWidth={1.8} /><span>Settings</span>
           </button>
         </nav>
 
         <div className="sidebar-bottom">
-          {updater.state.kind === 'ready' ? <button type="button" className="update-pill" onClick={() => void updater.restart()}><span className="status-dot" />Restart to update</button> : <span className="version">{version}</span>}
+          {updater.state.kind === 'ready' ? <button type="button" className="update-pill" title="Restart to update" aria-label="Restart to update" onClick={() => void updater.restart()}><span className="status-dot" /><span className="pill-text">Restart to update</span></button> : <span className="version">{version}</span>}
         </div>
       </aside>
 
@@ -601,6 +603,9 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
   const [appPicker, setAppPicker] = useState<'add' | 'autoswitch' | null>(null);
   // The right-hand panel: the library to add from, or the settings of the selected item.
   const [panel, setPanel] = useState<'add' | 'settings'>('add');
+  // In a narrow window the rail becomes a popover and the side panel slides in; these say whether they are open.
+  const [railOpen, setRailOpen] = useState(false);
+  const [sidePanelOpen, setSidePanelOpen] = useState(false);
   // Dragging pages and profiles in the rail.
   const [railDrag, setRailDrag] = useState<{ kind: 'page' | 'profile'; id: string; label: string; x: number; y: number; copy: boolean; ok: boolean; reason: string; drop: RailDrop } | null>(null);
   const [dragExpand, setDragExpand] = useState('');
@@ -664,6 +669,7 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
   }, [config, profileId, pageId, folderId, buttonId, widgetId]);
   useEffect(() => { setFolderId(''); setPendingCell(null); }, [profileId, pageId]);
   useEffect(() => { if (!buttonId && !widgetId) setPanel('add'); }, [buttonId, widgetId]);
+  useEffect(() => { if (buttonId || widgetId) setSidePanelOpen(true); }, [buttonId, widgetId]);
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const drag = railDragRef.current;
@@ -1390,6 +1396,7 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
   }
 
   function selectPage(target: DeckProfile, item: DeckPage) {
+    setRailOpen(false);
     setProfileId(target.id);
     setPageId(item.id);
     setButtonId('');
@@ -1740,8 +1747,9 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
     ? <input className="deck-rail-rename" aria-label={`Rename ${kind}`} value={renameDraft} maxLength={maxLength} autoFocus disabled={busy} onFocus={(event) => event.currentTarget.select()} onChange={(event) => setRenameDraft(event.target.value)} onBlur={commitRename} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); if (event.key === 'Escape') setRenaming(null); }} />
     : null;
 
-  return <div className={`deck-workspace ${hasSelection ? 'has-selection' : ''}`} onKeyDown={(event) => { if (event.key === 'Escape') { setMenu(null); setDialog(null); setMoveDialog(null); } }}>
-    <aside className="deck-rail" aria-label="Profiles and pages">
+  return <div className={`deck-workspace ${hasSelection ? 'has-selection' : ''} ${sidePanelOpen ? 'side-open' : ''}`} onKeyDown={(event) => { if (event.key === 'Escape') { setMenu(null); setDialog(null); setMoveDialog(null); setRailOpen(false); setSidePanelOpen(false); } }}>
+    {railOpen ? <div className="deck-rail-scrim" onClick={() => setRailOpen(false)} /> : null}
+    <aside className={`deck-rail ${railOpen ? 'open' : ''}`} aria-label="Profiles and pages">
       <div className="deck-rail-head"><span>Profiles</span><span>{deck.profiles.length} of 32</span></div>
       <div className="deck-rail-list">
         {deck.profiles.map((item) => {
@@ -1779,8 +1787,10 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
     </aside>
     <div className="deck-main">
       <div className="deck-main-head">
-        <div className="deck-crumb"><strong>{folder ? folder.name : page.name}</strong><span>{folder ? `${profile.name} › ${page.name} › folder` : profile.name}</span></div>
+        <button type="button" className="secondary-button deck-rail-toggle" aria-expanded={railOpen} aria-haspopup="true" onClick={() => setRailOpen(!railOpen)}><Layers size={14} /><span>{profile.name} › {page.name}</span><ChevronDown size={13} /></button>
+        <div className={`deck-crumb ${folder ? 'in-folder' : ''}`}><strong>{folder ? folder.name : page.name}</strong><span>{folder ? `${profile.name} › ${page.name} › folder` : profile.name}</span></div>
         {folder ? <button type="button" className="secondary-button" data-deck-back onClick={closeFolder}><ArrowLeft size={13} /> Back to {page.name}</button> : null}
+        <button type="button" className="secondary-button deck-panel-toggle" aria-expanded={sidePanelOpen} onClick={() => setSidePanelOpen(!sidePanelOpen)}><PanelRight size={14} /> {hasSelection ? 'Settings' : 'Add'}</button>
         <span className={`deck-save-state ${savedLabel === 'All changes saved' ? 'saved' : savedLabel === 'Could not save' ? 'failed' : ''}`} role="status"><i />{savedLabel}</span>
       </div>
       {deck.migrationNotes?.length ? <div className="deck-notice" role="status"><div><strong>Your deck was updated.</strong> Widgets now sit on the page grid next to your buttons.<ul>{deck.migrationNotes.map((note) => <li key={note}>{note}</li>)}</ul></div><button type="button" className="secondary-button" onClick={() => void save({ ...deck, migrationNotes: [] })}>Got it</button></div> : null}
@@ -1823,9 +1833,12 @@ function DesktopDeckEditor({ config: savedConfig, onSaved, playbackState, mediaS
       </div>
     </div>
       <div className="button-properties" role="region" aria-label="Add or edit">
+        <div className="deck-panel-bar">
         <div className="deck-panel-tabs transport-tabs" role="tablist" aria-label="Side panel">
           <button type="button" role="tab" aria-selected={!showSettings} className={`transport-tab ${!showSettings ? 'selected' : ''}`} onClick={() => setPanel('add')}>Add</button>
           <button type="button" role="tab" aria-selected={showSettings} className={`transport-tab ${showSettings ? 'selected' : ''}`} disabled={!hasSelection} onClick={() => setPanel('settings')}>Settings</button>
+        </div>
+          <button type="button" className="icon-button deck-panel-close" aria-label="Close panel" onClick={() => setSidePanelOpen(false)}><X size={14} /></button>
         </div>
         {showSettings ? <>
           <PanelHeader title={panelTitle} subtitle={panelSubtitle} noun={selectedWidget ? 'widget' : selected?.action.type === 'open_folder' ? 'folder' : 'button'} busy={busy} onDuplicate={duplicateSelected} onDelete={deleteSelected} />
