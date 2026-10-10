@@ -35,6 +35,8 @@ mod media_players;
 mod pc_stats;
 mod system_media;
 #[cfg(windows)]
+mod win_apps;
+#[cfg(windows)]
 mod win_icon;
 
 const PORT: u16 = 39421;
@@ -2521,6 +2523,18 @@ async fn list_installed_apps() -> Result<Vec<InstalledApp>, String> {
         }
         #[cfg(windows)]
         {
+            // The Start menu's own list, which includes Store apps. The shortcut scan is the fallback.
+            if let Ok(found) = win_apps::list() {
+                let apps: Vec<InstalledApp> = win_apps::tidy(found)
+                    .into_iter()
+                    .map(|(name, id)| InstalledApp { name, path: win_apps::target(&id) })
+                    .filter(|app| app.path.len() <= 512 && !app.path.chars().any(char::is_control))
+                    .take(2000)
+                    .collect();
+                if !apps.is_empty() {
+                    return apps;
+                }
+            }
             let roots: Vec<PathBuf> = ["ProgramData", "APPDATA"]
                 .iter()
                 .filter_map(|name| std::env::var_os(name))
@@ -2577,14 +2591,15 @@ fn read_app_icon(app: String, use_shortcut_icon: bool) -> Result<String, String>
     }
     #[cfg(target_os = "windows")]
     {
-        if !Path::new(&app).is_file() {
+        let in_shell = app.starts_with(win_apps::SHELL_PREFIX);
+        if !in_shell && !Path::new(&app).is_file() {
             return Err("Choose an existing application file".into());
         }
         // The shell reads the icon in this process: no console window, no wait for PowerShell to start. Only a
         // shortcut's *target* icon (the "reset to app icon" case) still needs the script below, as does any
         // file the shell cannot read.
         let is_shortcut = Path::new(&app).extension().is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"));
-        if use_shortcut_icon || !is_shortcut {
+        if use_shortcut_icon || !is_shortcut || in_shell {
             if let Ok(png) = win_icon::app_icon_png(&app) {
                 use base64::Engine;
                 let encoded = base64::engine::general_purpose::STANDARD.encode(png);
@@ -2592,6 +2607,9 @@ fn read_app_icon(app: String, use_shortcut_icon: bool) -> Result<String, String>
                     return Ok(format!("data:image/png;base64,{encoded}"));
                 }
             }
+        }
+        if in_shell {
+            return Err("Windows has no icon for that app".into());
         }
         let script = r#"
 Add-Type -AssemblyName System.Drawing
@@ -4108,9 +4126,10 @@ fn launch_app(app: &str) -> Result<(), String> {
         return Err("Enter a valid app name or path".into());
     }
     #[cfg(windows)]
-    let result = if Path::new(app)
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"))
+    let result = if app.starts_with(win_apps::SHELL_PREFIX)
+        || Path::new(app)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"))
     {
         Command::new("explorer.exe").arg(app).spawn()
     } else {
@@ -4798,6 +4817,33 @@ mod installed_apps_tests {
         // A missing root is just empty.
         assert!(scan_apps(&[root.join("missing")], "app", 2, false).is_empty());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lists_store_apps_and_reads_their_icons() {
+        use super::win_apps::{is_helper, tidy};
+        // Pure rules first: helpers go, a name that merely contains "help" stays, ids are not repeated.
+        assert!(is_helper("Uninstall Foo") && is_helper("Foo Release Notes") && !is_helper("Get Help") && !is_helper("Helper Tool"));
+        let tidied = tidy(vec![("Zed".into(), "z".into()), ("Alpha".into(), "a".into()), ("Alpha again".into(), "A".into()), (" ".into(), "b".into()), ("Uninstall Zed".into(), "u".into()), ("Zip Help".into(), r"C:\Zip\zip.chm".into())]);
+        assert_eq!(tidied.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), ["Alpha", "Zed"]);
+        // Then this PC's real list: it has far more than the Start Menu shortcuts, and every row can be launched.
+        let apps = tauri::async_runtime::block_on(list_installed_apps()).unwrap();
+        println!("{} apps", apps.len());
+        for app in apps.iter().filter(|app| app.path.starts_with(win_apps::SHELL_PREFIX)).take(8) {
+            println!("store: {} -> {}", app.name, app.path);
+        }
+        for wanted in ["Apple Music", "Calculator", "Netflix", "Spotify"] {
+            println!("{wanted}: {:?}", apps.iter().find(|app| app.name == wanted).map(|app| &app.path));
+        }
+        assert!(apps.iter().all(|app| !app.path.to_lowercase().ends_with(".chm")));
+        let store: Vec<_> = apps.iter().filter(|app| app.path.starts_with(win_apps::SHELL_PREFIX)).collect();
+        assert!(!store.is_empty(), "no Store apps listed");
+        // Icons for a Store app and a desktop app come back as PNGs.
+        for app in store.iter().take(3).copied().chain(apps.iter().find(|app| !app.path.starts_with(win_apps::SHELL_PREFIX))) {
+            let icon = read_app_icon(app.path.clone(), true).unwrap_or_else(|error| panic!("{}: {error}", app.name));
+            assert!(icon.starts_with("data:image/png;base64,"), "{}", app.name);
+        }
     }
 }
 

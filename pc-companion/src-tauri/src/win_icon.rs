@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
-use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
+use windows::Win32::UI::Shell::{ILFree, SHGetFileInfoW, SHParseDisplayName, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_PIDL};
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
 
 use super::icon_png;
@@ -42,8 +42,16 @@ pub(super) fn app_icon_png(path: &str) -> Result<Vec<u8>, String> {
 fn read_icon(path: &str) -> Result<Vec<u8>, String> {
     let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(std::iter::once(0)).collect();
     let mut info = SHFILEINFOW::default();
-    let found = unsafe {
-        SHGetFileInfoW(PCWSTR(wide.as_ptr()), FILE_FLAGS_AND_ATTRIBUTES(0), Some(&mut info), size_of::<SHFILEINFOW>() as u32, SHGFI_ICON | SHGFI_LARGEICON)
+    let size = size_of::<SHFILEINFOW>() as u32;
+    let found = if path.starts_with(super::win_apps::SHELL_PREFIX) {
+        // Not a file: the shell finds the app by its address, and the icon is asked for by that item's id.
+        let mut item = std::ptr::null_mut();
+        unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut item, 0, None) }.map_err(|error| error.to_string())?;
+        let found = unsafe { SHGetFileInfoW(PCWSTR(item as *const u16), FILE_FLAGS_AND_ATTRIBUTES(0), Some(&mut info), size, SHGFI_PIDL | SHGFI_ICON | SHGFI_LARGEICON) };
+        unsafe { ILFree(Some(item)) };
+        found
+    } else {
+        unsafe { SHGetFileInfoW(PCWSTR(wide.as_ptr()), FILE_FLAGS_AND_ATTRIBUTES(0), Some(&mut info), size, SHGFI_ICON | SHGFI_LARGEICON) }
     };
     if found == 0 || info.hIcon.is_invalid() {
         return Err("Windows has no icon for that file".into());
